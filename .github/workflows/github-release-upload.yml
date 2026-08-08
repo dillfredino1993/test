@@ -47,18 +47,22 @@ jobs:
         run: |
           mkdir -p downloads && cd downloads
           
-          # Parse and clean URLs from payload
+          # Parse and clean URLs from payload - FIXED to handle ps:// properly
           cat << 'PYEOF' > parse_urls.py
           import os, json, re
           
           def clean_url(url):
-              """Clean and fix common URL issues"""
+              """Clean and fix common URL issues - FIXED"""
               url = url.strip()
               
-              # Fix ps:// protocol
+              # CRITICAL FIX: Handle ps:// protocol
               if url.startswith('ps://'):
+                  # Replace ps:// with https://
                   url = url.replace('ps://', 'https://')
                   print(f"🔧 Fixed ps:// → https://")
+              
+              # Fix ps:// anywhere in URL (not just start)
+              url = re.sub(r'ps://', 'https://', url)
               
               # Fix missing protocol
               if not url.startswith(('http://', 'https://')):
@@ -70,8 +74,15 @@ jobs:
               url = re.sub(r'^http://https://', 'https://', url)
               url = re.sub(r'^https://http://', 'https://', url)
               
-              # Remove duplicate slashes
+              # Remove duplicate slashes (but keep protocol)
               url = re.sub(r'(?<!:)//+', '/', url)
+              
+              # Remove any remaining invalid protocol prefixes
+              url = re.sub(r'^[a-zA-Z]+://(?![http])', 'https://', url)
+              
+              # Ensure it starts with http:// or https://
+              if not url.startswith(('http://', 'https://')):
+                  url = 'https://' + url
               
               return url
           
@@ -126,7 +137,7 @@ jobs:
           
           echo "📥 Starting download of $(cat urls.txt | wc -l) episodes..."
           
-          # Create verify_and_repair.py as a separate file
+          # Create verify_and_repair.py
           cat > verify_and_repair.py << 'EOFVERIFY'
           import os
           import sys
@@ -135,7 +146,6 @@ jobs:
           import shutil
           
           def check_with_mediainfo(file_path):
-              """Check if file is valid using MediaInfo"""
               try:
                   cmd = ["mediainfo", "--Output=JSON", file_path]
                   result = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
@@ -151,10 +161,8 @@ jobs:
                   return False, None
           
           def repair_mp4(file_path):
-              """Attempt to repair MP4 file"""
               print("  🔧 Attempting to repair MP4 file...")
               
-              # Method 1: Try to remux with ffmpeg
               temp_file = f"{file_path}.temp.mp4"
               try:
                   cmd = [
@@ -181,9 +189,8 @@ jobs:
                       try: os.remove(temp_file)
                       except: pass
               
-              # Method 2: Try re-encode (last resort)
               try:
-                  print("  ⚠️ Attempting re-encode (this will take time)...")
+                  print("  ⚠️ Attempting re-encode...")
                   temp_file = f"{file_path}.temp.mp4"
                   cmd = [
                       "ffmpeg", "-y",
@@ -228,7 +235,6 @@ jobs:
                   print(f"  📐 Resolution: {video_track.get('Width', 'N/A')}x{video_track.get('Height', 'N/A')}")
                   print(f"  🎞️  Codec: {video_track.get('CodecID', 'N/A')}")
                   print(f"  ⏱️  Duration: {video_track.get('Duration', 'N/A')}s")
-                  print(f"  💾 Bitrate: {video_track.get('BitRate', 'N/A')} bps")
                   sys.exit(0)
               else:
                   print("  ⚠️ File appears corrupted or invalid")
@@ -266,6 +272,12 @@ jobs:
             echo "📎 URL: $URL"
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
+            
+            # Double-check URL protocol before download
+            if [[ "$URL" == ps://* ]]; then
+              URL="${URL/ps:/https:}"
+              echo "🔧 Fixed ps:// to https:// in URL: $URL"
+            fi
             
             if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *"m3u8"* ]]; then
               echo "📺 Detected HLS stream - Using yt-dlp"
@@ -339,7 +351,6 @@ jobs:
                 
                 echo "🔍 Verifying file integrity with MediaInfo..."
                 
-                # Run verification and repair
                 if python3 verify_and_repair.py "$OUT_FILE"; then
                   echo "✅ File verified and repaired (if needed)"
                   
@@ -357,7 +368,6 @@ jobs:
                     -metadata date="$(date +%Y-%m-%d)" \
                     -metadata media_type="tv_episode" \
                     -metadata encoded_by="GitHub Actions Pipeline" \
-                    -metadata copyright="$(date +%Y) $SERIES_TITLE" \
                     -movflags +faststart \
                     "temp_$OUT_FILE" 2>/dev/null
                   
@@ -663,7 +673,6 @@ jobs:
         run: |
           cd downloads
           
-          # Create upload script as separate file
           cat > upload_telegram.py << 'EOFUPLOAD'
           import os
           import sys
