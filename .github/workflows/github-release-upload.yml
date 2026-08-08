@@ -1,0 +1,608 @@
+name: GitHub Telegram & Media Pipeline
+
+on:
+  repository_dispatch:
+    types: [github_release_upload]
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg & Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg aria2 curl python3-pip jq
+          pip3 install --upgrade pip
+          pip3 install telethon qrcode yt-dlp
+          python3 -c "import telethon; print(f'Telethon version: {telethon.__version__}')"
+
+      - name: Compute Dynamic Formatted Output Filename & Label
+        id: fname
+        run: |
+          LABEL="${{ github.event.client_payload.label || 'NONE' }}"
+          SERIES="${{ github.event.client_payload.series || github.event.client_payload.series_name || 'Series' }}"
+          
+          CLEAN_LABEL=$(echo "$LABEL" | tr -d ' ' | tr '[:lower:]' '[:upper:]')
+          CLEAN_SERIES_TITLE=$(echo "$SERIES" | sed -e 's/[\/:*?"<>|]/_/g' -e 's/^ *//' -e 's/ *$//')
+          CLEAN_SERIES_TAG=$(echo "$CLEAN_SERIES_TITLE" | tr ' ' '_')
+          
+          DATE_STR=$(date +'%Y-%m-%d')
+          
+          TAG_NAME="${DATE_STR}-${CLEAN_LABEL}-${CLEAN_SERIES_TAG}"
+          FORMATTED_TITLE="[${DATE_STR}]-[${CLEAN_LABEL}]-${CLEAN_SERIES_TITLE}"
+          
+          echo "formatted_title=${FORMATTED_TITLE}" >> $GITHUB_OUTPUT
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+          echo "series_title=${CLEAN_SERIES_TITLE}" >> $GITHUB_OUTPUT
+
+      - name: Process, Download & Merge Episodes via FFmpeg Concat Filter
+        env:
+          CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          export TITLE="${{ steps.fname.outputs.formatted_title }}"
+          
+          mkdir -p downloads && cd downloads
+          
+          cat << 'PYEOF' > parse_urls.py
+          import os, json
+          
+          payload_str = os.environ.get("CLIENT_PAYLOAD", "{}")
+          try:
+              data = json.loads(payload_str)
+          except Exception as e:
+              print(f"Error parsing JSON: {e}")
+              data = {}
+          
+          urls = []
+          if isinstance(data.get("episodes"), list):
+              for ep in data["episodes"]:
+                  if isinstance(ep, dict) and ep.get("url"):
+                      urls.append(str(ep["url"]))
+                  elif isinstance(ep, str):
+                      urls.append(ep)
+          elif isinstance(data.get("video_urls"), list):
+              urls = [str(u) for u in data["video_urls"] if u]
+          elif data.get("video_url"):
+              urls.append(str(data["video_url"]))
+          elif data.get("url"):
+              urls.append(str(data["url"]))
+          
+          with open("urls.txt", "w", encoding="utf-8") as f:
+              for u in urls:
+                  f.write(u.strip() + "\n")
+          
+          print(f"Found {len(urls)} URLs to download.")
+          PYEOF
+
+          python3 parse_urls.py
+
+          EP_INDEX=1
+          while IFS= read -r URL; do
+            URL=$(echo "$URL" | xargs)
+            if [ -z "$URL" ]; then continue; fi
+            EP_NUM=$(printf "%02d" $EP_INDEX)
+            OUT_FILE="EP${EP_NUM}.mp4"
+            echo "Downloading Episode $EP_INDEX"
+            if [[ "$URL" == *".m3u8"* ]]; then
+              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts --concurrent-fragments 16 -o "$OUT_FILE" "$URL" || yt-dlp -o "$OUT_FILE" "$URL" || ffmpeg -i "$URL" -c copy "$OUT_FILE"
+            else
+              aria2c -x 16 -s 16 -k 1M --continue=true -o "$OUT_FILE" "$URL" || curl -sSL "$URL" -o "$OUT_FILE"
+            fi
+            EP_INDEX=$((EP_INDEX + 1))
+          done < urls.txt
+
+          cat << 'MERGE_PYEOF' > merge_episodes.py
+          import os, glob, re, subprocess, sys
+
+          def get_video_dims(file_path):
+              try:
+                  cmd = [
+                      "ffprobe", "-v", "error",
+                      "-select_streams", "v:0",
+                      "-show_entries", "stream=width,height",
+                      "-of", "csv=s=x:p=0",
+                      file_path
+                  ]
+                  out = subprocess.check_output(cmd, text=True).strip()
+                  w, h = map(int, out.split('x'))
+                  return (w if w % 2 == 0 else w + 1), (h if h % 2 == 0 else h + 1)
+              except Exception as e:
+                  print(f"Warning: Probing dimensions failed ({e}), defaulting to 720x1280.")
+                  return 720, 1280
+
+          def get_ep_num(f):
+              m = re.search(r'EP(\d+)\.mp4', f)
+              return int(m.group(1)) if m else 0
+
+          ep_files = sorted(glob.glob("EP*.mp4"), key=get_ep_num)
+          if not ep_files:
+              print("No EP*.mp4 files found to merge.")
+              sys.exit(0)
+
+          title = os.environ.get("TITLE", "merged_series")
+          merged_file = f"{title}.mp4"
+          
+          target_w, target_h = get_video_dims(ep_files[0])
+          print(f"Merging {len(ep_files)} episodes into {merged_file} with target resolution {target_w}x{target_h}...")
+
+          cmd = ["ffmpeg", "-y"]
+          filter_inputs = ""
+          concat_filter = ""
+
+          for i, ep in enumerate(ep_files):
+              cmd.extend(["-i", ep])
+              filter_inputs += f"[{i}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v{i}];[{i}:a]aformat=sample_rates=48000:channel_layouts=stereo[a{i}];"
+              concat_filter += f"[v{i}][a{i}]"
+
+          concat_filter += f"concat=n={len(ep_files)}:v=1:a=1[outv][outa]"
+          full_filter = filter_inputs + concat_filter
+
+          cmd.extend([
+              "-filter_complex", full_filter,
+              "-map", "[outv]",
+              "-map", "[outa]",
+              "-c:v", "libx264",
+              "-preset", "fast",
+              "-crf", "23",
+              "-c:a", "aac",
+              "-b:a", "128k",
+              "-movflags", "+faststart",
+              merged_file
+          ])
+
+          print("Executing FFmpeg Concat Filter Re-encoding command...")
+          res = subprocess.run(cmd)
+          
+          if res.returncode == 0 and os.path.exists(merged_file):
+              print(f"Successfully merged episodes into {merged_file}")
+              
+              file_size_mb = os.path.getsize(merged_file) / (1024 * 1024)
+              if file_size_mb > 1950:
+                  print("Merged file exceeds 1.95GB, compressing for Telegram limit...")
+                  comp_file = f"{title}_compressed.mp4"
+                  dur_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprintwrappers=1:nokey=1", merged_file]
+                  try:
+                      dur = float(subprocess.check_output(dur_cmd, text=True).strip())
+                  except Exception:
+                      dur = 3600.0
+                  
+                  target_bitrate = int((1900 * 8192) / max(dur, 1))
+                  if target_bitrate < 300:
+                      target_bitrate = 300
+                  
+                  comp_cmd = [
+                      "ffmpeg", "-y", "-i", merged_file,
+                      "-c:v", "libx264", "-b:v", f"{target_bitrate}k",
+                      "-maxrate", f"{target_bitrate * 2}k", "-bufsize", f"{target_bitrate * 4}k",
+                      "-c:a", "aac", "-b:a", "128k", "-preset", "fast", "-movflags", "+faststart",
+                      comp_file
+                  ]
+                  subprocess.run(comp_cmd)
+                  if os.path.exists(comp_file):
+                      os.replace(comp_file, merged_file)
+
+              with open(os.environ["GITHUB_ENV"], "a") as fenv:
+                  fenv.write(f"merged_file_path={os.path.abspath(merged_file)}\n")
+                  fenv.write("has_merged=true\n")
+          else:
+              print("FFmpeg Concat Filter failed!")
+              sys.exit(1)
+          MERGE_PYEOF
+
+          python3 merge_episodes.py
+
+      - name: Create & Execute Telegram Upload Script
+        env:
+          TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
+          TG_SINGLE_EPISODES_CHAT_ID: ${{ secrets.TELEGRAM_SINGLE_EPISODES_CHAT_ID }}
+          TG_MERGED_CHAT_ID: ${{ secrets.TELEGRAM_MERGED_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
+          TG_SINGLE_EPISODES_NAME: ${{ secrets.TELEGRAM_SINGLE_EPISODES_NAME }}
+          TG_MERGED_NAME: ${{ secrets.TELEGRAM_MERGED_NAME }}
+          TG_SINGLE_EPISODES_INVITE_LINK: ${{ secrets.TELEGRAM_SINGLE_EPISODES_INVITE_LINK }}
+          TG_MERGED_INVITE_LINK: ${{ secrets.TELEGRAM_MERGED_INVITE_LINK }}
+          MERGED_PATH: ${{ env.merged_file_path }}
+          TITLE: ${{ steps.fname.outputs.formatted_title }}
+          SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
+          LABEL: ${{ github.event.client_payload.label || 'NONE' }}
+        run: |
+          cat << 'EOF' > upload_telegram.py
+          import os
+          import sys
+          import glob
+          import re
+          import subprocess
+          import asyncio
+          import datetime
+          import traceback
+
+          if hasattr(sys.stdout, "reconfigure"):
+              sys.stdout.reconfigure(line_buffering=True)
+              sys.stderr.reconfigure(line_buffering=True)
+
+          try:
+              from telethon import TelegramClient
+              from telethon.sessions import StringSession
+              from telethon.errors import FloodWaitError, ChatWriteForbiddenError, ChannelPrivateError, UserAlreadyParticipantError
+              from telethon.tl.functions.channels import JoinChannelRequest
+              from telethon.tl.functions.messages import ImportChatInviteRequest, CreateForumTopicRequest
+              from telethon.tl.types import DocumentAttributeVideo, PeerChannel, PeerChat
+              import telethon
+              print(f"Telethon version: {telethon.__version__}")
+          except ImportError as e:
+              print(f"Import error: {e}")
+              sys.exit(1)
+
+          api_id = os.environ.get("TG_API_ID")
+          api_hash = os.environ.get("TG_API_HASH")
+          session_string = os.environ.get("TG_SESSION_STRING")
+          
+          single_chat_id_raw = os.environ.get("TG_SINGLE_EPISODES_CHAT_ID")
+          merged_chat_id_raw = os.environ.get("TG_MERGED_CHAT_ID")
+          
+          single_name = os.environ.get("TG_SINGLE_EPISODES_NAME")
+          merged_name = os.environ.get("TG_MERGED_NAME")
+          
+          single_invite_link = os.environ.get("TG_SINGLE_EPISODES_INVITE_LINK")
+          merged_invite_link = os.environ.get("TG_MERGED_INVITE_LINK")
+          
+          video_path = os.environ.get("MERGED_PATH")
+          title = os.environ.get("TITLE")
+          series_title = os.environ.get("SERIES_TITLE", "Series")
+          label = os.environ.get("LABEL", "NONE")
+
+          if not all([api_id, api_hash]):
+              print("Missing Telegram API credentials. Skipping uploads.")
+              sys.exit(0)
+
+          if not session_string:
+              print("Missing session string! Skipping uploads.")
+              sys.exit(0)
+
+          def parse_chat_id(val):
+              if not val:
+                  return None
+              val = str(val).strip().strip('"').strip("'")
+              try:
+                  return int(val)
+              except ValueError:
+                  return val
+
+          def get_video_metadata(file_path):
+              try:
+                  cmd = [
+                      "ffprobe", "-v", "error",
+                      "-select_streams", "v:0",
+                      "-show_entries", "stream=width,height,duration:format=duration",
+                      "-of", "default=noprintwrappers=1:nokey=1",
+                      file_path
+                  ]
+                  out = subprocess.check_output(cmd, text=True).strip().splitlines()
+                  if len(out) >= 3:
+                      w = int(out[0]) if out[0].isdigit() else 1280
+                      h = int(out[1]) if out[1].isdigit() else 720
+                      duration = float(out[2]) if out[2].replace('.', '', 1).isdigit() else 0.0
+                      return int(duration), w, h
+              except Exception as e:
+                  print(f"Warning: Failed to probe metadata for {file_path}: {e}")
+              return 0, 1280, 720
+
+          def generate_thumbnail(file_path, out_thumb_path="thumb.jpg"):
+              try:
+                  cmd = [
+                      "ffmpeg", "-y", "-ss", "00:00:01",
+                      "-i", file_path,
+                      "-vframes", "1",
+                      "-q:v", "2",
+                      out_thumb_path
+                  ]
+                  subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                  if os.path.exists(out_thumb_path):
+                      return out_thumb_path
+              except Exception as e:
+                  print(f"Warning: Failed to generate thumbnail for {file_path}: {e}")
+              return None
+
+          single_chat_id = parse_chat_id(single_chat_id_raw)
+          merged_chat_id = parse_chat_id(merged_chat_id_raw)
+
+          print("=" * 60)
+          print("Telegram Upload Configuration (Telethon)")
+          print("=" * 60)
+          print(f"Single Chat ID: {single_chat_id_raw}")
+          print(f"Single Chat Name: {single_name}")
+          print(f"Single Invite Link: {single_invite_link}")
+          print(f"Merged Chat ID: {merged_chat_id_raw}")
+          print(f"Merged Chat Name: {merged_name}")
+          print(f"Video Path: {video_path}")
+          print(f"Title: {title}")
+          print(f"Series: {series_title}")
+          print("=" * 60)
+
+          async def join_chat(client, invite_link):
+              if not invite_link or not str(invite_link).strip():
+                  return None
+              link = str(invite_link).strip()
+              print(f"Attempting to join chat via invite link: {link}")
+              
+              # 1. Check for private invite hash (+HASH or joinchat/HASH)
+              m = re.search(r'(?:joinchat/|\+)([a-zA-Z0-9_-]+)', link)
+              if m:
+                  invite_hash = m.group(1)
+                  try:
+                      updates = await client(ImportChatInviteRequest(invite_hash))
+                      chat = updates.chats[0]
+                      print(f" Successfully joined private group via hash '{invite_hash}': {getattr(chat, 'title', chat.id)} (ID: {chat.id})")
+                      return chat
+                  except UserAlreadyParticipantError:
+                      print(f" User is already a participant of private group hash '{invite_hash}'")
+                  except Exception as ie:
+                      print(f" ImportChatInviteRequest failed for hash '{invite_hash}': {ie}")
+              
+              # 2. Try standard JoinChannelRequest for public channel usernames/links
+              try:
+                  updates = await client(JoinChannelRequest(link))
+                  chat = updates.chats[0]
+                  print(f" Successfully joined channel via link: {getattr(chat, 'title', chat.id)} (ID: {chat.id})")
+                  return chat
+              except Exception as e:
+                  print(f" JoinChannelRequest failed: {e}")
+              
+              return None
+
+          async def search_dialogs_by_name(client, target_name):
+              if not target_name or not isinstance(target_name, str) or not target_name.strip():
+                  return None
+              print(f"Searching active & archived dialogs for title containing: '{target_name}'...")
+              target_clean = target_name.strip().lower()
+              matched_entity = None
+              all_dialog_titles = []
+              
+              async for dialog in client.iter_dialogs(limit=None):
+                  entity = dialog.entity
+                  title = getattr(entity, 'title', '') or getattr(entity, 'first_name', '') or ''
+                  if title:
+                      all_dialog_titles.append(f"'{title}' (ID: {dialog.id})")
+                  if target_clean in title.lower():
+                      print(f" Found matching chat in dialogs: '{title}' (ID: {dialog.id})")
+                      matched_entity = entity
+                      break
+              
+              if not matched_entity:
+                  print(f"Could not find any joined group/channel matching '{target_name}'.")
+                  print(f"Total dialogs checked: {len(all_dialog_titles)}")
+                  print("Available joined chats in account:")
+                  for d_title in all_dialog_titles[:30]:
+                      print(f"  - {d_title}")
+              
+              return matched_entity
+
+          async def resolve_chat_id(client, chat_id_input, invite_link=None, search_name=None):
+              # 1. Try joining via invite link if provided (handles both private t.me/+ and public links)
+              if invite_link:
+                  joined_entity = await join_chat(client, invite_link)
+                  if joined_entity:
+                      return joined_entity
+
+              # 2. Direct get_entity lookup if chat_id_input provided
+              if chat_id_input is not None:
+                  # Try exact input
+                  try:
+                      entity = await client.get_entity(chat_id_input)
+                      print(f"Resolved target chat directly -> {getattr(entity, 'title', entity.id)} (ID: {entity.id})")
+                      return entity
+                  except Exception as e:
+                      print(f"Direct entity lookup for '{chat_id_input}' failed: {e}")
+
+                  # If integer ID provided, try PeerChannel / PeerChat / -100 variants
+                  if isinstance(chat_id_input, int):
+                      raw_id = abs(chat_id_input)
+                      # Try -100 prefix if not already present
+                      channel_id_str = f"-100{raw_id}" if not str(abs(chat_id_input)).startswith("100") else str(chat_id_input)
+                      try:
+                          entity = await client.get_entity(int(channel_id_str))
+                          print(f"Resolved target channel via -100 prefix -> {getattr(entity, 'title', entity.id)} (ID: {entity.id})")
+                          return entity
+                      except Exception:
+                          pass
+                      
+                      try:
+                          entity = await client.get_entity(PeerChannel(raw_id))
+                          print(f"Resolved target channel via PeerChannel -> {getattr(entity, 'title', entity.id)} (ID: {entity.id})")
+                          return entity
+                      except Exception:
+                          pass
+
+              # 3. If chat_id_input itself is a text string name, search dialogs
+              if isinstance(chat_id_input, str) and chat_id_input.strip():
+                  entity = await search_dialogs_by_name(client, chat_id_input)
+                  if entity:
+                      return entity
+
+              # 4. Search dialogs by dedicated name secret (TG_SINGLE_EPISODES_NAME / TG_MERGED_NAME)
+              if search_name and str(search_name).strip():
+                  entity = await search_dialogs_by_name(client, str(search_name))
+                  if entity:
+                      return entity
+
+              return None
+
+          async def send_file_with_metadata(client, entity, file_path, caption, reply_to=None):
+              duration, w, h = get_video_metadata(file_path)
+              thumb_path = generate_thumbnail(file_path, f"{file_path}_thumb.jpg")
+              
+              video_attr = DocumentAttributeVideo(
+                  duration=duration,
+                  w=w,
+                  h=h,
+                  supports_streaming=True
+              )
+              
+              kwargs = {
+                  "entity": entity,
+                  "file": file_path,
+                  "caption": caption,
+                  "attributes": [video_attr],
+                  "supports_streaming": True
+              }
+              if thumb_path and os.path.exists(thumb_path):
+                  kwargs["thumb"] = thumb_path
+              if reply_to:
+                  kwargs["reply_to"] = reply_to
+              
+              try:
+                  await client.send_file(**kwargs)
+              finally:
+                  if thumb_path and os.path.exists(thumb_path):
+                      try: os.remove(thumb_path)
+                      except Exception: pass
+
+          async def upload_episodes(client, entity, topic_id):
+              def get_ep_num(f):
+                  m = re.search(r'EP(\d+)\.mp4', f)
+                  return int(m.group(1)) if m else 0
+              
+              ep_files = sorted(glob.glob("downloads/EP*.mp4"), key=get_ep_num)
+              if not ep_files:
+                  ep_files = sorted(glob.glob("EP*.mp4"), key=get_ep_num)
+              
+              print(f"Found {len(ep_files)} episode files")
+              if not ep_files:
+                  return False
+              
+              uploaded_count = 0
+              for ep_file in ep_files:
+                  ep_num = get_ep_num(ep_file)
+                  if ep_num == 0 or not os.path.isfile(ep_file):
+                      continue
+                  
+                  file_size = os.path.getsize(ep_file) / (1024 * 1024)
+                  if file_size > 2000:
+                      print(f"Episode {ep_num} size ({file_size:.2f} MB) exceeds 2GB limit!")
+                      continue
+                  
+                  ep_caption = f"Episode {ep_num}"
+                  print(f"Uploading Episode {ep_num} ({file_size:.2f} MB)...", flush=True)
+                  
+                  try:
+                      await send_file_with_metadata(client, entity, ep_file, ep_caption, topic_id)
+                      print(f"Uploaded Episode {ep_num}")
+                      uploaded_count += 1
+                      await asyncio.sleep(2)
+                  except FloodWaitError as e:
+                      print(f"Rate limited: Waiting {e.seconds} seconds...")
+                      await asyncio.sleep(e.seconds)
+                      await send_file_with_metadata(client, entity, ep_file, ep_caption, topic_id)
+                      print(f"Uploaded Episode {ep_num}")
+                      uploaded_count += 1
+                  except Exception as e:
+                      print(f"Failed to upload Episode {ep_num}: {e}")
+              
+              print(f"Successfully uploaded {uploaded_count} episodes")
+              return uploaded_count > 0
+
+          async def upload_merged_video(client, entity):
+              if not video_path or not os.path.isfile(video_path):
+                  print(f"Video file not found: {video_path}")
+                  return False
+              
+              file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+              print(f"File size: {file_size_mb:.2f} MB")
+              
+              if file_size_mb > 2000:
+                  print(f"File size exceeds Telegram's 2GB limit!")
+                  return False
+              
+              now = datetime.datetime.now()
+              month_year = now.strftime("%B%Y").upper()
+              clean_label = label.upper().replace("-", "").replace(" ", "")
+              caption = f"{title}\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}"
+              
+              try:
+                  print("Uploading merged video...", flush=True)
+                  await send_file_with_metadata(client, entity, video_path, caption)
+                  print("Merged video upload complete!")
+                  return True
+              except FloodWaitError as e:
+                  print(f"Rate limited: Waiting {e.seconds} seconds...")
+                  await asyncio.sleep(e.seconds)
+                  await send_file_with_metadata(client, entity, video_path, caption)
+                  print("Merged video upload complete!")
+                  return True
+              except Exception as e:
+                  print(f"Failed to upload merged video: {e}")
+                  return False
+
+          async def main():
+              try:
+                  print("Connecting with Telethon StringSession...")
+                  clean_session = session_string.strip()
+                  
+                  client = TelegramClient(StringSession(clean_session), int(api_id), api_hash)
+                  await client.connect()
+                  
+                  if not await client.is_user_authorized():
+                      print("Session string is invalid or expired.")
+                      return
+                  
+                  me = await client.get_me()
+                  print(f"Logged in as: {me.first_name} (@{me.username or 'No username'})")
+                  
+                  # 1. Resolve Individual Episodes Group
+                  single_entity = await resolve_chat_id(
+                      client, 
+                      single_chat_id, 
+                      single_invite_link,
+                      search_name=single_name
+                  )
+                  
+                  # 2. Resolve Merged Video Channel
+                  merged_entity = await resolve_chat_id(
+                      client, 
+                      merged_chat_id, 
+                      merged_invite_link,
+                      search_name=merged_name
+                  )
+                  
+                  if single_entity:
+                      print("Starting individual episodes upload...")
+                      topic_id = None
+                      if getattr(single_entity, "forum", False):
+                          try:
+                              res = await client(CreateForumTopicRequest(
+                                  channel=single_entity,
+                                  title=series_title[:50]
+                              ))
+                              topic_id = res.updates[0].id
+                              print(f"Created forum topic '{series_title[:50]}' (ID: {topic_id})")
+                          except Exception as e:
+                              print(f"Could not create forum topic: {e}")
+                      
+                      await upload_episodes(client, single_entity, topic_id)
+                  else:
+                      print("Could not resolve target group for individual episodes.")
+                  
+                  if merged_entity:
+                      print("Starting merged video upload...")
+                      await upload_merged_video(client, merged_entity)
+                  else:
+                      print("Could not resolve target channel for merged video.")
+                  
+                  await client.disconnect()
+                  print("=======================================================")
+                  print("Upload process completed!")
+                  print("=======================================================")
+                          
+              except Exception as e:
+                  print(f"Fatal error: {e}")
+                  traceback.print_exc()
+
+          if __name__ == '__main__':
+              asyncio.run(main())
+          EOF
+          
+          python3 -u upload_telegram.py
