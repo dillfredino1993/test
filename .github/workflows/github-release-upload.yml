@@ -47,42 +47,40 @@ jobs:
         run: |
           mkdir -p downloads && cd downloads
           
-          # Parse and clean URLs from payload - FIXED to handle ps:// properly
+          # Parse and clean URLs from payload - FIXED to prevent double protocol
           cat << 'PYEOF' > parse_urls.py
           import os, json, re
           
           def clean_url(url):
-              """Clean and fix common URL issues - FIXED"""
+              """Clean and fix common URL issues - PREVENTS DOUBLE PROTOCOL"""
               url = url.strip()
               
-              # CRITICAL FIX: Handle ps:// protocol
-              if url.startswith('ps://'):
-                  # Replace ps:// with https://
-                  url = url.replace('ps://', 'https://')
-                  print(f"🔧 Fixed ps:// → https://")
+              # Remove any existing protocol first to avoid duplicates
+              # Remove http://, https://, ps://, etc.
+              url = re.sub(r'^[a-zA-Z]+://', '', url)
               
-              # Fix ps:// anywhere in URL (not just start)
-              url = re.sub(r'ps://', 'https://', url)
+              # If URL starts with ps://, remove it (already handled above)
+              url = re.sub(r'^ps://', '', url)
               
-              # Fix missing protocol
+              # Remove any remaining protocol prefixes (htthttps, etc.)
+              url = re.sub(r'^https?https?://', '', url)
+              url = re.sub(r'^https?://https?://', '', url)
+              
+              # Remove duplicate slashes at start
+              url = re.sub(r'^//+', '', url)
+              
+              # Ensure we have a clean domain
               if not url.startswith(('http://', 'https://')):
-                  if '.m3u8' in url or '.mp4' in url or '.ts' in url:
+                  # Check if it looks like a valid domain/path
+                  if re.match(r'^[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}', url) or '/' in url:
                       url = 'https://' + url
-                      print(f"🔧 Added https://")
+                  else:
+                      return None
               
-              # Fix double protocols
+              # Final cleanup - remove any double protocols again
+              url = re.sub(r'^https?https?://', 'https://', url)
               url = re.sub(r'^http://https://', 'https://', url)
               url = re.sub(r'^https://http://', 'https://', url)
-              
-              # Remove duplicate slashes (but keep protocol)
-              url = re.sub(r'(?<!:)//+', '/', url)
-              
-              # Remove any remaining invalid protocol prefixes
-              url = re.sub(r'^[a-zA-Z]+://(?![http])', 'https://', url)
-              
-              # Ensure it starts with http:// or https://
-              if not url.startswith(('http://', 'https://')):
-                  url = 'https://' + url
               
               return url
           
@@ -110,7 +108,7 @@ jobs:
           cleaned_urls = []
           for url in urls:
               cleaned = clean_url(url)
-              if cleaned.startswith(('http://', 'https://')):
+              if cleaned and cleaned.startswith(('http://', 'https://')):
                   cleaned_urls.append(cleaned)
                   if '.m3u8' in cleaned:
                       print(f"📺 HLS Stream: {cleaned}")
@@ -273,11 +271,13 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # Double-check URL protocol before download
-            if [[ "$URL" == ps://* ]]; then
-              URL="${URL/ps:/https:}"
-              echo "🔧 Fixed ps:// to https:// in URL: $URL"
-            fi
+            # Final URL verification - fix any remaining double protocols
+            URL=$(echo "$URL" | sed 's|https://https://|https://|g')
+            URL=$(echo "$URL" | sed 's|http://https://|https://|g')
+            URL=$(echo "$URL" | sed 's|https://http://|https://|g')
+            URL=$(echo "$URL" | sed 's|htthttps://|https://|g')
+            
+            echo "📎 Cleaned URL: $URL"
             
             if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *"m3u8"* ]]; then
               echo "📺 Detected HLS stream - Using yt-dlp"
