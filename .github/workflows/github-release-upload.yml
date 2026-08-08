@@ -54,9 +54,15 @@ jobs:
             empty
           ' > urls_raw.txt
           
+          # UNIVERSAL URL CLEANING - Remove ANY protocol prefix
           cat urls_raw.txt | while read -r URL; do
             if [ -n "$URL" ]; then
-              CLEANED=$(echo "$URL" | sed -E 's|^[a-zA-Z]+://||g' | sed -E 's|^//+||g')
+              # Remove ANY protocol prefix (http://, https://, ps://, tps://, anything://)
+              # This uses a regex that matches any letters followed by ://
+              CLEANED=$(echo "$URL" | sed -E 's|^[a-zA-Z]+://||g')
+              # Remove any duplicate slashes at start
+              CLEANED=$(echo "$CLEANED" | sed -E 's|^//+||g')
+              # Add https://
               echo "https://$CLEANED" >> urls.txt
             fi
           done
@@ -65,6 +71,8 @@ jobs:
           
           echo "========================================="
           echo "📋 Found $(cat urls.txt | wc -l) URLs"
+          echo "========================================="
+          cat urls.txt
           echo "========================================="
           
           echo "total_episodes=$(cat urls.txt | wc -l)" >> $GITHUB_ENV
@@ -332,7 +340,6 @@ jobs:
           TOTAL_FILES=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           echo "✅ Downloaded: $TOTAL_FILES/$TOTAL_EPISODES episodes"
           
-          # ALL-OR-NOTHING CHECK
           if [ -n "$FAILED_EPISODES" ]; then
             echo "❌ FAILED EPISODES: $FAILED_EPISODES"
             echo "❌ Not all episodes downloaded successfully!"
@@ -543,7 +550,6 @@ jobs:
                       except: pass
 
           async def upload_episodes(client, entity, topic_id):
-              # Get episode files in order (EP01, EP02, etc.)
               ep_files = sorted(glob.glob("EP*.mp4"), 
                   key=lambda f: int(re.search(r'EP(\d+)\.mp4', f).group(1)) if re.search(r'EP(\d+)\.mp4', f) else 0)
               
@@ -565,7 +571,6 @@ jobs:
                       print(f"⚠️ Episode {ep_num} size ({file_size:.2f} MB) exceeds 2GB! Skipping.")
                       continue
                   
-                  # Simple caption - just episode number
                   caption = f"📺 Episode {ep_num}"
                   
                   print(f"📤 Uploading Episode {ep_num} ({file_size:.1f} MB)...")
@@ -663,10 +668,8 @@ jobs:
             exit 1
           fi
           
-          # Only merge if we have more than 1 episode
           if [ "$EP_COUNT" -eq 1 ]; then
             echo "📦 Only 1 episode - skipping merge"
-            # Just rename the single episode
             SINGLE_FILE=$(ls EP*.mp4 | head -1)
             ffmpeg -i "$SINGLE_FILE" -c copy -movflags +faststart \
               -metadata title="$TITLE" \
@@ -883,7 +886,6 @@ jobs:
           echo "🔍 VERIFYING MERGED FILE WITH MEDIAINFO"
           echo "========================================="
           
-          # Check if MediaInfo can read the file
           if mediainfo output.mp4 > /dev/null 2>&1; then
             echo "✅ MediaInfo can read the file"
             echo ""
@@ -896,7 +898,6 @@ jobs:
             echo "❌ MediaInfo cannot read the file!"
             echo "🔧 Attempting to repair..."
             
-            # Attempt repair - re-encode
             ffmpeg -y -err_detect ignore_err -i output.mp4 \
               -c:v libx264 -preset veryfast -crf 23 \
               -c:a aac -b:a 128k \
