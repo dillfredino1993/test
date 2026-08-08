@@ -46,6 +46,7 @@ jobs:
         run: |
           mkdir -p downloads && cd downloads
           
+          # Parse with jq first - THIS IS THE BETTER TOOL
           echo "$CLIENT_PAYLOAD" | jq -r '
             .episodes[]?.url // 
             .video_urls[]? // 
@@ -54,28 +55,58 @@ jobs:
             empty
           ' > urls_raw.txt
           
-          # UNIVERSAL URL CLEANING - Remove ANY protocol prefix
-          cat urls_raw.txt | while read -r URL; do
-            if [ -n "$URL" ]; then
-              # Remove ANY protocol prefix (http://, https://, ps://, tps://, anything://)
-              # This uses a regex that matches any letters followed by ://
-              CLEANED=$(echo "$URL" | sed -E 's|^[a-zA-Z]+://||g')
-              # Remove any duplicate slashes at start
-              CLEANED=$(echo "$CLEANED" | sed -E 's|^//+||g')
+          echo "========================================="
+          echo "📋 Raw URLs from jq:"
+          cat urls_raw.txt
+          echo "========================================="
+          
+          # Clean URLs with Python (only cleaning, not parsing)
+          cat << 'PYEOF' > clean_urls.py
+          import re
+          import sys
+          
+          def clean_url(url):
+              """Remove ANY protocol prefix and add https://"""
+              url = url.strip()
+              if not url:
+                  return None
+              
+              # Remove ANY protocol prefix (http://, https://, ps://, tps://, etc.)
+              url = re.sub(r'^[a-zA-Z]+://', '', url)
+              
+              # Remove duplicate slashes at start
+              url = re.sub(r'^//+', '', url)
+              
               # Add https://
-              echo "https://$CLEANED" >> urls.txt
-            fi
-          done
+              return 'https://' + url
           
-          sed -i '/^$/d' urls.txt
+          # Read raw URLs from stdin, clean them
+          cleaned_urls = []
+          for line in sys.stdin:
+              line = line.strip()
+              if line:
+                  cleaned = clean_url(line)
+                  if cleaned:
+                      cleaned_urls.append(cleaned)
+                      print(f"✅ Cleaned: {line} -> {cleaned}")
+          
+          # Write to urls.txt
+          with open('urls.txt', 'w') as f:
+              for url in cleaned_urls:
+                  f.write(url + '\n')
+          
+          print(f"\n✅ Total URLs after cleaning: {len(cleaned_urls)}")
+          PYEOF
+          
+          # Pipe raw URLs to Python cleaner
+          cat urls_raw.txt | python3 clean_urls.py
           
           echo "========================================="
-          echo "📋 Found $(cat urls.txt | wc -l) URLs"
-          echo "========================================="
+          echo "📋 Final URLs:"
           cat urls.txt
           echo "========================================="
           
-          echo "total_episodes=$(cat urls.txt | wc -l)" >> $GITHUB_ENV
+          echo "total_episodes=$(cat urls.txt 2>/dev/null | wc -l)" >> $GITHUB_ENV
           
           if [ ! -s urls.txt ]; then
             echo "❌ No valid URLs found!"
