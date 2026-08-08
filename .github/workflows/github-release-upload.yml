@@ -39,96 +39,65 @@ jobs:
           echo "series_title=${CLEAN_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "clean_label=${CLEAN_LABEL}" >> $GITHUB_OUTPUT
 
-      - name: Parse and Clean URLs
-        id: parse_urls
+      - name: Parse URLs (Original Working Method)
         env:
           CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
           mkdir -p downloads && cd downloads
           
-          # Step 1: Parse with jq
-          echo "$CLIENT_PAYLOAD" | jq -r '
-            .episodes[]?.url // 
-            .video_urls[]? // 
-            .video_url // 
-            .url // 
-            empty
-          ' > urls_raw.txt
+          # Use Python to extract URLs - just like the old working workflow
+          cat << 'PYEOF' > parse_urls.py
+          import os, json
           
-          echo "========================================="
-          echo "📋 Raw URLs from jq:"
-          cat urls_raw.txt
-          echo "========================================="
+          payload_str = os.environ.get("CLIENT_PAYLOAD", "{}")
+          try:
+              data = json.loads(payload_str)
+          except Exception as e:
+              print(f"Error parsing JSON: {e}")
+              data = {}
           
-          # Step 2: Clean with Python - SAVE TO urls.txt
-          cat << 'PYEOF' > clean_urls.py
-          import re
-          import sys
+          urls = []
+          if isinstance(data.get("episodes"), list):
+              for ep in data["episodes"]:
+                  if isinstance(ep, dict) and ep.get("url"):
+                      urls.append(str(ep["url"]))
+                  elif isinstance(ep, str):
+                      urls.append(ep)
+          elif isinstance(data.get("video_urls"), list):
+              urls = [str(u) for u in data["video_urls"] if u]
+          elif data.get("video_url"):
+              urls.append(str(data["video_url"]))
+          elif data.get("url"):
+              urls.append(str(data["url"]))
           
-          def clean_url(url):
-              """Remove ANY protocol prefix and add https://"""
-              url = url.strip()
-              if not url:
-                  return None
-              
-              # Remove ANY protocol prefix (http://, https://, ps://, tps://, etc.)
-              url = re.sub(r'^[a-zA-Z]+://', '', url)
-              
-              # Remove duplicate slashes at start
-              url = re.sub(r'^//+', '', url)
-              
-              # Add https://
-              return 'https://' + url
+          with open("urls.txt", "w", encoding="utf-8") as f:
+              for u in urls:
+                  f.write(u.strip() + "\n")
           
-          # Read raw URLs from stdin, clean them
-          cleaned_urls = []
-          for line in sys.stdin:
-              line = line.strip()
-              if line:
-                  cleaned = clean_url(line)
-                  if cleaned:
-                      cleaned_urls.append(cleaned)
-                      print(f"✅ Cleaned: {line} -> {cleaned}")
-          
-          # Write to urls.txt - THIS IS WHAT DOWNLOAD LOOP READS
-          with open('urls.txt', 'w') as f:
-              for url in cleaned_urls:
-                  f.write(url + '\n')
-          
-          print(f"\n✅ Total URLs after cleaning: {len(cleaned_urls)}")
+          print(f"Found {len(urls)} URLs to download.")
           PYEOF
+
+          python3 parse_urls.py
           
-          # Run the cleaning
-          cat urls_raw.txt | python3 clean_urls.py
-          
-          # VERIFY: Show the final URLs that will be used
           echo "========================================="
-          echo "📋 FINAL URLs (will be used for download):"
+          echo "📋 URLs to download:"
           cat urls.txt
           echo "========================================="
           
-          # Count episodes
-          EP_COUNT=$(cat urls.txt 2>/dev/null | wc -l)
-          echo "total_episodes=$EP_COUNT" >> $GITHUB_ENV
+          echo "total_episodes=$(cat urls.txt | wc -l)" >> $GITHUB_ENV
           
           if [ ! -s urls.txt ]; then
             echo "❌ No valid URLs found!"
             exit 1
           fi
 
-      - name: Download All Episodes
+      - name: Download All Episodes (All-or-Nothing)
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
           LABEL: ${{ github.event.client_payload.label || 'NONE' }}
         run: |
           cd downloads
-          
-          # DEBUG: Show what's in urls.txt before download
-          echo "========================================="
-          echo "🔍 DEBUG: urls.txt content:"
-          cat urls.txt
-          echo "========================================="
           
           TOTAL_EPISODES=$(cat urls.txt | wc -l)
           echo "📥 Need to download $TOTAL_EPISODES episodes"
@@ -265,72 +234,18 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # Verify URL starts with https://
-            if [[ ! "$URL" =~ ^https?:// ]]; then
-              echo "❌ Invalid URL (doesn't start with http:// or https://): $URL"
-              FAILED_EPISODES="$FAILED_EPISODES $EP_NUM"
-              EP_INDEX=$((EP_INDEX + 1))
-              continue
-            fi
-            
-            if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *"m3u8"* ]]; then
+            # Use the same download logic as the old working workflow
+            if [[ "$URL" == *".m3u8"* ]]; then
               echo "📺 HLS stream - Using yt-dlp"
-              
-              yt-dlp -f "bestvideo+bestaudio/best" \
-                --hls-use-mpegts \
-                --concurrent-fragments 16 \
-                --embed-metadata \
-                --add-metadata \
-                --no-check-certificate \
-                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                -o "$OUT_FILE" \
-                --progress \
-                --newline \
-                "$URL"
-              
+              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts --concurrent-fragments 16 -o "$OUT_FILE" "$URL" || \
+              yt-dlp -o "$OUT_FILE" "$URL" || \
+              ffmpeg -i "$URL" -c copy "$OUT_FILE"
               DOWNLOAD_STATUS=$?
             else
               echo "🎬 Direct file - Using aria2c"
-              
-              aria2c -x 16 -s 16 -k 1M \
-                --continue=true \
-                --max-connection-per-server=16 \
-                --split=16 \
-                --min-split-size=1M \
-                --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                --timeout=60 \
-                --connect-timeout=60 \
-                --console-log-level=notice \
-                --summary-interval=5 \
-                -o "$OUT_FILE" \
-                "$URL"
-              
+              aria2c -x 16 -s 16 -k 1M --continue=true -o "$OUT_FILE" "$URL" || \
+              curl -sSL "$URL" -o "$OUT_FILE"
               DOWNLOAD_STATUS=$?
-              
-              if [ $DOWNLOAD_STATUS -ne 0 ]; then
-                echo "⚠️ aria2c failed, trying curl..."
-                curl -L -o "$OUT_FILE" \
-                  -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                  --progress-bar \
-                  --connect-timeout 60 \
-                  --max-time 600 \
-                  "$URL"
-                
-                DOWNLOAD_STATUS=$?
-              fi
-              
-              if [ $DOWNLOAD_STATUS -ne 0 ]; then
-                echo "⚠️ curl failed, trying wget..."
-                wget -O "$OUT_FILE" \
-                  --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                  --no-check-certificate \
-                  --timeout=300 \
-                  --tries=3 \
-                  --progress=bar:force \
-                  "$URL"
-                
-                DOWNLOAD_STATUS=$?
-              fi
             fi
             
             if [ $DOWNLOAD_STATUS -eq 0 ] && [ -f "$OUT_FILE" ]; then
