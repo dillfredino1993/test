@@ -39,14 +39,14 @@ jobs:
           echo "series_title=${CLEAN_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "clean_label=${CLEAN_LABEL}" >> $GITHUB_OUTPUT
 
-      - name: Parse URLs with jq
+      - name: Parse and Clean URLs
         id: parse_urls
         env:
           CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
           mkdir -p downloads && cd downloads
           
-          # Parse with jq first - THIS IS THE BETTER TOOL
+          # Step 1: Parse with jq
           echo "$CLIENT_PAYLOAD" | jq -r '
             .episodes[]?.url // 
             .video_urls[]? // 
@@ -60,7 +60,7 @@ jobs:
           cat urls_raw.txt
           echo "========================================="
           
-          # Clean URLs with Python (only cleaning, not parsing)
+          # Step 2: Clean with Python - SAVE TO urls.txt
           cat << 'PYEOF' > clean_urls.py
           import re
           import sys
@@ -90,7 +90,7 @@ jobs:
                       cleaned_urls.append(cleaned)
                       print(f"✅ Cleaned: {line} -> {cleaned}")
           
-          # Write to urls.txt
+          # Write to urls.txt - THIS IS WHAT DOWNLOAD LOOP READS
           with open('urls.txt', 'w') as f:
               for url in cleaned_urls:
                   f.write(url + '\n')
@@ -98,22 +98,25 @@ jobs:
           print(f"\n✅ Total URLs after cleaning: {len(cleaned_urls)}")
           PYEOF
           
-          # Pipe raw URLs to Python cleaner
+          # Run the cleaning
           cat urls_raw.txt | python3 clean_urls.py
           
+          # VERIFY: Show the final URLs that will be used
           echo "========================================="
-          echo "📋 Final URLs:"
+          echo "📋 FINAL URLs (will be used for download):"
           cat urls.txt
           echo "========================================="
           
-          echo "total_episodes=$(cat urls.txt 2>/dev/null | wc -l)" >> $GITHUB_ENV
+          # Count episodes
+          EP_COUNT=$(cat urls.txt 2>/dev/null | wc -l)
+          echo "total_episodes=$EP_COUNT" >> $GITHUB_ENV
           
           if [ ! -s urls.txt ]; then
             echo "❌ No valid URLs found!"
             exit 1
           fi
 
-      - name: Download All Episodes (All-or-Nothing)
+      - name: Download All Episodes
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -121,9 +124,16 @@ jobs:
         run: |
           cd downloads
           
+          # DEBUG: Show what's in urls.txt before download
+          echo "========================================="
+          echo "🔍 DEBUG: urls.txt content:"
+          cat urls.txt
+          echo "========================================="
+          
           TOTAL_EPISODES=$(cat urls.txt | wc -l)
           echo "📥 Need to download $TOTAL_EPISODES episodes"
           
+          # Create verify_and_repair.py
           cat > verify_and_repair.py << 'EOFVERIFY'
           import os
           import sys
@@ -254,6 +264,14 @@ jobs:
             echo "📎 URL: $URL"
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
+            
+            # Verify URL starts with https://
+            if [[ ! "$URL" =~ ^https?:// ]]; then
+              echo "❌ Invalid URL (doesn't start with http:// or https://): $URL"
+              FAILED_EPISODES="$FAILED_EPISODES $EP_NUM"
+              EP_INDEX=$((EP_INDEX + 1))
+              continue
+            fi
             
             if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *"m3u8"* ]]; then
               echo "📺 HLS stream - Using yt-dlp"
