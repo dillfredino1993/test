@@ -39,45 +39,23 @@ jobs:
           echo "series_title=${CLEAN_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "clean_label=${CLEAN_LABEL}" >> $GITHUB_OUTPUT
 
-      - name: Parse URLs (Original Working Method)
+      - name: Parse URLs with jq (Better Tool)
         env:
           CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
           mkdir -p downloads && cd downloads
           
-          # Use Python to extract URLs - just like the old working workflow
-          cat << 'PYEOF' > parse_urls.py
-          import os, json
+          # Use jq to extract URLs - BETTER TOOL than Python
+          echo "$CLIENT_PAYLOAD" | jq -r '
+            .episodes[]?.url // 
+            .video_urls[]? // 
+            .video_url // 
+            .url // 
+            empty
+          ' > urls.txt
           
-          payload_str = os.environ.get("CLIENT_PAYLOAD", "{}")
-          try:
-              data = json.loads(payload_str)
-          except Exception as e:
-              print(f"Error parsing JSON: {e}")
-              data = {}
-          
-          urls = []
-          if isinstance(data.get("episodes"), list):
-              for ep in data["episodes"]:
-                  if isinstance(ep, dict) and ep.get("url"):
-                      urls.append(str(ep["url"]))
-                  elif isinstance(ep, str):
-                      urls.append(ep)
-          elif isinstance(data.get("video_urls"), list):
-              urls = [str(u) for u in data["video_urls"] if u]
-          elif data.get("video_url"):
-              urls.append(str(data["video_url"]))
-          elif data.get("url"):
-              urls.append(str(data["url"]))
-          
-          with open("urls.txt", "w", encoding="utf-8") as f:
-              for u in urls:
-                  f.write(u.strip() + "\n")
-          
-          print(f"Found {len(urls)} URLs to download.")
-          PYEOF
-
-          python3 parse_urls.py
+          # Remove empty lines
+          sed -i '/^$/d' urls.txt
           
           echo "========================================="
           echo "📋 URLs to download:"
@@ -1093,10 +1071,12 @@ jobs:
               now = datetime.datetime.now()
               month_year = now.strftime("%B%Y").upper()
               
+              # Label handling - same as old workflow
               clean_label = str(label).upper().replace("-", "").replace(" ", "").replace("_", "")
               if clean_label == "NONE" or clean_label == "":
                   clean_label = "NONE"
               
+              # Caption format from old workflow
               caption = f"{title}\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}"
               
               print(f"📤 Uploading merged video...")
