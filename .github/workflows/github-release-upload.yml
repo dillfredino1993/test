@@ -47,40 +47,59 @@ jobs:
         run: |
           mkdir -p downloads && cd downloads
           
-          # Parse and clean URLs from payload - ULTRA AGGRESSIVE CLEANING
+          # Parse and clean URLs from payload - UNIVERSAL URL CLEANING
           cat << 'PYEOF' > parse_urls.py
           import os, json, re
           
           def clean_url(url):
-              """ULTRA AGGRESSIVE URL CLEANING - Fixes all protocol issues"""
+              """
+              UNIVERSAL URL CLEANING - Works for ANY domain
+              The problem: URLs come with ps://, htthttps://, duplicate protocols
+              Solution: Strip ALL protocol prefixes, then add ONE https://
+              """
               url = url.strip()
               
-              # Step 1: Remove ALL protocol prefixes and duplicates
-              # Remove any combination of http/https/ps/htthttps etc.
-              url = re.sub(r'^(https?://)+', '', url)
-              url = re.sub(r'^(ps://)+', '', url)
-              url = re.sub(r'^(htthttps?://)+', '', url)
-              url = re.sub(r'^(http://https?://)+', '', url)
-              url = re.sub(r'^(https?://http://)+', '', url)
+              # STEP 1: Remove ANY protocol prefix (http://, https://, ps://, etc.)
+              # This regex matches: protocol:// where protocol can be any letters
+              # It will strip: ps://, https://, http://, htthttps://, etc.
+              url = re.sub(r'^[a-zA-Z]+://', '', url)
               
-              # Step 2: Remove any remaining protocol-like patterns
-              url = re.sub(r'https?https?://', '', url)
-              url = re.sub(r'ps://', '', url)
-              url = re.sub(r'htthttps://', '', url)
-              url = re.sub(r'http://https://', '', url)
-              url = re.sub(r'https://http://', '', url)
+              # STEP 2: Remove any remaining protocol-like patterns anywhere
+              # Handle cases like: domain.com/https://path or domain.com/ps://path
+              url = re.sub(r'[a-zA-Z]+://', '', url)
               
-              # Step 3: Remove duplicate slashes at start
+              # STEP 3: Remove duplicate slashes at the beginning
               url = re.sub(r'^//+', '', url)
               
-              # Step 4: Now add https:// once
-              if url and not url.startswith(('http://', 'https://')):
-                  url = 'https://' + url
-              
-              # Step 5: Final validation - ensure it's a proper URL
-              if not re.match(r'^https?://[a-zA-Z0-9\-\.]+', url):
-                  print(f"⚠️ Invalid URL after cleaning: {url}")
+              # STEP 4: If the URL is empty or just whitespace, return None
+              if not url or not url.strip():
                   return None
+              
+              # STEP 5: Add a SINGLE https:// prefix
+              url = 'https://' + url
+              
+              # STEP 6: Clean up any double slashes in the path (but keep protocol)
+              # This handles: https://domain.com//path -> https://domain.com/path
+              url = re.sub(r'(?<!:)//+', '/', url)
+              
+              # STEP 7: Remove any duplicate protocols that might have survived
+              # This handles: https://https://domain.com -> https://domain.com
+              url = re.sub(r'^https?://https?://', 'https://', url)
+              
+              # STEP 8: Final validation - ensure it looks like a URL
+              if not re.match(r'^https?://[a-zA-Z0-9\-\.]+', url):
+                  # Try to extract a path if the URL is malformed
+                  path_match = re.search(r'(/[a-zA-Z0-9\-_/\.]+)', url)
+                  if path_match:
+                      # Try to find a domain in the URL
+                      domain_match = re.search(r'([a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,})', url)
+                      if domain_match:
+                          url = 'https://' + domain_match.group(1) + path_match.group(1)
+                      else:
+                          # If no domain found, the URL is likely invalid
+                          return None
+                  else:
+                      return None
               
               return url
           
@@ -108,45 +127,35 @@ jobs:
           cleaned_urls = []
           for url in urls:
               cleaned = clean_url(url)
-              if cleaned and cleaned.startswith(('http://', 'https://')):
+              if cleaned:
                   cleaned_urls.append(cleaned)
                   if '.m3u8' in cleaned:
-                      print(f"📺 HLS Stream: {cleaned}")
+                      print(f"📺 HLS: {cleaned}")
                   elif '.mp4' in cleaned:
-                      print(f"🎬 MP4 Video: {cleaned}")
+                      print(f"🎬 MP4: {cleaned}")
                   else:
-                      print(f"❓ Unknown type: {cleaned}")
+                      print(f"❓ Other: {cleaned}")
               else:
                   print(f"⚠️ Skipping invalid URL: {url}")
           
-          # Write cleaned URLs to file - ONE URL PER LINE
           with open("urls.txt", "w", encoding="utf-8") as f:
               for u in cleaned_urls:
                   f.write(u.strip() + "\n")
           
-          print(f"Found {len(cleaned_urls)} valid URLs to download.")
-          
-          # Write a debug file to see what was saved
-          with open("urls_debug.txt", "w") as f:
-              f.write("Cleaned URLs:\n")
-              for u in cleaned_urls:
-                  f.write(f"  {u}\n")
+          print(f"✅ Found {len(cleaned_urls)} valid URLs")
           PYEOF
           
           python3 parse_urls.py
           
-          # Show the URLs being used
+          if [ ! -s urls.txt ]; then
+            echo "❌ No valid URLs found!"
+            exit 1
+          fi
+          
           echo "========================================="
           echo "📋 URLs to download:"
           cat urls.txt
           echo "========================================="
-          
-          if [ ! -s urls.txt ]; then
-            echo "❌ No valid URLs found to download!"
-            exit 1
-          fi
-          
-          echo "📥 Starting download of $(cat urls.txt | wc -l) episodes..."
           
           # Create verify_and_repair.py
           cat > verify_and_repair.py << 'EOFVERIFY'
@@ -280,47 +289,19 @@ jobs:
             
             echo "========================================="
             echo "📥 Downloading Episode $EP_INDEX/$TOTAL_EPISODES"
-            echo "📎 Original URL: $URL"
-            
-            # ULTRA AGGRESSIVE URL CLEANING IN BASH
-            # Remove ALL protocol prefixes
-            URL=$(echo "$URL" | sed -E 's|^(https?://)+||g')
-            URL=$(echo "$URL" | sed -E 's|^(ps://)+||g')
-            URL=$(echo "$URL" | sed -E 's|^(htthttps?://)+||g')
-            URL=$(echo "$URL" | sed -E 's|^(http://https?://)+||g')
-            URL=$(echo "$URL" | sed -E 's|^(https?://http://)+||g')
-            # Remove any remaining protocol-like patterns
-            URL=$(echo "$URL" | sed 's|https://https://|https://|g')
-            URL=$(echo "$URL" | sed 's|http://https://|https://|g')
-            URL=$(echo "$URL" | sed 's|https://http://|https://|g')
-            URL=$(echo "$URL" | sed 's|ps://||g')
-            URL=$(echo "$URL" | sed 's|htthttps://||g')
-            # Remove duplicate slashes
-            URL=$(echo "$URL" | sed 's|^//+||g')
-            # Add https://
-            URL="https://$URL"
-            
-            echo "📎 Cleaned URL: $URL"
+            echo "📎 URL: $URL"
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # Verify URL starts with https://
-            if [[ ! "$URL" == https://* ]] && [[ ! "$URL" == http://* ]]; then
-              echo "❌ URL is still invalid after cleaning: $URL"
-              EP_INDEX=$((EP_INDEX + 1))
-              continue
-            fi
-            
-            # Verify URL has a valid domain
-            DOMAIN=$(echo "$URL" | sed -E 's|^https?://([^/]+).*|\1|')
-            if [ -z "$DOMAIN" ] || [ "$DOMAIN" = "$URL" ]; then
-              echo "❌ URL has no valid domain: $URL"
+            # Verify URL is valid
+            if [[ ! "$URL" =~ ^https?:// ]]; then
+              echo "❌ Invalid URL (doesn't start with http:// or https://): $URL"
               EP_INDEX=$((EP_INDEX + 1))
               continue
             fi
             
             if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *"m3u8"* ]]; then
-              echo "📺 Detected HLS stream - Using yt-dlp"
+              echo "📺 HLS stream - Using yt-dlp"
               
               yt-dlp -f "bestvideo+bestaudio/best" \
                 --hls-use-mpegts \
@@ -329,7 +310,6 @@ jobs:
                 --add-metadata \
                 --no-check-certificate \
                 --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                --referer "https://v-mps.crazymaplestudios.com/" \
                 -o "$OUT_FILE" \
                 --progress \
                 --newline \
@@ -337,7 +317,7 @@ jobs:
               
               DOWNLOAD_STATUS=$?
             else
-              echo "🎬 Detected direct MP4 - Using aria2c"
+              echo "🎬 Direct file - Using aria2c"
               
               aria2c -x 16 -s 16 -k 1M \
                 --continue=true \
@@ -345,7 +325,6 @@ jobs:
                 --split=16 \
                 --min-split-size=1M \
                 --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                --header="Referer: https://v-mps.crazymaplestudios.com/" \
                 --timeout=60 \
                 --connect-timeout=60 \
                 --console-log-level=notice \
@@ -359,7 +338,6 @@ jobs:
                 echo "⚠️ aria2c failed, trying curl..."
                 curl -L -o "$OUT_FILE" \
                   -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                  -H "Referer: https://v-mps.crazymaplestudios.com/" \
                   --progress-bar \
                   --connect-timeout 60 \
                   --max-time 600 \
@@ -372,7 +350,6 @@ jobs:
                 echo "⚠️ curl failed, trying wget..."
                 wget -O "$OUT_FILE" \
                   --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                  --header="Referer: https://v-mps.crazymaplestudios.com/" \
                   --no-check-certificate \
                   --timeout=300 \
                   --tries=3 \
@@ -387,12 +364,12 @@ jobs:
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
               
               if [ "$FILE_SIZE" -gt 1000000 ]; then
-                echo "✅ Successfully downloaded $OUT_FILE ($(du -h "$OUT_FILE" | cut -f1))"
+                echo "✅ Downloaded $OUT_FILE ($(du -h "$OUT_FILE" | cut -f1))"
                 
-                echo "🔍 Verifying file integrity with MediaInfo..."
+                echo "🔍 Verifying file..."
                 
                 if python3 verify_and_repair.py "$OUT_FILE"; then
-                  echo "✅ File verified and repaired (if needed)"
+                  echo "✅ File verified"
                   
                   # Add metadata
                   EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
@@ -407,29 +384,27 @@ jobs:
                     -metadata label="$LABEL" \
                     -metadata date="$(date +%Y-%m-%d)" \
                     -metadata media_type="tv_episode" \
-                    -metadata encoded_by="GitHub Actions Pipeline" \
                     -movflags +faststart \
                     "temp_$OUT_FILE" 2>/dev/null
                   
                   if [ $? -eq 0 ] && [ -f "temp_$OUT_FILE" ]; then
                     mv "temp_$OUT_FILE" "$OUT_FILE"
-                    echo "✅ Metadata added successfully"
+                    echo "✅ Metadata added"
                   else
-                    echo "⚠️ Could not add metadata, keeping original file"
+                    echo "⚠️ Could not add metadata"
                     rm -f "temp_$OUT_FILE"
                   fi
                   
-                  echo "📊 Key metadata from MediaInfo:"
-                  mediainfo --Inform="General;Duration: %Duration/String3%\nSize: %FileSize/String%" "$OUT_FILE" 2>/dev/null || echo "  General info not available"
-                  mediainfo --Inform="Video;Resolution: %Width%x%Height%\nCodec: %CodecID%\nBitrate: %BitRate/String%" "$OUT_FILE" 2>/dev/null || echo "  Video info not available"
+                  echo "📊 Metadata:"
+                  mediainfo --Inform="General;Duration: %Duration/String3%\nSize: %FileSize/String%" "$OUT_FILE" 2>/dev/null || echo "  General info unavailable"
+                  mediainfo --Inform="Video;Resolution: %Width%x%Height%\nCodec: %CodecID%" "$OUT_FILE" 2>/dev/null || echo "  Video info unavailable"
                   
-                  echo "========================================="
                 else
-                  echo "❌ File verification failed, skipping"
+                  echo "❌ File verification failed"
                   rm -f "$OUT_FILE"
                 fi
               else
-                echo "❌ Downloaded file too small: $OUT_FILE ($FILE_SIZE bytes)"
+                echo "❌ File too small: $OUT_FILE ($FILE_SIZE bytes)"
                 rm -f "$OUT_FILE"
               fi
             else
@@ -444,15 +419,15 @@ jobs:
           echo "📊 DOWNLOAD SUMMARY"
           echo "========================================="
           TOTAL_FILES=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
-          echo "✅ Successfully downloaded: $TOTAL_FILES/$TOTAL_EPISODES episodes"
+          echo "✅ Downloaded: $TOTAL_FILES/$TOTAL_EPISODES episodes"
           
           if [ "$TOTAL_FILES" -eq 0 ]; then
-            echo "❌ No episodes downloaded successfully!"
+            echo "❌ No episodes downloaded!"
             exit 1
           fi
           
           echo ""
-          echo "📁 Downloaded files:"
+          echo "📁 Files:"
           for f in EP*.mp4; do
             if [ -f "$f" ]; then
               SIZE=$(du -h "$f" | cut -f1)
@@ -469,13 +444,13 @@ jobs:
           
           EP_COUNT=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           if [ "$EP_COUNT" -eq 0 ]; then
-            echo "❌ No episodes downloaded successfully!"
+            echo "❌ No episodes to merge!"
             exit 1
           fi
           
-          echo "📊 Found $EP_COUNT episodes to merge"
+          echo "📊 Found $EP_COUNT episodes"
           
-          echo "🔍 Analyzing video resolutions with MediaInfo..."
+          echo "🔍 Analyzing resolutions..."
           
           declare -A resolutions
           for f in EP*.mp4; do
@@ -487,21 +462,21 @@ jobs:
           done
           
           if [ ${#resolutions[@]} -eq 0 ]; then
-            echo "❌ No valid video files found to merge!"
+            echo "❌ No valid files to merge!"
             exit 1
           fi
           
           TARGET_RES=$(printf '%s\n' "${resolutions[@]}" | grep -v "0x0" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           
           if [ -z "$TARGET_RES" ] || [ "$TARGET_RES" = "0x0" ]; then
-            echo "⚠️ Could not determine target resolution, using 1920x1080"
+            echo "⚠️ Using 1920x1080"
             TARGET_RES="1920x1080"
           fi
           
           TARGET_W=$(echo "$TARGET_RES" | cut -d'x' -f1)
           TARGET_H=$(echo "$TARGET_RES" | cut -d'x' -f2)
           
-          echo "🎯 Target resolution: ${TARGET_W}x${TARGET_H}"
+          echo "🎯 Target: ${TARGET_W}x${TARGET_H}"
           
           NORMALIZED_FILES=""
           NEEDS_REENCODE=false
@@ -511,10 +486,10 @@ jobs:
             CURRENT_RES="${resolutions[$f]}"
             
             if [ "$CURRENT_RES" == "$TARGET_RES" ]; then
-              echo "✅ Keeping original: $f"
+              echo "✅ Keeping: $f"
               NORMALIZED_FILES="$NORMALIZED_FILES $f"
             else
-              echo "⚠️ Normalizing: $f (${CURRENT_RES} → ${TARGET_RES})"
+              echo "⚠️ Normalizing: $f"
               NEEDS_REENCODE=true
               
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
@@ -525,16 +500,13 @@ jobs:
                 -c:v libx264 -preset veryfast -crf 23 \
                 -c:a copy \
                 -metadata title="$EPISODE_TITLE" \
-                -metadata episode_id="$EP_NUM" \
-                -metadata series="$SERIES_TITLE" \
-                -metadata label="$LABEL" \
                 -movflags +faststart \
                 "normalized_$f" 2>/dev/null
               
               if [ -f "normalized_$f" ]; then
                 NORMALIZED_FILES="$NORMALIZED_FILES normalized_$f"
               else
-                echo "⚠️ Normalization failed for $f, using original"
+                echo "⚠️ Normalization failed, using original"
                 NORMALIZED_FILES="$NORMALIZED_FILES $f"
               fi
             fi
@@ -548,7 +520,7 @@ jobs:
           fi
           
           if [ "$NEEDS_REENCODE" = "false" ] && [ $FILE_COUNT -gt 1 ]; then
-            echo "✅ All videos same resolution - Using FAST MKVToolNix merge"
+            echo "✅ Using MKVToolNix merge"
             
             MERGE_ARGS=""
             FIRST_FILE=true
@@ -564,20 +536,18 @@ jobs:
               fi
             done
             
-            echo "📁 Merging files: $MERGE_ARGS"
-            
             mkvmerge -o merged.mkv --title "$TITLE" --default-track 0:yes $MERGE_ARGS 2>/dev/null
             
             if [ -f "merged.mkv" ]; then
               echo "✅ MKVToolNix merge successful"
             else
-              echo "⚠️ MKVToolNix merge failed, falling back to FFmpeg..."
+              echo "⚠️ MKVToolNix failed, falling back to FFmpeg..."
               NEEDS_REENCODE=true
             fi
           fi
           
           if [ "$NEEDS_REENCODE" = "true" ] || [ ! -f "merged.mkv" ]; then
-            echo "⚠️ Using FFmpeg merge (re-encoding)"
+            echo "⚠️ Using FFmpeg merge"
             
             FILES=""
             FILTER=""
@@ -592,7 +562,7 @@ jobs:
             done
             
             if [ $COUNT -eq 0 ]; then
-              echo "❌ No valid files to merge!"
+              echo "❌ No valid files!"
               exit 1
             fi
             
@@ -623,23 +593,22 @@ jobs:
           fi
           
           if [ -f "merged.mkv" ]; then
-            echo "📦 Converting to final MP4 with metadata..."
+            echo "📦 Converting to MP4..."
             ffmpeg -i merged.mkv -c copy -movflags +faststart \
               -metadata title="$TITLE" \
               -metadata series="$SERIES_TITLE" \
               -metadata label="$LABEL" \
               -metadata year="$(date +%Y)" \
               -metadata date="$(date +%Y-%m-%d)" \
-              -metadata encoder="GitHub Actions Pipeline" \
               "output.mp4" 2>/dev/null
             rm -f merged.mkv
-            echo "✅ Converted to MP4"
+            echo "✅ Converted"
           elif [ -f "merged.mp4" ]; then
             mv merged.mp4 output.mp4
-            echo "✅ Using merged MP4 directly"
+            echo "✅ Using MP4"
           elif [ $(ls -1 EP*.mp4 2>/dev/null | wc -l) -eq 1 ]; then
             SINGLE_FILE=$(ls EP*.mp4 | head -1)
-            echo "📦 Single episode - converting to final format..."
+            echo "📦 Single episode..."
             ffmpeg -i "$SINGLE_FILE" -c copy -movflags +faststart \
               -metadata title="$TITLE" \
               -metadata series="$SERIES_TITLE" \
@@ -647,34 +616,22 @@ jobs:
               -metadata year="$(date +%Y)" \
               -metadata date="$(date +%Y-%m-%d)" \
               "output.mp4" 2>/dev/null
-            echo "✅ Single episode processed"
+            echo "✅ Done"
           else
-            echo "❌ No merged file created!"
+            echo "❌ No merged file!"
             exit 1
           fi
           
           if [ -f "output.mp4" ]; then
-            echo "🖼️ Generating aspect-ratio-correct thumbnails..."
+            echo "🖼️ Generating thumbnails..."
             
-            ffmpeg -i "output.mp4" \
-              -ss 00:00:01 \
-              -vframes 1 \
+            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
               -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
-              -q:v 2 \
-              "thumb.jpg" 2>/dev/null
+              -q:v 2 "thumb.jpg" 2>/dev/null
             
-            ffmpeg -i "output.mp4" \
-              -ss 00:00:01 \
-              -vframes 1 \
+            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
               -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
-              -q:v 2 \
-              "square_thumb.jpg" 2>/dev/null
-            
-            if [ -f "thumb.jpg" ]; then
-              echo "✅ Thumbnails generated successfully"
-            else
-              echo "⚠️ Could not generate thumbnails"
-            fi
+              -q:v 2 "square_thumb.jpg" 2>/dev/null
             
             rm -f normalized_*.mp4
             
@@ -683,11 +640,11 @@ jobs:
             
             echo ""
             echo "========================================="
-            echo "📊 FINAL MERGED FILE"
+            echo "📊 FINAL FILE"
             echo "========================================="
             ls -lh output.mp4
             echo ""
-            echo "📝 MediaInfo metadata:"
+            echo "📝 Metadata:"
             mediainfo output.mp4 | head -20
             echo "========================================="
           else
@@ -760,11 +717,11 @@ jobs:
           label = os.environ.get("LABEL", "NONE")
 
           if not all([api_id, api_hash]):
-              print("❌ Missing Telegram API credentials. Skipping uploads.")
+              print("❌ Missing Telegram API credentials.")
               sys.exit(0)
 
           if not session_string:
-              print("❌ Missing session string! Skipping uploads.")
+              print("❌ Missing session string!")
               sys.exit(0)
 
           def parse_chat_id(val):
@@ -776,7 +733,7 @@ jobs:
               except ValueError:
                   return val
 
-          def get_video_metadata_with_mediainfo(file_path):
+          def get_video_metadata(file_path):
               try:
                   cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%|%Duration%", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
@@ -787,11 +744,11 @@ jobs:
                       h = int(parts[1]) if parts[1].isdigit() else 720
                       duration = float(parts[2]) if parts[2].replace('.', '', 1).isdigit() else 0.0
                       return int(duration), w, h
-              except Exception as e:
-                  print(f"⚠️ Failed to probe metadata with MediaInfo: {e}")
+              except:
+                  pass
               return 0, 1280, 720
 
-          def generate_proper_thumbnail(file_path):
+          def generate_thumbnail(file_path):
               try:
                   thumb_path = f"{file_path}_thumb.jpg"
                   
@@ -832,324 +789,159 @@ jobs:
                           ]
                       
                       subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                      
-                      if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
-                          print(f"✅ Generated Telegram-optimized thumbnail")
-                          return thumb_path
-                          
-              except Exception as e:
-                  print(f"⚠️ Failed to generate proper thumbnail: {e}")
-              
+                      return thumb_path if os.path.exists(thumb_path) else None
+              except:
+                  pass
               return None
 
           single_chat_id = parse_chat_id(single_chat_id_raw)
           merged_chat_id = parse_chat_id(merged_chat_id_raw)
 
           print("=" * 60)
-          print("📤 Telegram Upload Configuration")
-          print("=" * 60)
-          print(f"📁 Video Path: {video_path}")
-          print(f"📝 Title: {title}")
+          print("📤 Telegram Upload")
           print("=" * 60)
 
           async def join_chat(client, invite_link):
-              if not invite_link or not str(invite_link).strip():
+              if not invite_link:
                   return None
-              link = str(invite_link).strip()
-              print(f"🔗 Attempting to join chat via invite link: {link}")
-              
               try:
-                  entity = await client.get_entity(link)
-                  print(f"✅ Resolved chat: {getattr(entity, 'title', entity.id)}")
+                  entity = await client.get_entity(invite_link)
                   return entity
-              except Exception as e:
-                  print(f"⚠️ Direct lookup failed: {e}")
-
-              m = re.search(r'(?:joinchat/|\+)([a-zA-Z0-9_-]+)', link)
-              if m:
-                  invite_hash = m.group(1)
-                  try:
-                      updates = await client(ImportChatInviteRequest(invite_hash))
-                      chat = getattr(updates, 'chat', None)
-                      if not chat and hasattr(updates, 'chats') and updates.chats:
-                          chat = updates.chats[0]
-                      if chat:
-                          print(f"✅ Joined private group: {getattr(chat, 'title', chat.id)}")
-                          return chat
-                  except Exception as ie:
-                      print(f"⚠️ Private join failed: {ie}")
-
-              try:
-                  updates = await client(JoinChannelRequest(link))
-                  chat = getattr(updates, 'chat', None)
-                  if not chat and hasattr(updates, 'chats') and updates.chats:
-                      chat = updates.chats[0]
-                  if chat:
-                      print(f"✅ Joined channel: {getattr(chat, 'title', chat.id)}")
-                      return chat
-              except Exception as e:
-                  print(f"⚠️ Channel join failed: {e}")
-
+              except:
+                  pass
               return None
 
-          async def search_dialogs_by_name(client, target_name):
-              if not target_name or not str(target_name).strip():
-                  return None
-              
-              target_clean = str(target_name).strip().lower()
-              print(f"🔍 Searching dialogs for: '{target_clean}'")
-              
-              async for dialog in client.iter_dialogs(limit=50):
-                  entity = dialog.entity
-                  title = getattr(entity, 'title', '') or getattr(entity, 'first_name', '') or ''
-                  if title and target_clean in title.lower():
-                      print(f"✅ Found match: '{title}' (ID: {dialog.id})")
-                      return entity
-              
-              return None
-
-          async def resolve_chat_id(client, chat_id_input, invite_link=None, search_name=None):
+          async def resolve_chat(client, chat_id, invite_link, search_name):
               if invite_link:
                   entity = await join_chat(client, invite_link)
                   if entity:
                       return entity
-
-              if chat_id_input is not None:
+              if chat_id:
                   try:
-                      entity = await client.get_entity(chat_id_input)
-                      print(f"✅ Resolved directly: {getattr(entity, 'title', entity.id)}")
-                      return entity
-                  except Exception:
+                      return await client.get_entity(chat_id)
+                  except:
                       pass
-
               if search_name:
-                  entity = await search_dialogs_by_name(client, search_name)
-                  if entity:
-                      return entity
-
+                  async for dialog in client.iter_dialogs(limit=50):
+                      if search_name.lower() in str(dialog.name).lower():
+                          return dialog.entity
               return None
 
-          async def send_file_with_telegram_thumb(client, entity, file_path, caption, reply_to=None):
-              duration, w, h = get_video_metadata_with_mediainfo(file_path)
-              thumb_path = generate_proper_thumbnail(file_path)
-              
-              video_attr = DocumentAttributeVideo(
-                  duration=duration,
-                  w=w,
-                  h=h,
-                  supports_streaming=True
-              )
+          async def send_file(client, entity, file_path, caption, reply_to=None):
+              duration, w, h = get_video_metadata(file_path)
+              thumb = generate_thumbnail(file_path)
               
               kwargs = {
                   "entity": entity,
                   "file": file_path,
                   "caption": caption,
-                  "attributes": [video_attr],
+                  "attributes": [DocumentAttributeVideo(duration=duration, w=w, h=h, supports_streaming=True)],
                   "supports_streaming": True
               }
-              
-              if thumb_path and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
-                  kwargs["thumb"] = thumb_path
-                  print(f"📎 Using thumbnail")
-              else:
-                  print("⚠️ No thumbnail available")
-              
+              if thumb:
+                  kwargs["thumb"] = thumb
               if reply_to:
                   kwargs["reply_to"] = reply_to
               
               try:
-                  result = await client.send_file(**kwargs)
-                  print(f"✅ File sent successfully")
-                  return result
+                  await client.send_file(**kwargs)
+                  return True
               except Exception as e:
-                  print(f"❌ Failed to send file: {e}")
-                  if "thumb" in kwargs:
-                      del kwargs["thumb"]
-                      print("🔄 Retrying without thumbnail...")
-                      result = await client.send_file(**kwargs)
-                      return result
-                  raise
+                  print(f"❌ Failed: {e}")
+                  return False
               finally:
-                  if thumb_path and os.path.exists(thumb_path):
-                      try: os.remove(thumb_path)
-                      except: pass
+                  if thumb and os.path.exists(thumb):
+                      os.remove(thumb)
 
           async def upload_episodes(client, entity, topic_id):
-              ep_files = sorted(glob.glob("EP*.mp4"), 
-                  key=lambda f: int(re.search(r'EP(\d+)\.mp4', f).group(1)) if re.search(r'EP(\d+)\.mp4', f) else 0)
-              
+              ep_files = sorted(glob.glob("EP*.mp4"))
               if not ep_files:
-                  print("⚠️ No episode files found")
                   return False
               
-              uploaded_count = 0
+              count = 0
               for ep_file in ep_files:
                   ep_match = re.search(r'EP(\d+)\.mp4', ep_file)
                   if not ep_match:
                       continue
                   ep_num = int(ep_match.group(1))
                   
-                  if not os.path.isfile(ep_file):
-                      continue
-                  
                   file_size = os.path.getsize(ep_file) / (1024 * 1024)
                   if file_size > 2000:
-                      print(f"⚠️ Episode {ep_num} size ({file_size:.2f} MB) exceeds 2GB!")
                       continue
                   
-                  duration, w, h = get_video_metadata_with_mediainfo(ep_file)
-                  
-                  ep_caption = (
-                      f"📺 **Episode {ep_num}**\n\n"
-                      f"📁 Series: {series_title}\n"
-                      f"📅 Date: {datetime.datetime.now().strftime('%Y-%m-%d')}\n"
-                      f"📐 Resolution: {w}x{h}\n"
-                      f"⏱️  Duration: {duration//60}m {duration%60}s\n"
-                      f"🏷️ Label: {label}\n\n"
-                      f"#Episode{ep_num} #Unwatched"
-                  )
-                  
-                  print(f"📤 Uploading Episode {ep_num} ({file_size:.2f} MB)...")
+                  duration, w, h = get_video_metadata(ep_file)
+                  caption = f"📺 Episode {ep_num}\n📁 {series_title}\n📐 {w}x{h}\n⏱️ {duration//60}m {duration%60}s\n#Episode{ep_num} #Unwatched"
                   
                   try:
-                      await send_file_with_telegram_thumb(client, entity, ep_file, ep_caption, topic_id)
-                      uploaded_count += 1
-                      await asyncio.sleep(2)
+                      if await send_file(client, entity, ep_file, caption, topic_id):
+                          count += 1
+                          await asyncio.sleep(2)
                   except FloodWaitError as e:
-                      print(f"⏳ Rate limited: waiting {e.seconds} seconds...")
                       await asyncio.sleep(e.seconds)
-                      await send_file_with_telegram_thumb(client, entity, ep_file, ep_caption, topic_id)
-                      uploaded_count += 1
-                  except Exception as e:
-                      print(f"❌ Failed to upload Episode {ep_num}: {e}")
-              
-              print(f"✅ Successfully uploaded {uploaded_count} episodes")
-              return uploaded_count > 0
+                      if await send_file(client, entity, ep_file, caption, topic_id):
+                          count += 1
+              return count > 0
 
-          async def upload_merged_video(client, entity):
+          async def upload_merged(client, entity):
               if not video_path or not os.path.isfile(video_path):
-                  print(f"❌ Video file not found: {video_path}")
                   return False
               
               file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-              print(f"📊 File size: {file_size_mb:.2f} MB")
-              
               if file_size_mb > 2000:
-                  print(f"❌ File exceeds Telegram's 2GB limit!")
                   return False
               
-              duration, w, h = get_video_metadata_with_mediainfo(video_path)
-              
+              duration, w, h = get_video_metadata(video_path)
               now = datetime.datetime.now()
               month_year = now.strftime("%B%Y").upper()
               clean_label = str(label).upper().replace("-", "").replace(" ", "")
               
-              caption = (
-                  f"📺 **{title}**\n\n"
-                  f"📅 Date: {now.strftime('%Y-%m-%d')}\n"
-                  f"📁 Series: {series_title}\n"
-                  f"📐 Resolution: {w}x{h}\n"
-                  f"⏱️  Duration: {duration//3600}h {(duration%3600)//60}m {duration%60}s\n"
-                  f"💾 Size: {file_size_mb:.1f} MB\n"
-                  f"🏷️ Label: {label}\n\n"
-                  f"#UNWATCHED\n"
-                  f"#{month_year}\n"
-                  f"#{month_year}UNWATCHED\n"
-                  f"#{month_year}{clean_label}\n"
-                  f"#{clean_label}"
-              )
+              caption = f"📺 {title}\n📅 {now.strftime('%Y-%m-%d')}\n📁 {series_title}\n📐 {w}x{h}\n⏱️ {duration//3600}h {(duration%3600)//60}m {duration%60}s\n💾 {file_size_mb:.1f}MB\n#UNWATCHED #{month_year} #{month_year}UNWATCHED #{month_year}{clean_label} #{clean_label}"
               
               try:
-                  print("📤 Uploading merged video...")
-                  await send_file_with_telegram_thumb(client, entity, video_path, caption)
-                  print("✅ Merged video upload complete!")
-                  return True
+                  return await send_file(client, entity, video_path, caption)
               except FloodWaitError as e:
-                  print(f"⏳ Rate limited: waiting {e.seconds} seconds...")
                   await asyncio.sleep(e.seconds)
-                  await send_file_with_telegram_thumb(client, entity, video_path, caption)
-                  return True
-              except Exception as e:
-                  print(f"❌ Failed to upload merged video: {e}")
-                  return False
+                  return await send_file(client, entity, video_path, caption)
 
           async def main():
               try:
-                  print("🔌 Connecting to Telegram using Telethon...")
-                  clean_session = str(session_string).strip()
-                  
-                  client = TelegramClient(StringSession(clean_session), int(api_id), api_hash)
+                  client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
                   await client.connect()
                   
                   if not await client.is_user_authorized():
-                      print("❌ Session string invalid or expired")
+                      print("❌ Session invalid")
                       return
                   
                   me = await client.get_me()
-                  print(f"✅ Logged in as: {me.first_name} (@{me.username or 'No username'})")
+                  print(f"✅ Logged in: {me.first_name}")
                   
-                  single_entity = await resolve_chat_id(
-                      client, 
-                      single_chat_id, 
-                      single_invite_link,
-                      search_name=single_name
-                  )
-                  
-                  merged_entity = await resolve_chat_id(
-                      client, 
-                      merged_chat_id, 
-                      merged_invite_link,
-                      search_name=merged_name
-                  )
+                  single_entity = await resolve_chat(client, single_chat_id, single_invite_link, single_name)
+                  merged_entity = await resolve_chat(client, merged_chat_id, merged_invite_link, merged_name)
                   
                   if single_entity:
-                      print(f"\n📤 Uploading episodes to: {getattr(single_entity, 'title', single_entity.id)}")
+                      print(f"\n📤 Uploading episodes...")
                       topic_id = None
-                      
-                      if getattr(single_entity, "forum", False):
+                      if hasattr(single_entity, "forum") and single_entity.forum:
                           try:
-                              res = await client(CreateForumTopicRequest(
-                                  peer=single_entity,
-                                  title=str(series_title)[:50]
-                              ))
-                              
-                              if hasattr(res, 'updates'):
-                                  for u in res.updates:
-                                      if hasattr(u, 'topic_id'):
-                                          topic_id = u.topic_id
-                                          break
-                                      elif hasattr(u, 'id'):
-                                          topic_id = u.id
-                                          break
-                              if not topic_id and hasattr(res, 'id'):
-                                  topic_id = res.id
-                              
-                              print(f"✅ Created forum topic: {series_title[:50]}")
-                          except Exception as e:
-                              print(f"⚠️ Could not create forum topic: {e}")
-                      
+                              res = await client(CreateForumTopicRequest(single_entity, series_title[:50]))
+                              topic_id = res.id if hasattr(res, 'id') else None
+                          except:
+                              pass
                       await upload_episodes(client, single_entity, topic_id)
-                  else:
-                      print("⚠️ Could not resolve target group for individual episodes")
                   
                   if merged_entity:
-                      print(f"\n📤 Uploading merged to: {getattr(merged_entity, 'title', merged_entity.id)}")
-                      await upload_merged_video(client, merged_entity)
-                  else:
-                      print("⚠️ Could not resolve target channel for merged video")
+                      print(f"\n📤 Uploading merged...")
+                      await upload_merged(client, merged_entity)
                   
                   await client.disconnect()
-                  print("\n" + "=" * 60)
-                  print("✅ Upload process completed successfully!")
-                  print("=" * 60)
+                  print("\n✅ Upload complete!")
                           
               except Exception as e:
-                  print(f"❌ Fatal error: {e}")
-                  traceback.print_exc()
+                  print(f"❌ Error: {e}")
 
           if __name__ == '__main__':
               asyncio.run(main())
           EOFUPLOAD
           
-          echo "🚀 Starting Telegram upload using Telethon..."
+          echo "🚀 Starting Telegram upload..."
           python3 -u upload_telegram.py
