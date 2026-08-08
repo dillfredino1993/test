@@ -47,40 +47,38 @@ jobs:
         run: |
           mkdir -p downloads && cd downloads
           
-          # Parse and clean URLs from payload - FIXED to prevent double protocol
+          # Parse and clean URLs from payload - FIXED to handle ps:// properly
           cat << 'PYEOF' > parse_urls.py
           import os, json, re
           
           def clean_url(url):
-              """Clean and fix common URL issues - PREVENTS DOUBLE PROTOCOL"""
+              """Clean and fix common URL issues - COMPLETELY FIXED"""
               url = url.strip()
               
-              # Remove any existing protocol first to avoid duplicates
-              # Remove http://, https://, ps://, etc.
-              url = re.sub(r'^[a-zA-Z]+://', '', url)
+              # Handle ps:// protocol - REPLACE IT
+              if 'ps://' in url:
+                  url = url.replace('ps://', 'https://')
+                  print(f"🔧 Replaced ps:// with https://")
               
-              # If URL starts with ps://, remove it (already handled above)
-              url = re.sub(r'^ps://', '', url)
-              
-              # Remove any remaining protocol prefixes (htthttps, etc.)
-              url = re.sub(r'^https?https?://', '', url)
-              url = re.sub(r'^https?://https?://', '', url)
-              
-              # Remove duplicate slashes at start
-              url = re.sub(r'^//+', '', url)
-              
-              # Ensure we have a clean domain
-              if not url.startswith(('http://', 'https://')):
-                  # Check if it looks like a valid domain/path
-                  if re.match(r'^[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}', url) or '/' in url:
-                      url = 'https://' + url
-                  else:
-                      return None
-              
-              # Final cleanup - remove any double protocols again
+              # Remove any double protocols
               url = re.sub(r'^https?https?://', 'https://', url)
               url = re.sub(r'^http://https://', 'https://', url)
               url = re.sub(r'^https://http://', 'https://', url)
+              url = re.sub(r'^ps://', 'https://', url)
+              
+              # If URL doesn't start with http:// or https://, add it
+              if not url.startswith(('http://', 'https://')):
+                  # Check if it looks like a domain with path
+                  if re.match(r'^[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}', url) or '/' in url:
+                      url = 'https://' + url
+                      print(f"🔧 Added https:// prefix")
+                  else:
+                      print(f"⚠️ Invalid URL format: {url}")
+                      return None
+              
+              # Final cleanup - remove any remaining weirdness
+              url = re.sub(r'^https?://https?://', 'https://', url)
+              url = re.sub(r'^ps://', 'https://', url)
               
               return url
           
@@ -119,14 +117,27 @@ jobs:
               else:
                   print(f"⚠️ Skipping invalid URL: {url}")
           
+          # Write cleaned URLs to file - ONE URL PER LINE
           with open("urls.txt", "w", encoding="utf-8") as f:
               for u in cleaned_urls:
                   f.write(u.strip() + "\n")
           
           print(f"Found {len(cleaned_urls)} valid URLs to download.")
+          
+          # Write a debug file to see what was saved
+          with open("urls_debug.txt", "w") as f:
+              f.write("Cleaned URLs:\n")
+              for u in cleaned_urls:
+                  f.write(f"  {u}\n")
           PYEOF
           
           python3 parse_urls.py
+          
+          # Show the URLs being used
+          echo "========================================="
+          echo "📋 URLs to download:"
+          cat urls.txt
+          echo "========================================="
           
           if [ ! -s urls.txt ]; then
             echo "❌ No valid URLs found to download!"
@@ -267,17 +278,26 @@ jobs:
             
             echo "========================================="
             echo "📥 Downloading Episode $EP_INDEX/$TOTAL_EPISODES"
-            echo "📎 URL: $URL"
-            echo "💾 Output: $OUT_FILE"
-            echo "========================================="
+            echo "📎 Original URL: $URL"
             
-            # Final URL verification - fix any remaining double protocols
+            # MANUALLY FIX THE URL - Convert ps:// to https://
+            URL=$(echo "$URL" | sed 's|^ps://|https://|g')
+            URL=$(echo "$URL" | sed 's|ps://|https://|g')
             URL=$(echo "$URL" | sed 's|https://https://|https://|g')
             URL=$(echo "$URL" | sed 's|http://https://|https://|g')
             URL=$(echo "$URL" | sed 's|https://http://|https://|g')
             URL=$(echo "$URL" | sed 's|htthttps://|https://|g')
             
             echo "📎 Cleaned URL: $URL"
+            echo "💾 Output: $OUT_FILE"
+            echo "========================================="
+            
+            # Verify URL starts with https://
+            if [[ ! "$URL" == https://* ]] && [[ ! "$URL" == http://* ]]; then
+              echo "❌ URL is still invalid after cleaning: $URL"
+              EP_INDEX=$((EP_INDEX + 1))
+              continue
+            fi
             
             if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *"m3u8"* ]]; then
               echo "📺 Detected HLS stream - Using yt-dlp"
