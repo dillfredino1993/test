@@ -47,38 +47,40 @@ jobs:
         run: |
           mkdir -p downloads && cd downloads
           
-          # Parse and clean URLs from payload - FIXED to handle ps:// properly
+          # Parse and clean URLs from payload - ULTRA AGGRESSIVE CLEANING
           cat << 'PYEOF' > parse_urls.py
           import os, json, re
           
           def clean_url(url):
-              """Clean and fix common URL issues - COMPLETELY FIXED"""
+              """ULTRA AGGRESSIVE URL CLEANING - Fixes all protocol issues"""
               url = url.strip()
               
-              # Handle ps:// protocol - REPLACE IT
-              if 'ps://' in url:
-                  url = url.replace('ps://', 'https://')
-                  print(f"🔧 Replaced ps:// with https://")
+              # Step 1: Remove ALL protocol prefixes and duplicates
+              # Remove any combination of http/https/ps/htthttps etc.
+              url = re.sub(r'^(https?://)+', '', url)
+              url = re.sub(r'^(ps://)+', '', url)
+              url = re.sub(r'^(htthttps?://)+', '', url)
+              url = re.sub(r'^(http://https?://)+', '', url)
+              url = re.sub(r'^(https?://http://)+', '', url)
               
-              # Remove any double protocols
-              url = re.sub(r'^https?https?://', 'https://', url)
-              url = re.sub(r'^http://https://', 'https://', url)
-              url = re.sub(r'^https://http://', 'https://', url)
-              url = re.sub(r'^ps://', 'https://', url)
+              # Step 2: Remove any remaining protocol-like patterns
+              url = re.sub(r'https?https?://', '', url)
+              url = re.sub(r'ps://', '', url)
+              url = re.sub(r'htthttps://', '', url)
+              url = re.sub(r'http://https://', '', url)
+              url = re.sub(r'https://http://', '', url)
               
-              # If URL doesn't start with http:// or https://, add it
-              if not url.startswith(('http://', 'https://')):
-                  # Check if it looks like a domain with path
-                  if re.match(r'^[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}', url) or '/' in url:
-                      url = 'https://' + url
-                      print(f"🔧 Added https:// prefix")
-                  else:
-                      print(f"⚠️ Invalid URL format: {url}")
-                      return None
+              # Step 3: Remove duplicate slashes at start
+              url = re.sub(r'^//+', '', url)
               
-              # Final cleanup - remove any remaining weirdness
-              url = re.sub(r'^https?://https?://', 'https://', url)
-              url = re.sub(r'^ps://', 'https://', url)
+              # Step 4: Now add https:// once
+              if url and not url.startswith(('http://', 'https://')):
+                  url = 'https://' + url
+              
+              # Step 5: Final validation - ensure it's a proper URL
+              if not re.match(r'^https?://[a-zA-Z0-9\-\.]+', url):
+                  print(f"⚠️ Invalid URL after cleaning: {url}")
+                  return None
               
               return url
           
@@ -280,13 +282,23 @@ jobs:
             echo "📥 Downloading Episode $EP_INDEX/$TOTAL_EPISODES"
             echo "📎 Original URL: $URL"
             
-            # MANUALLY FIX THE URL - Convert ps:// to https://
-            URL=$(echo "$URL" | sed 's|^ps://|https://|g')
-            URL=$(echo "$URL" | sed 's|ps://|https://|g')
+            # ULTRA AGGRESSIVE URL CLEANING IN BASH
+            # Remove ALL protocol prefixes
+            URL=$(echo "$URL" | sed -E 's|^(https?://)+||g')
+            URL=$(echo "$URL" | sed -E 's|^(ps://)+||g')
+            URL=$(echo "$URL" | sed -E 's|^(htthttps?://)+||g')
+            URL=$(echo "$URL" | sed -E 's|^(http://https?://)+||g')
+            URL=$(echo "$URL" | sed -E 's|^(https?://http://)+||g')
+            # Remove any remaining protocol-like patterns
             URL=$(echo "$URL" | sed 's|https://https://|https://|g')
             URL=$(echo "$URL" | sed 's|http://https://|https://|g')
             URL=$(echo "$URL" | sed 's|https://http://|https://|g')
-            URL=$(echo "$URL" | sed 's|htthttps://|https://|g')
+            URL=$(echo "$URL" | sed 's|ps://||g')
+            URL=$(echo "$URL" | sed 's|htthttps://||g')
+            # Remove duplicate slashes
+            URL=$(echo "$URL" | sed 's|^//+||g')
+            # Add https://
+            URL="https://$URL"
             
             echo "📎 Cleaned URL: $URL"
             echo "💾 Output: $OUT_FILE"
@@ -295,6 +307,14 @@ jobs:
             # Verify URL starts with https://
             if [[ ! "$URL" == https://* ]] && [[ ! "$URL" == http://* ]]; then
               echo "❌ URL is still invalid after cleaning: $URL"
+              EP_INDEX=$((EP_INDEX + 1))
+              continue
+            fi
+            
+            # Verify URL has a valid domain
+            DOMAIN=$(echo "$URL" | sed -E 's|^https?://([^/]+).*|\1|')
+            if [ -z "$DOMAIN" ] || [ "$DOMAIN" = "$URL" ]; then
+              echo "❌ URL has no valid domain: $URL"
               EP_INDEX=$((EP_INDEX + 1))
               continue
             fi
