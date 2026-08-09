@@ -213,13 +213,10 @@ jobs:
             if [[ "$URL" == *".m3u8"* ]]; then
               echo "📺 HLS stream - Using yt-dlp"
               
-              # Create a temporary file for yt-dlp output
-              TMP_LOG=$(mktemp)
-              
               # Run yt-dlp with progress hidden but info shown
               yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts --concurrent-fragments 16 \
                 --no-progress --no-warnings \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>&1 | tee "$TMP_LOG" | grep -E "(Extracting URL|Downloading webpage|Downloading m3u8|Total fragments|Destination|Downloading 1 format)" || true
+                -o "$OUT_FILE" "$URL" < /dev/null 2>&1 | grep -E "(Extracting URL|Downloading webpage|Downloading m3u8|Total fragments|Destination|Downloading 1 format)" || true
               
               # Check if download succeeded
               if [ ! -f "$OUT_FILE" ] || [ ! -s "$OUT_FILE" ]; then
@@ -252,7 +249,8 @@ jobs:
             if [ $DOWNLOAD_STATUS -eq 0 ] && [ -f "$OUT_FILE" ]; then
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
               
-              if [ "$FILE_SIZE" -gt 1000000 ]; then
+              # MODIFIED: Lowered threshold to 50KB for very short episodes
+              if [ "$FILE_SIZE" -gt 50000 ]; then
                 echo "🔍 Verifying file..."
                 
                 if python3 verify_and_repair.py "$OUT_FILE" < /dev/null; then
