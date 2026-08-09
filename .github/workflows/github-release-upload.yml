@@ -196,7 +196,7 @@ jobs:
           
           if __name__ == "__main__":
               main()
-          EOFVERIFY
+EOFVERIFY
           
           EP_INDEX=1
           FAILED_EPISODES=""
@@ -676,7 +676,7 @@ jobs:
                       sys.exit(0)
                   else:
                       sys.exit(1)
-              EOFTHUMB
+EOFTHUMB
               
               # Try to generate a good thumbnail
               if python3 generate_thumb.py output.mp4 $DURATION; then
@@ -1112,12 +1112,13 @@ jobs:
 
           if __name__ == '__main__':
               asyncio.run(main())
-          EOFUPLOAD
+EOFUPLOAD
           
           # Start merged upload in background
           python3 -u upload_merged.py &
           MERGED_PID=$!
           echo "✅ Merged upload started in background (PID: $MERGED_PID)"
+          echo $MERGED_PID > /tmp/merged_pid.txt
 
       - name: Upload Single Episodes (Parallel with Merged Upload)
         if: steps.merge.outputs.merge_success == 'true'
@@ -1585,20 +1586,13 @@ jobs:
 
           if __name__ == '__main__':
               asyncio.run(main())
-          EOFUPLOAD
+EOFUPLOAD
           
           # Upload single episodes (this runs in parallel with the merged upload)
           echo "🚀 Starting single episode upload (parallel with merged upload)..."
           python3 -u upload_single.py
           
           echo "✅ Single episode upload complete!"
-
-      - name: Wait for Merged Upload to Complete
-        if: steps.merge.outputs.merge_success == 'true'
-        run: |
-          echo "⏳ Waiting for merged upload to complete..."
-          wait $MERGED_PID 2>/dev/null || true
-          echo "✅ Merged upload process finished"
 
       - name: Verify Merged File with MediaInfo and Fix Duration
         if: steps.merge.outputs.merge_success == 'true'
