@@ -8,6 +8,7 @@ on:
 concurrency:
   group: media-pipeline-processor
   cancel-in-progress: false
+  queue: max
 
 # Add permissions for deleting workflow runs
 permissions:
