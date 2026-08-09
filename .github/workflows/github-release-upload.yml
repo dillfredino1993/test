@@ -1,3 +1,6 @@
+Here is the complete, corrected GitHub Actions workflow file with the URL extraction and download loop fixed to prevent URL corruption:
+
+```yaml
 name: GitHub Telegram & Media Pipeline
 
 on:
@@ -39,23 +42,20 @@ jobs:
           echo "series_title=${CLEAN_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "clean_label=${CLEAN_LABEL}" >> $GITHUB_OUTPUT
 
-      - name: Parse URLs with jq
+      - name: Parse URLs with jq (Clean & Uncorrupted)
         env:
           CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
           mkdir -p downloads && cd downloads
           
-          # Safely write payload to file using printf to preserve raw characters and URLs
-          printf '%s' "$CLIENT_PAYLOAD" | jq -r '
-            .episodes[]?.url // 
-            .video_urls[]? // 
-            .video_url // 
-            .url // 
-            empty
+          # Extract URLs cleanly: remove \r carriage returns and trim whitespace
+          echo "$CLIENT_PAYLOAD" | tr -d '\r' | jq -r '
+            (.episodes[]?.url // .video_urls[]? // .video_url // .url // empty)
+            | tostring | gsub("^\\s+|\\s+$"; "")
           ' > urls.txt
           
-          # Remove CR characters and blank lines
-          sed -i 's/\r//g; /^$/d' urls.txt
+          # Remove empty lines
+          sed -i '/^$/d' urls.txt
           
           echo "========================================="
           echo "📋 URLs to download:"
@@ -200,7 +200,7 @@ jobs:
           FAILED_EPISODES=""
           
           while IFS= read -r URL || [ -n "$URL" ]; do
-            # Clean spaces without mangling characters
+            # Safely trim whitespace and \r without xargs stripping backslashes or special chars
             URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [ -z "$URL" ]; then continue; fi
             
@@ -626,6 +626,7 @@ jobs:
           fi
           
           echo "📊 Found $EP_COUNT episodes to merge"
+          
           echo "🔍 Analyzing resolutions with MediaInfo..."
           
           declare -A resolutions
@@ -672,7 +673,7 @@ jobs:
               EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
               
               ffmpeg -i "$f" \
-                -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2" \
+                -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-ih)/2:(oh-ih)/2" \
                 -c:v libx264 -preset veryfast -crf 23 \
                 -c:a copy \
                 -metadata title="$EPISODE_TITLE" \
@@ -1131,3 +1132,4 @@ jobs:
           
           echo "🚀 Starting merged video upload..."
           python3 -u upload_merged.py
+```
