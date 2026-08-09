@@ -655,6 +655,7 @@ jobs:
           echo "🔍 Analyzing resolutions with MediaInfo..."
           
           declare -A resolutions
+          TARGET_RES=""
           for f in EP*.mp4; do
             if [ -f "$f" ]; then
               res=$(mediainfo --Inform="Video;%Width%x%Height%" "$f" 2>/dev/null || echo "0x0")
@@ -668,18 +669,20 @@ jobs:
             exit 1
           fi
           
+          # Find the most common resolution as target
           TARGET_RES=$(printf '%s\n' "${resolutions[@]}" | grep -v "0x0" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           
           if [ -z "$TARGET_RES" ] || [ "$TARGET_RES" = "0x0" ]; then
-            echo "⚠️ Using 1920x1080"
-            TARGET_RES="1920x1080"
+            echo "⚠️ Using 540x960 as default"
+            TARGET_RES="540x960"
           fi
           
           TARGET_W=$(echo "$TARGET_RES" | cut -d'x' -f1)
           TARGET_H=$(echo "$TARGET_RES" | cut -d'x' -f2)
           
-          echo "🎯 Target: ${TARGET_W}x${TARGET_H}"
+          echo "🎯 Target resolution: ${TARGET_W}x${TARGET_H}"
           
+          # Normalize any files that don't match the target resolution
           NORMALIZED_FILES=""
           NEEDS_REENCODE=false
           
@@ -688,25 +691,37 @@ jobs:
             CURRENT_RES="${resolutions[$f]}"
             
             if [ "$CURRENT_RES" == "$TARGET_RES" ]; then
-              echo "✅ Keeping: $f"
+              echo "✅ Keeping: $f (matches target)"
               NORMALIZED_FILES="$NORMALIZED_FILES $f"
             else
-              echo "⚠️ Normalizing: $f"
+              echo "⚠️ Normalizing: $f (${CURRENT_RES} -> ${TARGET_RES})"
               NEEDS_REENCODE=true
               
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
               EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
               
+              # Re-encode to match target resolution
               ffmpeg -i "$f" \
-                -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-ih)/2:(oh-ih)/2" \
+                -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black" \
                 -c:v libx264 -preset veryfast -crf 23 \
-                -c:a copy \
+                -c:a aac -b:a 128k \
                 -metadata title="$EPISODE_TITLE" \
+                -metadata episode_id="$EP_NUM" \
+                -metadata series="$SERIES_TITLE" \
+                -metadata label="$LABEL" \
                 -movflags +faststart \
                 "normalized_$f" 2>/dev/null
               
-              if [ -f "normalized_$f" ]; then
-                NORMALIZED_FILES="$NORMALIZED_FILES normalized_$f"
+              if [ -f "normalized_$f" ] && [ -s "normalized_$f" ]; then
+                # Verify the normalized file
+                NORM_RES=$(mediainfo --Inform="Video;%Width%x%Height%" "normalized_$f" 2>/dev/null || echo "0x0")
+                if [ "$NORM_RES" == "$TARGET_RES" ]; then
+                  echo "✅ Normalized successfully: $f -> normalized_$f (${NORM_RES})"
+                  NORMALIZED_FILES="$NORMALIZED_FILES normalized_$f"
+                else
+                  echo "⚠️ Normalization produced wrong resolution ${NORM_RES}, using original"
+                  NORMALIZED_FILES="$NORMALIZED_FILES $f"
+                fi
               else
                 echo "⚠️ Normalization failed, using original"
                 NORMALIZED_FILES="$NORMALIZED_FILES $f"
@@ -714,59 +729,59 @@ jobs:
             fi
           done
           
+          # Count files to merge
           FILE_COUNT=$(echo "$NORMALIZED_FILES" | wc -w)
+          echo "📊 Files to merge: $FILE_COUNT"
           
           if [ $FILE_COUNT -eq 0 ]; then
             echo "❌ No files to merge!"
             exit 1
           fi
           
-          if [ "$NEEDS_REENCODE" = "false" ] && [ $FILE_COUNT -gt 1 ]; then
-            echo "✅ All videos same resolution - Using MKVToolNix merge"
-            
-            MERGE_ARGS=""
-            FIRST_FILE=true
-            
-            for f in $NORMALIZED_FILES; do
-              if [ -f "$f" ]; then
-                if [ "$FIRST_FILE" = true ]; then
-                  MERGE_ARGS="$f"
-                  FIRST_FILE=false
-                else
-                  MERGE_ARGS="$MERGE_ARGS +$f"
-                fi
-              fi
-            done
-            
-            mkvmerge -o merged.mkv --title "$TITLE" --default-track 0:yes $MERGE_ARGS 2>/dev/null
-            
-            if [ -f "merged.mkv" ]; then
-              echo "✅ MKVToolNix merge successful"
-            else
-              echo "⚠️ MKVToolNix failed, falling back to FFmpeg..."
-              NEEDS_REENCODE=true
-            fi
-          fi
+          # Now all files should have the same resolution - use MKVToolNix
+          echo "✅ All videos now have same resolution - Using MKVToolNix merge"
           
-          if [ "$NEEDS_REENCODE" = "true" ] || [ ! -f "merged.mkv" ]; then
-            echo "⚠️ Using FFmpeg merge"
+          # Build merge arguments
+          MERGE_ARGS=""
+          FIRST_FILE=true
+          
+          for f in $NORMALIZED_FILES; do
+            if [ -f "$f" ]; then
+              if [ "$FIRST_FILE" = true ]; then
+                MERGE_ARGS="$f"
+                FIRST_FILE=false
+              else
+                MERGE_ARGS="$MERGE_ARGS +$f"
+              fi
+            fi
+          done
+          
+          echo "🔄 Merging $FILE_COUNT files with MKVToolNix..."
+          mkvmerge -o merged.mkv --title "$TITLE" --default-track 0:yes $MERGE_ARGS 2>/dev/null
+          
+          if [ -f "merged.mkv" ] && [ -s "merged.mkv" ]; then
+            echo "✅ MKVToolNix merge successful"
+          else
+            echo "❌ MKVToolNix merge failed!"
+            echo "🔧 Falling back to FFmpeg concat..."
             
+            # Fallback to FFmpeg concat
             FILES=""
-            FILTER=""
-            COUNT=0
-            
             for f in $NORMALIZED_FILES; do
               if [ -f "$f" ]; then
                 FILES="$FILES -i $f"
+              fi
+            done
+            
+            # Use concat filter
+            COUNT=0
+            FILTER=""
+            for f in $NORMALIZED_FILES; do
+              if [ -f "$f" ]; then
                 FILTER="${FILTER}[$COUNT:v]scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2,fps=30[v$COUNT];"
                 COUNT=$((COUNT + 1))
               fi
             done
-            
-            if [ $COUNT -eq 0 ]; then
-              echo "❌ No valid files!"
-              exit 1
-            fi
             
             CONCAT=""
             for i in $(seq 0 $((COUNT - 1))); do
@@ -788,14 +803,18 @@ jobs:
               -threads $(nproc) \
               merged.mp4 2>/dev/null
             
-            if [ -f "merged.mp4" ]; then
+            if [ -f "merged.mp4" ] && [ -s "merged.mp4" ]; then
               mv merged.mp4 merged.mkv 2>/dev/null || true
               echo "✅ FFmpeg merge successful"
+            else
+              echo "❌ FFmpeg merge failed!"
+              exit 1
             fi
           fi
           
-          if [ -f "merged.mkv" ]; then
-            echo "📦 Converting to MP4..."
+          # Convert to MP4 with proper metadata
+          if [ -f "merged.mkv" ] && [ -s "merged.mkv" ]; then
+            echo "📦 Converting MKV to MP4..."
             ffmpeg -i merged.mkv -c copy -movflags +faststart \
               -metadata title="$TITLE" \
               -metadata series="$SERIES_TITLE" \
@@ -803,17 +822,18 @@ jobs:
               -metadata year="$(date +%Y)" \
               -metadata date="$(date +%Y-%m-%d)" \
               "output.mp4" 2>/dev/null
-            rm -f merged.mkv
-            echo "✅ Converted"
-          elif [ -f "merged.mp4" ]; then
-            mv merged.mp4 output.mp4
-            echo "✅ Using MP4"
-          else
-            echo "❌ No merged file!"
-            exit 1
+            
+            if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
+              echo "✅ Converted to MP4 successfully"
+              rm -f merged.mkv
+            else
+              echo "⚠️ Conversion failed, using MKV file"
+              mv merged.mkv output.mp4 2>/dev/null || true
+            fi
           fi
           
-          if [ -f "output.mp4" ]; then
+          # Generate thumbnails
+          if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
             echo "🖼️ Generating thumbnails..."
             
             ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
@@ -824,6 +844,7 @@ jobs:
               -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
               -q:v 2 "square_thumb.jpg" 2>/dev/null
             
+            # Clean up normalized files
             rm -f normalized_*.mp4
             
             echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
@@ -862,7 +883,8 @@ jobs:
             echo "✅ Duration metadata fixed"
           fi
           
-          if mediainfo output.mp4 > /dev/null 2>&1; then            echo "✅ MediaInfo can read the file"
+          if mediainfo output.mp4 > /dev/null 2>&1; then
+            echo "✅ MediaInfo can read the file"
             echo ""
             echo "📊 MediaInfo Output:"
             echo "----------------------------------------"
