@@ -1,4 +1,4 @@
-name: GitHub Telegram & Media Pipeline
+ame: GitHub Telegram & Media Pipeline
 
 on:
   repository_dispatch:
@@ -39,14 +39,14 @@ jobs:
           echo "series_title=${CLEAN_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "clean_label=${CLEAN_LABEL}" >> $GITHUB_OUTPUT
 
-      - name: Parse URLs with jq (Better Tool)
+      - name: Parse URLs with jq
         env:
           CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
           mkdir -p downloads && cd downloads
           
-          # Use jq to extract URLs - BETTER TOOL than Python
-          echo "$CLIENT_PAYLOAD" | jq -r '
+          # Safely write payload to file using printf to preserve raw characters and URLs
+          printf '%s' "$CLIENT_PAYLOAD" | jq -r '
             .episodes[]?.url // 
             .video_urls[]? // 
             .video_url // 
@@ -54,8 +54,8 @@ jobs:
             empty
           ' > urls.txt
           
-          # Remove empty lines
-          sed -i '/^$/d' urls.txt
+          # Remove CR characters and blank lines
+          sed -i 's/\r//g; /^$/d' urls.txt
           
           echo "========================================="
           echo "📋 URLs to download:"
@@ -199,8 +199,9 @@ jobs:
           EP_INDEX=1
           FAILED_EPISODES=""
           
-          while IFS= read -r URL; do
-            URL=$(echo "$URL" | xargs)
+          while IFS= read -r URL || [ -n "$URL" ]; do
+            # Clean spaces without mangling characters
+            URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [ -z "$URL" ]; then continue; fi
             
             EP_NUM=$(printf "%02d" $EP_INDEX)
@@ -212,7 +213,6 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # Use the same download logic as the old working workflow
             if [[ "$URL" == *".m3u8"* ]]; then
               echo "📺 HLS stream - Using yt-dlp"
               yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts --concurrent-fragments 16 -o "$OUT_FILE" "$URL" || \
@@ -626,7 +626,6 @@ jobs:
           fi
           
           echo "📊 Found $EP_COUNT episodes to merge"
-          
           echo "🔍 Analyzing resolutions with MediaInfo..."
           
           declare -A resolutions
@@ -1071,12 +1070,10 @@ jobs:
               now = datetime.datetime.now()
               month_year = now.strftime("%B%Y").upper()
               
-              # Label handling - same as old workflow
               clean_label = str(label).upper().replace("-", "").replace(" ", "").replace("_", "")
               if clean_label == "NONE" or clean_label == "":
                   clean_label = "NONE"
               
-              # Caption format from old workflow
               caption = f"{title}\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}"
               
               print(f"📤 Uploading merged video...")
