@@ -1,10 +1,13 @@
 name: GitHub Telegram & Media Pipeline
-permissions:
-  actions: write  # Required to delete workflow runs
-  contents: read
+
 on:
   repository_dispatch:
     types: [github_release_upload]
+
+# Add permissions for deleting workflow runs
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   upload:
@@ -320,7 +323,256 @@ jobs:
           echo "✅ All $TOTAL_EPISODES episodes downloaded successfully!"
           echo "========================================="
 
-      - name: Upload Single Episodes (Only if ALL downloaded)
+      - name: Smart Merge Episodes
+        id: merge
+        run: |
+          cd downloads
+          
+          EP_COUNT=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
+          if [ "$EP_COUNT" -eq 0 ]; then
+            echo "❌ No episodes to merge!"
+            exit 1
+          fi
+          
+          if [ "$EP_COUNT" -eq 1 ]; then
+            echo "📦 Only 1 episode - skipping merge"
+            SINGLE_FILE=$(ls EP*.mp4 | head -1)
+            ffmpeg -i "$SINGLE_FILE" -c copy -movflags +faststart \
+              -metadata title="$TITLE" \
+              -metadata series="$SERIES_TITLE" \
+              -metadata label="$LABEL" \
+              -metadata year="$(date +%Y)" \
+              -metadata date="$(date +%Y-%m-%d)" \
+              "output.mp4" 2>/dev/null
+            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
+            echo "has_merged=true" >> $GITHUB_ENV
+            echo "merge_success=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "📊 Found $EP_COUNT episodes to merge"
+          
+          echo "🔍 Analyzing resolutions with MediaInfo..."
+          
+          declare -A resolutions
+          TARGET_RES=""
+          for f in EP*.mp4; do
+            if [ -f "$f" ]; then
+              res=$(mediainfo --Inform="Video;%Width%x%Height%" "$f" 2>/dev/null || echo "0x0")
+              resolutions["$f"]="$res"
+              echo "$f: $res"
+            fi
+          done
+          
+          if [ ${#resolutions[@]} -eq 0 ]; then
+            echo "❌ No valid files to merge!"
+            exit 1
+          fi
+          
+          # Find the most common resolution as target
+          TARGET_RES=$(printf '%s\n' "${resolutions[@]}" | grep -v "0x0" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+          
+          if [ -z "$TARGET_RES" ] || [ "$TARGET_RES" = "0x0" ]; then
+            echo "⚠️ Using 540x960 as default"
+            TARGET_RES="540x960"
+          fi
+          
+          TARGET_W=$(echo "$TARGET_RES" | cut -d'x' -f1)
+          TARGET_H=$(echo "$TARGET_RES" | cut -d'x' -f2)
+          
+          echo "🎯 Target resolution: ${TARGET_W}x${TARGET_H}"
+          
+          # Normalize any files that don't match the target resolution
+          NORMALIZED_FILES=""
+          NEEDS_REENCODE=false
+          
+          for f in EP*.mp4; do
+            if [ ! -f "$f" ]; then continue; fi
+            CURRENT_RES="${resolutions[$f]}"
+            
+            if [ "$CURRENT_RES" == "$TARGET_RES" ]; then
+              echo "✅ Keeping: $f (matches target)"
+              NORMALIZED_FILES="$NORMALIZED_FILES $f"
+            else
+              echo "⚠️ Normalizing: $f (${CURRENT_RES} -> ${TARGET_RES})"
+              NEEDS_REENCODE=true
+              
+              EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
+              EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
+              
+              # Re-encode to match target resolution
+              ffmpeg -i "$f" \
+                -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black" \
+                -c:v libx264 -preset veryfast -crf 23 \
+                -c:a aac -b:a 128k \
+                -metadata title="$EPISODE_TITLE" \
+                -metadata episode_id="$EP_NUM" \
+                -metadata series="$SERIES_TITLE" \
+                -metadata label="$LABEL" \
+                -movflags +faststart \
+                "normalized_$f" 2>/dev/null
+              
+              if [ -f "normalized_$f" ] && [ -s "normalized_$f" ]; then
+                # Verify the normalized file
+                NORM_RES=$(mediainfo --Inform="Video;%Width%x%Height%" "normalized_$f" 2>/dev/null || echo "0x0")
+                if [ "$NORM_RES" == "$TARGET_RES" ]; then
+                  echo "✅ Normalized successfully: $f -> normalized_$f (${NORM_RES})"
+                  NORMALIZED_FILES="$NORMALIZED_FILES normalized_$f"
+                else
+                  echo "⚠️ Normalization produced wrong resolution ${NORM_RES}, using original"
+                  NORMALIZED_FILES="$NORMALIZED_FILES $f"
+                fi
+              else
+                echo "⚠️ Normalization failed, using original"
+                NORMALIZED_FILES="$NORMALIZED_FILES $f"
+              fi
+            fi
+          done
+          
+          # Count files to merge
+          FILE_COUNT=$(echo "$NORMALIZED_FILES" | wc -w)
+          echo "📊 Files to merge: $FILE_COUNT"
+          
+          if [ $FILE_COUNT -eq 0 ]; then
+            echo "❌ No files to merge!"
+            exit 1
+          fi
+          
+          # Now all files should have the same resolution - use MKVToolNix
+          echo "✅ All videos now have same resolution - Using MKVToolNix merge"
+          
+          # Build merge arguments with proper file validation
+          MERGE_FILES=""
+          for f in $NORMALIZED_FILES; do
+            if [ -f "$f" ] && [ -s "$f" ]; then
+              # Verify file is valid
+              if mediainfo "$f" > /dev/null 2>&1; then
+                MERGE_FILES="$MERGE_FILES $f"
+                echo "✅ Added to merge: $f ($(du -h $f | cut -f1))"
+              else
+                echo "⚠️ Skipping invalid file: $f"
+              fi
+            else
+              echo "⚠️ File missing or empty: $f"
+            fi
+          done
+          
+          # Convert to array
+          MERGE_FILES_ARRAY=($MERGE_FILES)
+          FILE_COUNT=${#MERGE_FILES_ARRAY[@]}
+          
+          if [ $FILE_COUNT -lt 2 ]; then
+            echo "❌ Not enough valid files to merge (need at least 2)"
+            exit 1
+          fi
+          
+          echo "📊 Merging $FILE_COUNT valid files with MKVToolNix..."
+          
+          # Build mkvmerge command with simple append
+          MKVMERGE_CMD_SIMPLE="mkvmerge -o merged.mkv --title \"$TITLE\""
+          FIRST=true
+          for f in "${MERGE_FILES_ARRAY[@]}"; do
+            if [ "$FIRST" = true ]; then
+              MKVMERGE_CMD_SIMPLE="$MKVMERGE_CMD_SIMPLE \"$f\""
+              FIRST=false
+            else
+              MKVMERGE_CMD_SIMPLE="$MKVMERGE_CMD_SIMPLE +\"$f\""
+            fi
+          done
+          
+          # Try simple append first (works for same codec files)
+          echo "🔄 Attempting simple append merge..."
+          eval $MKVMERGE_CMD_SIMPLE 2>&1 || true
+          
+          if [ -f "merged.mkv" ] && [ -s "merged.mkv" ]; then
+            echo "✅ Simple append merge successful"
+          else
+            echo "❌ MKVToolNix merge failed!"
+            echo "🔧 Falling back to FFmpeg concat..."
+            
+            # Fallback to FFmpeg concat with proper handling
+            # Create concat list
+            CONCAT_LIST="concat_list.txt"
+            > $CONCAT_LIST
+            
+            for f in "${MERGE_FILES_ARRAY[@]}"; do
+              echo "file '$f'" >> $CONCAT_LIST
+            done
+            
+            # Use concat demuxer
+            ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
+              -c:v libx264 -preset veryfast -crf 23 \
+              -c:a aac -b:a 128k \
+              -metadata title="$TITLE" \
+              -metadata series="$SERIES_TITLE" \
+              -metadata label="$LABEL" \
+              -metadata year="$(date +%Y)" \
+              -metadata date="$(date +%Y-%m-%d)" \
+              -movflags +faststart \
+              -threads $(nproc) \
+              merged.mp4 2>/dev/null
+            
+            if [ -f "merged.mp4" ] && [ -s "merged.mp4" ]; then
+              mv merged.mp4 merged.mkv 2>/dev/null || true
+              echo "✅ FFmpeg concat merge successful"
+            else
+              echo "❌ FFmpeg concat merge failed!"
+              exit 1
+            fi
+          fi
+          
+          # Convert to MP4 with proper metadata
+          if [ -f "merged.mkv" ] && [ -s "merged.mkv" ]; then
+            echo "📦 Converting MKV to MP4..."
+            ffmpeg -i merged.mkv -c copy -movflags +faststart \
+              -metadata title="$TITLE" \
+              -metadata series="$SERIES_TITLE" \
+              -metadata label="$LABEL" \
+              -metadata year="$(date +%Y)" \
+              -metadata date="$(date +%Y-%m-%d)" \
+              "output.mp4" 2>/dev/null
+            
+            if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
+              echo "✅ Converted to MP4 successfully"
+              rm -f merged.mkv
+            else
+              echo "⚠️ Conversion failed, using MKV file"
+              mv merged.mkv output.mp4 2>/dev/null || true
+            fi
+          fi
+          
+          # Generate thumbnails
+          if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
+            echo "🖼️ Generating thumbnails..."
+            
+            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
+              -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
+              -q:v 2 "thumb.jpg" 2>/dev/null
+            
+            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
+              -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
+              -q:v 2 "square_thumb.jpg" 2>/dev/null
+            
+            # Clean up normalized files
+            rm -f normalized_*.mp4
+            
+            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
+            echo "has_merged=true" >> $GITHUB_ENV
+            echo "merge_success=true" >> $GITHUB_OUTPUT
+            
+            echo ""
+            echo "========================================="
+            echo "📊 FINAL FILE"
+            echo "========================================="
+            ls -lh output.mp4
+            echo "========================================="
+          else
+            echo "❌ output.mp4 not created!"
+            exit 1
+          fi
+
+      - name: Upload Single Episodes (Only if Merge Successful)
+        if: steps.merge.outputs.merge_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -624,269 +876,8 @@ jobs:
           echo "🚀 Starting episode upload..."
           python3 -u upload_single.py
 
-      - name: Smart Merge Episodes
-        run: |
-          cd downloads
-          
-          EP_COUNT=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
-          if [ "$EP_COUNT" -eq 0 ]; then
-            echo "❌ No episodes to merge!"
-            exit 1
-          fi
-          
-          if [ "$EP_COUNT" -eq 1 ]; then
-            echo "📦 Only 1 episode - skipping merge"
-            SINGLE_FILE=$(ls EP*.mp4 | head -1)
-            ffmpeg -i "$SINGLE_FILE" -c copy -movflags +faststart \
-              -metadata title="$TITLE" \
-              -metadata series="$SERIES_TITLE" \
-              -metadata label="$LABEL" \
-              -metadata year="$(date +%Y)" \
-              -metadata date="$(date +%Y-%m-%d)" \
-              "output.mp4" 2>/dev/null
-            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
-            echo "has_merged=true" >> $GITHUB_ENV
-            exit 0
-          fi
-          
-          echo "📊 Found $EP_COUNT episodes to merge"
-          
-          echo "🔍 Analyzing resolutions with MediaInfo..."
-          
-          declare -A resolutions
-          TARGET_RES=""
-          for f in EP*.mp4; do
-            if [ -f "$f" ]; then
-              res=$(mediainfo --Inform="Video;%Width%x%Height%" "$f" 2>/dev/null || echo "0x0")
-              resolutions["$f"]="$res"
-              echo "$f: $res"
-            fi
-          done
-          
-          if [ ${#resolutions[@]} -eq 0 ]; then
-            echo "❌ No valid files to merge!"
-            exit 1
-          fi
-          
-          # Find the most common resolution as target
-          TARGET_RES=$(printf '%s\n' "${resolutions[@]}" | grep -v "0x0" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
-          
-          if [ -z "$TARGET_RES" ] || [ "$TARGET_RES" = "0x0" ]; then
-            echo "⚠️ Using 540x960 as default"
-            TARGET_RES="540x960"
-          fi
-          
-          TARGET_W=$(echo "$TARGET_RES" | cut -d'x' -f1)
-          TARGET_H=$(echo "$TARGET_RES" | cut -d'x' -f2)
-          
-          echo "🎯 Target resolution: ${TARGET_W}x${TARGET_H}"
-          
-          # Normalize any files that don't match the target resolution
-          NORMALIZED_FILES=""
-          NEEDS_REENCODE=false
-          
-          for f in EP*.mp4; do
-            if [ ! -f "$f" ]; then continue; fi
-            CURRENT_RES="${resolutions[$f]}"
-            
-            if [ "$CURRENT_RES" == "$TARGET_RES" ]; then
-              echo "✅ Keeping: $f (matches target)"
-              NORMALIZED_FILES="$NORMALIZED_FILES $f"
-            else
-              echo "⚠️ Normalizing: $f (${CURRENT_RES} -> ${TARGET_RES})"
-              NEEDS_REENCODE=true
-              
-              EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
-              EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
-              
-              # Re-encode to match target resolution
-              ffmpeg -i "$f" \
-                -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black" \
-                -c:v libx264 -preset veryfast -crf 23 \
-                -c:a aac -b:a 128k \
-                -metadata title="$EPISODE_TITLE" \
-                -metadata episode_id="$EP_NUM" \
-                -metadata series="$SERIES_TITLE" \
-                -metadata label="$LABEL" \
-                -movflags +faststart \
-                "normalized_$f" 2>/dev/null
-              
-              if [ -f "normalized_$f" ] && [ -s "normalized_$f" ]; then
-                # Verify the normalized file
-                NORM_RES=$(mediainfo --Inform="Video;%Width%x%Height%" "normalized_$f" 2>/dev/null || echo "0x0")
-                if [ "$NORM_RES" == "$TARGET_RES" ]; then
-                  echo "✅ Normalized successfully: $f -> normalized_$f (${NORM_RES})"
-                  NORMALIZED_FILES="$NORMALIZED_FILES normalized_$f"
-                else
-                  echo "⚠️ Normalization produced wrong resolution ${NORM_RES}, using original"
-                  NORMALIZED_FILES="$NORMALIZED_FILES $f"
-                fi
-              else
-                echo "⚠️ Normalization failed, using original"
-                NORMALIZED_FILES="$NORMALIZED_FILES $f"
-              fi
-            fi
-          done
-          
-          # Count files to merge
-          FILE_COUNT=$(echo "$NORMALIZED_FILES" | wc -w)
-          echo "📊 Files to merge: $FILE_COUNT"
-          
-          if [ $FILE_COUNT -eq 0 ]; then
-            echo "❌ No files to merge!"
-            exit 1
-          fi
-          
-          # Now all files should have the same resolution - use MKVToolNix
-          echo "✅ All videos now have same resolution - Using MKVToolNix merge"
-          
-          # Build merge arguments with proper file validation
-          MERGE_FILES=""
-          for f in $NORMALIZED_FILES; do
-            if [ -f "$f" ] && [ -s "$f" ]; then
-              # Verify file is valid
-              if mediainfo "$f" > /dev/null 2>&1; then
-                MERGE_FILES="$MERGE_FILES $f"
-                echo "✅ Added to merge: $f ($(du -h $f | cut -f1))"
-              else
-                echo "⚠️ Skipping invalid file: $f"
-              fi
-            else
-              echo "⚠️ File missing or empty: $f"
-            fi
-          done
-          
-          # Convert to array
-          MERGE_FILES_ARRAY=($MERGE_FILES)
-          FILE_COUNT=${#MERGE_FILES_ARRAY[@]}
-          
-          if [ $FILE_COUNT -lt 2 ]; then
-            echo "❌ Not enough valid files to merge (need at least 2)"
-            exit 1
-          fi
-          
-          echo "📊 Merging $FILE_COUNT valid files with MKVToolNix..."
-          
-          # Build mkvmerge command with explicit track selection
-          MKVMERGE_CMD="mkvmerge -o merged.mkv --title \"$TITLE\""
-          
-          # Add each file with explicit track selection
-          for f in "${MERGE_FILES_ARRAY[@]}"; do
-            MKVMERGE_CMD="$MKVMERGE_CMD --language 0:und --default-track 0:yes --track-order 0:0,0:1 \"$f\""
-          done
-          
-          # Also add as simple append for files with same codec
-          MKVMERGE_CMD_SIMPLE="mkvmerge -o merged.mkv --title \"$TITLE\""
-          FIRST=true
-          for f in "${MERGE_FILES_ARRAY[@]}"; do
-            if [ "$FIRST" = true ]; then
-              MKVMERGE_CMD_SIMPLE="$MKVMERGE_CMD_SIMPLE \"$f\""
-              FIRST=false
-            else
-              MKVMERGE_CMD_SIMPLE="$MKVMERGE_CMD_SIMPLE +\"$f\""
-            fi
-          done
-          
-          # Try simple append first (works for same codec files)
-          echo "🔄 Attempting simple append merge..."
-          eval $MKVMERGE_CMD_SIMPLE 2>&1 || true
-          
-          if [ -f "merged.mkv" ] && [ -s "merged.mkv" ]; then
-            echo "✅ Simple append merge successful"
-          else
-            echo "⚠️ Simple append failed, trying explicit track selection..."
-            rm -f merged.mkv
-            
-            eval $MKVMERGE_CMD 2>&1 || true
-            
-            if [ -f "merged.mkv" ] && [ -s "merged.mkv" ]; then
-              echo "✅ Explicit track selection merge successful"
-            else
-              echo "❌ MKVToolNix merge failed!"
-              echo "🔧 Falling back to FFmpeg concat..."
-              
-              # Fallback to FFmpeg concat with proper handling
-              # Create concat list
-              CONCAT_LIST="concat_list.txt"
-              > $CONCAT_LIST
-              
-              for f in "${MERGE_FILES_ARRAY[@]}"; do
-                echo "file '$f'" >> $CONCAT_LIST
-              done
-              
-              # Use concat demuxer
-              ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
-                -c:v libx264 -preset veryfast -crf 23 \
-                -c:a aac -b:a 128k \
-                -metadata title="$TITLE" \
-                -metadata series="$SERIES_TITLE" \
-                -metadata label="$LABEL" \
-                -metadata year="$(date +%Y)" \
-                -metadata date="$(date +%Y-%m-%d)" \
-                -movflags +faststart \
-                -threads $(nproc) \
-                merged.mp4 2>/dev/null
-              
-              if [ -f "merged.mp4" ] && [ -s "merged.mp4" ]; then
-                mv merged.mp4 merged.mkv 2>/dev/null || true
-                echo "✅ FFmpeg concat merge successful"
-              else
-                echo "❌ FFmpeg concat merge failed!"
-                exit 1
-              fi
-            fi
-          fi
-          
-          # Convert to MP4 with proper metadata
-          if [ -f "merged.mkv" ] && [ -s "merged.mkv" ]; then
-            echo "📦 Converting MKV to MP4..."
-            ffmpeg -i merged.mkv -c copy -movflags +faststart \
-              -metadata title="$TITLE" \
-              -metadata series="$SERIES_TITLE" \
-              -metadata label="$LABEL" \
-              -metadata year="$(date +%Y)" \
-              -metadata date="$(date +%Y-%m-%d)" \
-              "output.mp4" 2>/dev/null
-            
-            if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
-              echo "✅ Converted to MP4 successfully"
-              rm -f merged.mkv
-            else
-              echo "⚠️ Conversion failed, using MKV file"
-              mv merged.mkv output.mp4 2>/dev/null || true
-            fi
-          fi
-          
-          # Generate thumbnails
-          if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
-            echo "🖼️ Generating thumbnails..."
-            
-            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
-              -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
-              -q:v 2 "thumb.jpg" 2>/dev/null
-            
-            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
-              -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
-              -q:v 2 "square_thumb.jpg" 2>/dev/null
-            
-            # Clean up normalized files
-            rm -f normalized_*.mp4
-            
-            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
-            echo "has_merged=true" >> $GITHUB_ENV
-            
-            echo ""
-            echo "========================================="
-            echo "📊 FINAL FILE"
-            echo "========================================="
-            ls -lh output.mp4
-            echo "========================================="
-          else
-            echo "❌ output.mp4 not created!"
-            exit 1
-          fi
-
       - name: Verify Merged File with MediaInfo and Fix Duration
+        if: steps.merge.outputs.merge_success == 'true'
         run: |
           cd downloads
           
@@ -954,6 +945,7 @@ jobs:
           fi
 
       - name: Upload Merged Video to Telegram
+        if: steps.merge.outputs.merge_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -1240,20 +1232,32 @@ jobs:
         if: success()
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const runId = context.runId;
             const repo = context.repo;
             
             console.log(`🧹 Cleaning up workflow run ${runId}`);
+            console.log(`📦 Repository: ${repo.owner}/${repo.repo}`);
             
             try {
-              await github.rest.actions.deleteWorkflowRun({
+              const response = await github.rest.actions.deleteWorkflowRun({
                 owner: repo.owner,
                 repo: repo.repo,
                 run_id: runId
               });
               console.log(`✅ Successfully deleted workflow run ${runId}`);
+              console.log(`📊 Response status: ${response.status}`);
             } catch (error) {
-              console.log(`⚠️ Could not delete workflow run: ${error.message}`);
-              console.log('ℹ️ You may need to manually delete it or check permissions');
+              console.log(`❌ Failed to delete workflow run: ${error.message}`);
+              if (error.status === 403) {
+                console.log('⚠️ Permission denied. The token may not have "actions: write" permission.');
+                console.log('ℹ️ Add "permissions: actions: write" to your workflow.');
+              } else if (error.status === 404) {
+                console.log('⚠️ Workflow run not found. It may have been already deleted.');
+              } else {
+                console.log(`⚠️ Error details: ${JSON.stringify(error, null, 2)}`);
+              }
+              // Don't fail the workflow if cleanup fails
+              console.log('ℹ️ Continuing workflow execution...');
             }
