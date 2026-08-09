@@ -196,7 +196,7 @@ jobs:
           EP_INDEX=1
           FAILED_EPISODES=""
           
-           while IFS= read -u 3 -r URL || [ -n "$URL" ]; do
+          while IFS= read -u 3 -r URL || [ -n "$URL" ]; do
             URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [ -z "$URL" ]; then continue; fi
             
@@ -209,25 +209,50 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # 2. Redirect standard input using < /dev/null for all downloaders
+            # MODIFIED: Condensed download output
             if [[ "$URL" == *".m3u8"* ]]; then
               echo "📺 HLS stream - Using yt-dlp"
-              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts --concurrent-fragments 16 -o "$OUT_FILE" "$URL" < /dev/null || \
-              yt-dlp -o "$OUT_FILE" "$URL" < /dev/null || \
-              ffmpeg -nostdin -i "$URL" -c copy "$OUT_FILE" < /dev/null
+              
+              # Create a temporary file for yt-dlp output
+              TMP_LOG=$(mktemp)
+              
+              # Run yt-dlp with progress hidden but info shown
+              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts --concurrent-fragments 16 \
+                --no-progress --no-warnings \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>&1 | tee "$TMP_LOG" | grep -E "(Extracting URL|Downloading webpage|Downloading m3u8|Total fragments|Destination|Downloading 1 format)" || true
+              
+              # Check if download succeeded
+              if [ ! -f "$OUT_FILE" ] || [ ! -s "$OUT_FILE" ]; then
+                echo "⚠️ First attempt failed, trying with ffmpeg..."
+                ffmpeg -nostdin -i "$URL" -c copy "$OUT_FILE" < /dev/null 2>/dev/null
+              fi
               DOWNLOAD_STATUS=$?
+              
+              # Show download summary
+              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                FILE_SIZE=$(du -h "$OUT_FILE" | cut -f1)
+                echo "✅ Downloaded: $OUT_FILE ($FILE_SIZE)"
+              fi
+              
             else
               echo "🎬 Direct file - Using aria2c"
-              aria2c -x 16 -s 16 -k 1M --continue=true -o "$OUT_FILE" "$URL" < /dev/null || \
-              curl -sSL "$URL" -o "$OUT_FILE" < /dev/null
+              aria2c -x 16 -s 16 -k 1M --continue=true \
+                --console-log-level=error \
+                --summary-interval=0 \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null || \
+              curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
               DOWNLOAD_STATUS=$?
+              
+              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                FILE_SIZE=$(du -h "$OUT_FILE" | cut -f1)
+                echo "✅ Downloaded: $OUT_FILE ($FILE_SIZE)"
+              fi
             fi
             
             if [ $DOWNLOAD_STATUS -eq 0 ] && [ -f "$OUT_FILE" ]; then
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
               
               if [ "$FILE_SIZE" -gt 1000000 ]; then
-                echo "✅ Downloaded $OUT_FILE ($(du -h "$OUT_FILE" | cut -f1))"
                 echo "🔍 Verifying file..."
                 
                 if python3 verify_and_repair.py "$OUT_FILE" < /dev/null; then
