@@ -2,7 +2,6 @@ name: GitHub Telegram & Media Pipeline
 permissions:
   actions: write  # Required to delete workflow runs
   contents: read
-
 on:
   repository_dispatch:
     types: [github_release_upload]
@@ -741,74 +740,100 @@ jobs:
           # Now all files should have the same resolution - use MKVToolNix
           echo "✅ All videos now have same resolution - Using MKVToolNix merge"
           
-          # Build merge arguments
-          MERGE_ARGS=""
-          FIRST_FILE=true
-          
+          # Build merge arguments with proper file validation
+          MERGE_FILES=""
           for f in $NORMALIZED_FILES; do
-            if [ -f "$f" ]; then
-              if [ "$FIRST_FILE" = true ]; then
-                MERGE_ARGS="$f"
-                FIRST_FILE=false
+            if [ -f "$f" ] && [ -s "$f" ]; then
+              # Verify file is valid
+              if mediainfo "$f" > /dev/null 2>&1; then
+                MERGE_FILES="$MERGE_FILES $f"
+                echo "✅ Added to merge: $f ($(du -h $f | cut -f1))"
               else
-                MERGE_ARGS="$MERGE_ARGS +$f"
+                echo "⚠️ Skipping invalid file: $f"
               fi
+            else
+              echo "⚠️ File missing or empty: $f"
             fi
           done
           
-          echo "🔄 Merging $FILE_COUNT files with MKVToolNix..."
-          mkvmerge -o merged.mkv --title "$TITLE" --default-track 0:yes $MERGE_ARGS 2>/dev/null
+          # Convert to array
+          MERGE_FILES_ARRAY=($MERGE_FILES)
+          FILE_COUNT=${#MERGE_FILES_ARRAY[@]}
+          
+          if [ $FILE_COUNT -lt 2 ]; then
+            echo "❌ Not enough valid files to merge (need at least 2)"
+            exit 1
+          fi
+          
+          echo "📊 Merging $FILE_COUNT valid files with MKVToolNix..."
+          
+          # Build mkvmerge command with explicit track selection
+          MKVMERGE_CMD="mkvmerge -o merged.mkv --title \"$TITLE\""
+          
+          # Add each file with explicit track selection
+          for f in "${MERGE_FILES_ARRAY[@]}"; do
+            MKVMERGE_CMD="$MKVMERGE_CMD --language 0:und --default-track 0:yes --track-order 0:0,0:1 \"$f\""
+          done
+          
+          # Also add as simple append for files with same codec
+          MKVMERGE_CMD_SIMPLE="mkvmerge -o merged.mkv --title \"$TITLE\""
+          FIRST=true
+          for f in "${MERGE_FILES_ARRAY[@]}"; do
+            if [ "$FIRST" = true ]; then
+              MKVMERGE_CMD_SIMPLE="$MKVMERGE_CMD_SIMPLE \"$f\""
+              FIRST=false
+            else
+              MKVMERGE_CMD_SIMPLE="$MKVMERGE_CMD_SIMPLE +\"$f\""
+            fi
+          done
+          
+          # Try simple append first (works for same codec files)
+          echo "🔄 Attempting simple append merge..."
+          eval $MKVMERGE_CMD_SIMPLE 2>&1 || true
           
           if [ -f "merged.mkv" ] && [ -s "merged.mkv" ]; then
-            echo "✅ MKVToolNix merge successful"
+            echo "✅ Simple append merge successful"
           else
-            echo "❌ MKVToolNix merge failed!"
-            echo "🔧 Falling back to FFmpeg concat..."
+            echo "⚠️ Simple append failed, trying explicit track selection..."
+            rm -f merged.mkv
             
-            # Fallback to FFmpeg concat
-            FILES=""
-            for f in $NORMALIZED_FILES; do
-              if [ -f "$f" ]; then
-                FILES="$FILES -i $f"
-              fi
-            done
+            eval $MKVMERGE_CMD 2>&1 || true
             
-            # Use concat filter
-            COUNT=0
-            FILTER=""
-            for f in $NORMALIZED_FILES; do
-              if [ -f "$f" ]; then
-                FILTER="${FILTER}[$COUNT:v]scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2,fps=30[v$COUNT];"
-                COUNT=$((COUNT + 1))
-              fi
-            done
-            
-            CONCAT=""
-            for i in $(seq 0 $((COUNT - 1))); do
-              CONCAT="${CONCAT}[v$i][$i:a]"
-            done
-            CONCAT="${CONCAT}concat=n=$COUNT:v=1:a=1[outv][outa]"
-            
-            eval ffmpeg $FILES \
-              -filter_complex \"${FILTER}${CONCAT}\" \
-              -map \"[outv]\" -map \"[outa]\" \
-              -c:v libx264 -preset veryfast -crf 23 \
-              -c:a aac -b:a 128k \
-              -metadata title=\"$TITLE\" \
-              -metadata series=\"$SERIES_TITLE\" \
-              -metadata label=\"$LABEL\" \
-              -metadata year=\"$(date +%Y)\" \
-              -metadata date=\"$(date +%Y-%m-%d)\" \
-              -movflags +faststart \
-              -threads $(nproc) \
-              merged.mp4 2>/dev/null
-            
-            if [ -f "merged.mp4" ] && [ -s "merged.mp4" ]; then
-              mv merged.mp4 merged.mkv 2>/dev/null || true
-              echo "✅ FFmpeg merge successful"
+            if [ -f "merged.mkv" ] && [ -s "merged.mkv" ]; then
+              echo "✅ Explicit track selection merge successful"
             else
-              echo "❌ FFmpeg merge failed!"
-              exit 1
+              echo "❌ MKVToolNix merge failed!"
+              echo "🔧 Falling back to FFmpeg concat..."
+              
+              # Fallback to FFmpeg concat with proper handling
+              # Create concat list
+              CONCAT_LIST="concat_list.txt"
+              > $CONCAT_LIST
+              
+              for f in "${MERGE_FILES_ARRAY[@]}"; do
+                echo "file '$f'" >> $CONCAT_LIST
+              done
+              
+              # Use concat demuxer
+              ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
+                -c:v libx264 -preset veryfast -crf 23 \
+                -c:a aac -b:a 128k \
+                -metadata title="$TITLE" \
+                -metadata series="$SERIES_TITLE" \
+                -metadata label="$LABEL" \
+                -metadata year="$(date +%Y)" \
+                -metadata date="$(date +%Y-%m-%d)" \
+                -movflags +faststart \
+                -threads $(nproc) \
+                merged.mp4 2>/dev/null
+              
+              if [ -f "merged.mp4" ] && [ -s "merged.mp4" ]; then
+                mv merged.mp4 merged.mkv 2>/dev/null || true
+                echo "✅ FFmpeg concat merge successful"
+              else
+                echo "❌ FFmpeg concat merge failed!"
+                exit 1
+              fi
             fi
           fi
           
