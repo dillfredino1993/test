@@ -1,6 +1,3 @@
-Here is the complete, corrected GitHub Actions workflow file with the URL extraction and download loop fixed to prevent URL corruption:
-
-```yaml
 name: GitHub Telegram & Media Pipeline
 
 on:
