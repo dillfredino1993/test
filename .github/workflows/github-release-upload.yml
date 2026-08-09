@@ -647,19 +647,68 @@ jobs:
               except ValueError:
                   return val
 
+          def fix_video_duration(file_path):
+              """Fix duration metadata in video file"""
+              try:
+                  temp_file = f"{file_path}.fixed.mp4"
+                  cmd = [
+                      "ffmpeg", "-y",
+                      "-i", file_path,
+                      "-c", "copy",
+                      "-map_metadata", "0",
+                      "-movflags", "+faststart",
+                      temp_file
+                  ]
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                  
+                  if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                      # Verify duration is now present
+                      cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", temp_file]
+                      duration_check = subprocess.check_output(cmd, text=True).strip()
+                      if duration_check and duration_check.replace('.', '', 1).isdigit():
+                          os.replace(temp_file, file_path)
+                          return True
+                  return False
+              except Exception as e:
+                  print(f"⚠️ Could not fix duration: {e}")
+                  return False
+
           def get_video_metadata(file_path):
               try:
-                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%|%Duration%", file_path]
+                  # First try ffprobe for accurate duration
+                  cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  if result and result.replace('.', '', 1).isdigit():
+                      duration = float(result)
+                  else:
+                      # Fallback to mediainfo
+                      cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      duration = float(result) if result.replace('.', '', 1).isdigit() else 0.0
+                  
+                  # Get resolution from mediainfo
+                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
                   parts = result.split('|')
                   
-                  if len(parts) >= 3:
+                  if len(parts) >= 2:
                       w = int(parts[0]) if parts[0].isdigit() else 1280
                       h = int(parts[1]) if parts[1].isdigit() else 720
-                      duration = float(parts[2]) if parts[2].replace('.', '', 1).isdigit() else 0.0
-                      return int(duration), w, h
-              except:
-                  pass
+                  else:
+                      # Fallback to ffprobe
+                      cmd = ["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "default=noprint_wrappers=1", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      w = 1280
+                      h = 720
+                      for line in result.split('\n'):
+                          if 'width=' in line:
+                              w = int(line.split('=')[1])
+                          elif 'height=' in line:
+                              h = int(line.split('=')[1])
+                  
+                  return int(duration), w, h
+              except Exception as e:
+                  print(f"⚠️ Error getting metadata: {e}")
               return 0, 1280, 720
 
           def generate_thumbnail(file_path):
@@ -723,12 +772,26 @@ jobs:
 
           async def send_file_with_thumb(client, entity, file_path, caption, reply_to=None):
               duration, w, h = get_video_metadata(file_path)
+              print(f"📊 Video duration: {duration} seconds, {w}x{h}")
+              
+              # If duration is 0, try to get it from the file itself
+              if duration == 0:
+                  try:
+                      cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      if result and result.replace('.', '', 1).isdigit():
+                          duration = int(float(result))
+                          print(f"📊 Retrieved duration from ffprobe: {duration} seconds")
+                  except:
+                      pass
+              
               thumb = generate_thumbnail(file_path)
               
+              # Create video attribute with proper duration
               video_attr = DocumentAttributeVideo(
                   duration=duration,
-                  w=w,
-                  h=h,
+                  w=w if w > 0 else 1280,
+                  h=h if h > 0 else 720,
                   supports_streaming=True
               )
               
@@ -737,7 +800,9 @@ jobs:
                   "file": file_path,
                   "caption": caption,
                   "attributes": [video_attr],
-                  "supports_streaming": True
+                  "supports_streaming": True,
+                  "force_document": False,
+                  "allow_cache": True
               }
               
               if thumb and os.path.exists(thumb):
@@ -781,6 +846,13 @@ jobs:
                   if not ep_match:
                       continue
                   ep_num = int(ep_match.group(1))
+                  
+                  # Fix duration metadata before upload
+                  print(f"🔧 Fixing duration metadata for Episode {ep_num}...")
+                  if fix_video_duration(ep_file):
+                      print(f"✅ Duration metadata fixed for Episode {ep_num}")
+                  else:
+                      print(f"⚠️ Could not fix duration metadata for Episode {ep_num}")
                   
                   file_size = os.path.getsize(ep_file) / (1024 * 1024)
                   if file_size > 2000:
@@ -837,7 +909,6 @@ jobs:
                   topic_id = None
                   if hasattr(entity, 'forum') and entity.forum:
                       try:
-                          # MODIFIED: Topic name format [LABEL]-SERIES
                           topic_name = f"[{label}]-{series_title}"
                           print(f"📝 Creating forum topic: {topic_name[:50]}")
                           result = await client(CreateForumTopicRequest(
@@ -1123,7 +1194,9 @@ jobs:
                   "file": file_path,
                   "caption": caption,
                   "attributes": [video_attr],
-                  "supports_streaming": True
+                  "supports_streaming": True,
+                  "force_document": False,
+                  "allow_cache": True
               }
               
               if thumb and os.path.exists(thumb):
@@ -1241,23 +1314,18 @@ jobs:
             console.log(`📦 Repository: ${repo.owner}/${repo.repo}`);
             
             try {
-              const response = await github.rest.actions.deleteWorkflowRun({
+              await github.rest.actions.deleteWorkflowRun({
                 owner: repo.owner,
                 repo: repo.repo,
                 run_id: runId
               });
               console.log(`✅ Successfully deleted workflow run ${runId}`);
-              console.log(`📊 Response status: ${response.status}`);
             } catch (error) {
               console.log(`❌ Failed to delete workflow run: ${error.message}`);
               if (error.status === 403) {
                 console.log('⚠️ Permission denied. The token may not have "actions: write" permission.');
-                console.log('ℹ️ Add "permissions: actions: write" to your workflow.');
               } else if (error.status === 404) {
                 console.log('⚠️ Workflow run not found. It may have been already deleted.');
-              } else {
-                console.log(`⚠️ Error details: ${JSON.stringify(error, null, 2)}`);
               }
-              // Don't fail the workflow if cleanup fails
               console.log('ℹ️ Continuing workflow execution...');
             }
