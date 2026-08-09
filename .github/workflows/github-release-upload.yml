@@ -4,6 +4,11 @@ on:
   repository_dispatch:
     types: [github_release_upload]
 
+# Add concurrency control - THIS MAKES IT WAIT
+concurrency:
+  group: media-pipeline-processor
+  cancel-in-progress: false
+
 # Add permissions for deleting workflow runs
 permissions:
   actions: write
