@@ -1,4 +1,4 @@
-ame: GitHub Telegram & Media Pipeline
+name: GitHub Telegram & Media Pipeline
 
 on:
   repository_dispatch:
