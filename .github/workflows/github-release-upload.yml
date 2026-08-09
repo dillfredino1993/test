@@ -4,7 +4,6 @@ on:
   repository_dispatch:
     types: [github_release_upload]
 
-# Add permissions for deleting workflow runs
 permissions:
   actions: write
   contents: read
@@ -50,13 +49,11 @@ jobs:
         run: |
           mkdir -p downloads && cd downloads
           
-          # Extract URLs cleanly: remove \r carriage returns and trim whitespace
           echo "$CLIENT_PAYLOAD" | tr -d '\r' | jq -r '
             (.episodes[]?.url // .video_urls[]? // .video_url // .url // empty)
             | tostring | gsub("^\\s+|\\s+$"; "")
           ' > urls.txt
           
-          # Remove empty lines
           sed -i '/^$/d' urls.txt
           
           echo "========================================="
@@ -82,7 +79,6 @@ jobs:
           TOTAL_EPISODES=$(cat urls.txt | wc -l)
           echo "📥 Need to download $TOTAL_EPISODES episodes"
           
-          # Create verify_and_repair.py
           cat > verify_and_repair.py << 'EOFVERIFY'
           import os
           import sys
@@ -214,23 +210,19 @@ EOFVERIFY
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # MODIFIED: Condensed download output
             if [[ "$URL" == *".m3u8"* ]]; then
               echo "📺 HLS stream - Using yt-dlp"
               
-              # Run yt-dlp with progress hidden but info shown
               yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts --concurrent-fragments 16 \
                 --no-progress --no-warnings \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>&1 | grep -E "(Extracting URL|Downloading webpage|Downloading m3u8|Total fragments|Destination|Downloading 1 format)" || true
               
-              # Check if download succeeded
               if [ ! -f "$OUT_FILE" ] || [ ! -s "$OUT_FILE" ]; then
                 echo "⚠️ First attempt failed, trying with ffmpeg..."
                 ffmpeg -nostdin -i "$URL" -c copy "$OUT_FILE" < /dev/null 2>/dev/null
               fi
               DOWNLOAD_STATUS=$?
               
-              # Show download summary
               if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
                 FILE_SIZE=$(du -h "$OUT_FILE" | cut -f1)
                 echo "✅ Downloaded: $OUT_FILE ($FILE_SIZE)"
@@ -254,7 +246,6 @@ EOFVERIFY
             if [ $DOWNLOAD_STATUS -eq 0 ] && [ -f "$OUT_FILE" ]; then
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
               
-              # MODIFIED: Lowered threshold to 50KB for very short episodes
               if [ "$FILE_SIZE" -gt 50000 ]; then
                 echo "🔍 Verifying file..."
                 
@@ -369,7 +360,6 @@ EOFVERIFY
             exit 1
           fi
           
-          # Find the most common resolution as target
           TARGET_RES=$(printf '%s\n' "${resolutions[@]}" | grep -v "0x0" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           
           if [ -z "$TARGET_RES" ] || [ "$TARGET_RES" = "0x0" ]; then
@@ -382,7 +372,6 @@ EOFVERIFY
           
           echo "🎯 Target resolution: ${TARGET_W}x${TARGET_H}"
           
-          # Normalize any files that don't match the target resolution
           NORMALIZED_FILES=""
           NEEDS_REENCODE=false
           
@@ -400,7 +389,6 @@ EOFVERIFY
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
               EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
               
-              # Re-encode to match target resolution
               ffmpeg -i "$f" \
                 -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black" \
                 -c:v libx264 -preset veryfast -crf 23 \
@@ -413,7 +401,6 @@ EOFVERIFY
                 "normalized_$f" 2>/dev/null
               
               if [ -f "normalized_$f" ] && [ -s "normalized_$f" ]; then
-                # Verify the normalized file
                 NORM_RES=$(mediainfo --Inform="Video;%Width%x%Height%" "normalized_$f" 2>/dev/null || echo "0x0")
                 if [ "$NORM_RES" == "$TARGET_RES" ]; then
                   echo "✅ Normalized successfully: $f -> normalized_$f (${NORM_RES})"
@@ -429,7 +416,6 @@ EOFVERIFY
             fi
           done
           
-          # Count files to merge
           FILE_COUNT=$(echo "$NORMALIZED_FILES" | wc -w)
           echo "📊 Files to merge: $FILE_COUNT"
           
@@ -438,14 +424,11 @@ EOFVERIFY
             exit 1
           fi
           
-          # Now all files should have the same resolution - use MKVToolNix
           echo "✅ All videos now have same resolution - Using MKVToolNix merge"
           
-          # Build merge arguments with proper file validation
           MERGE_FILES=""
           for f in $NORMALIZED_FILES; do
             if [ -f "$f" ] && [ -s "$f" ]; then
-              # Verify file is valid
               if mediainfo "$f" > /dev/null 2>&1; then
                 MERGE_FILES="$MERGE_FILES $f"
                 echo "✅ Added to merge: $f ($(du -h $f | cut -f1))"
@@ -457,7 +440,6 @@ EOFVERIFY
             fi
           done
           
-          # Convert to array
           MERGE_FILES_ARRAY=($MERGE_FILES)
           FILE_COUNT=${#MERGE_FILES_ARRAY[@]}
           
@@ -468,7 +450,6 @@ EOFVERIFY
           
           echo "📊 Merging $FILE_COUNT valid files with MKVToolNix..."
           
-          # Build mkvmerge command with simple append
           MKVMERGE_CMD_SIMPLE="mkvmerge -o merged.mkv --title \"$TITLE\""
           FIRST=true
           for f in "${MERGE_FILES_ARRAY[@]}"; do
@@ -480,7 +461,6 @@ EOFVERIFY
             fi
           done
           
-          # Try simple append first (works for same codec files)
           echo "🔄 Attempting simple append merge..."
           eval $MKVMERGE_CMD_SIMPLE 2>&1 || true
           
@@ -490,8 +470,6 @@ EOFVERIFY
             echo "❌ MKVToolNix merge failed!"
             echo "🔧 Falling back to FFmpeg concat..."
             
-            # Fallback to FFmpeg concat with proper handling
-            # Create concat list
             CONCAT_LIST="concat_list.txt"
             > $CONCAT_LIST
             
@@ -499,7 +477,6 @@ EOFVERIFY
               echo "file '$f'" >> $CONCAT_LIST
             done
             
-            # Use concat demuxer
             ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
               -c:v libx264 -preset veryfast -crf 23 \
               -c:a aac -b:a 128k \
@@ -521,7 +498,6 @@ EOFVERIFY
             fi
           fi
           
-          # Convert to MP4 with proper metadata
           if [ -f "merged.mkv" ] && [ -s "merged.mkv" ]; then
             echo "📦 Converting MKV to MP4..."
             ffmpeg -i merged.mkv -c copy -movflags +faststart \
@@ -541,27 +517,23 @@ EOFVERIFY
             fi
           fi
           
-          # Generate thumbnails with improved logic
           if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
             echo "🖼️ Generating thumbnails..."
             
-            # Get video duration
             DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 output.mp4 2>/dev/null || echo "0")
             DURATION=${DURATION%.*}
             
             if [ "$DURATION" -gt 0 ]; then
               echo "📊 Video duration: $DURATION seconds"
               
-              # Create a Python script for intelligent thumbnail generation
               cat > generate_thumb.py << 'EOFTHUMB'
               import subprocess
               import os
               import sys
+              import random
               
               def check_frame_content(file_path, timestamp):
-                  """Check if a frame at given timestamp has content (not black)"""
                   try:
-                      import random
                       temp_file = f"/tmp/check_frame_{random.randint(1000,9999)}.jpg"
                       cmd = [
                           "ffmpeg", "-y", "-ss", str(timestamp),
@@ -588,24 +560,19 @@ EOFVERIFY
                       return False
               
               def generate_best_thumbnail(file_path, duration):
-                  """Generate thumbnail from best frame in video"""
                   try:
-                      # Try multiple positions
                       timestamps = []
                       
-                      # Add percentage-based positions
                       for pct in [0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]:
                           ts = duration * pct
                           if ts > 0 and ts < duration:
                               timestamps.append(ts)
                       
-                      # Add fixed positions for longer videos
                       if duration > 30:
                           for ts in [2, 5, 10, 15, 20, 30]:
                               if ts < duration:
                                   timestamps.append(ts)
                       
-                      # Remove duplicates and sort
                       timestamps = sorted(set(timestamps))
                       
                       print(f"🔍 Trying {len(timestamps)} positions for thumbnail...")
@@ -626,7 +593,6 @@ EOFVERIFY
                           subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
                           
                           if os.path.exists(temp_thumb) and os.path.getsize(temp_thumb) > 5000:
-                              # Check if frame has content (not black)
                               if check_frame_content(file_path, ts):
                                   print(f"✅ Found good thumbnail at {ts}s")
                                   os.rename(temp_thumb, "thumb.jpg")
@@ -637,7 +603,6 @@ EOFVERIFY
                               if os.path.exists(temp_thumb):
                                   os.remove(temp_thumb)
                       
-                      # Fallback: try with square crop
                       for ts in timestamps:
                           if ts >= duration or ts < 0:
                               continue
@@ -678,7 +643,6 @@ EOFVERIFY
                       sys.exit(1)
 EOFTHUMB
               
-              # Try to generate a good thumbnail
               if python3 generate_thumb.py output.mp4 $DURATION; then
                 echo "✅ Generated good thumbnail"
               else
@@ -688,20 +652,17 @@ EOFTHUMB
                   -q:v 2 "thumb.jpg" 2>/dev/null
               fi
             else
-              # Fallback for very short videos
               echo "⚠️ Could not get duration, using fallback thumbnail"
               ffmpeg -i output.mp4 -ss 00:00:00 -vframes 1 \
                 -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
                 -q:v 2 "thumb.jpg" 2>/dev/null
             fi
             
-            # Generate square thumbnail from the main thumbnail if it exists
             if [ -f "thumb.jpg" ]; then
               ffmpeg -i "thumb.jpg" -vf "crop=min(iw,ih):min(iw,ih),scale=512:512:flags=lanczos" \
                 -q:v 2 "square_thumb.jpg" 2>/dev/null
               echo "✅ Square thumbnail generated"
             else
-              # Generate square thumbnail directly from video if main thumb failed
               ffmpeg -i output.mp4 -ss 00:00:01 -vframes 1 \
                 -vf "crop=min(iw,ih):min(iw,ih),scale=512:512:flags=lanczos" \
                 -q:v 2 "square_thumb.jpg" 2>/dev/null
@@ -751,18 +712,12 @@ EOFTHUMB
           cat > upload_merged.py << 'EOFUPLOAD'
           import os
           import sys
-          import glob
-          import re
           import subprocess
           import asyncio
           import datetime
           import traceback
           import json
           import random
-
-          if hasattr(sys.stdout, "reconfigure"):
-              sys.stdout.reconfigure(line_buffering=True)
-              sys.stderr.reconfigure(line_buffering=True)
 
           try:
               from telethon import TelegramClient
@@ -808,7 +763,6 @@ EOFTHUMB
                   return val
 
           def get_video_duration(file_path):
-              """Get video duration in seconds"""
               try:
                   cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
@@ -819,7 +773,6 @@ EOFTHUMB
               return 0
 
           def check_frame_content(file_path, timestamp):
-              """Check if a frame at given timestamp has content (not black)"""
               try:
                   temp_file = f"/tmp/check_frame_{random.randint(1000,9999)}.jpg"
                   cmd = [
@@ -847,7 +800,6 @@ EOFTHUMB
                   return False
 
           def generate_best_thumbnail(file_path):
-              """Generate thumbnail from best frame in video"""
               try:
                   duration = get_video_duration(file_path)
                   thumb_path = f"{file_path}_thumb.jpg"
@@ -958,10 +910,6 @@ EOFTHUMB
 
           chat_id = parse_chat_id(chat_id_raw)
 
-          print("=" * 60)
-          print("📤 Uploading Merged Video")
-          print("=" * 60)
-
           async def join_chat(client, invite_link):
               if not invite_link:
                   return None
@@ -992,7 +940,6 @@ EOFTHUMB
               duration, w, h = get_video_metadata(file_path)
               print(f"📊 Video duration: {duration} seconds, {w}x{h}")
               
-              print(f"🎨 Generating thumbnail from best frame...")
               thumb = generate_best_thumbnail(file_path)
               if thumb:
                   print(f"✅ Thumbnail generated successfully")
@@ -1049,7 +996,6 @@ EOFTHUMB
                   return False
               
               duration, w, h = get_video_metadata(video_path)
-              print(f"📊 Duration: {duration} seconds")
               
               now = datetime.datetime.now()
               month_year = now.strftime("%B%Y").upper()
@@ -1063,7 +1009,6 @@ EOFTHUMB
               print(f"📤 Uploading merged video...")
               print(f"💾 File size: {file_size_mb:.1f} MB")
               print(f"⏱️  Duration: {duration} seconds")
-              print(f"📝 Caption: {caption}")
               
               try:
                   success, result = await send_file_with_thumb(client, entity, video_path, caption)
@@ -1114,7 +1059,6 @@ EOFTHUMB
               asyncio.run(main())
 EOFUPLOAD
           
-          # Start merged upload in background
           python3 -u upload_merged.py &
           MERGED_PID=$!
           echo "✅ Merged upload started in background (PID: $MERGED_PID)"
@@ -1150,10 +1094,6 @@ EOFUPLOAD
           import traceback
           import json
           import random
-
-          if hasattr(sys.stdout, "reconfigure"):
-              sys.stdout.reconfigure(line_buffering=True)
-              sys.stderr.reconfigure(line_buffering=True)
 
           try:
               from telethon import TelegramClient
@@ -1198,7 +1138,6 @@ EOFUPLOAD
                   return val
 
           def get_video_duration(file_path):
-              """Get video duration in seconds"""
               try:
                   cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
@@ -1209,7 +1148,6 @@ EOFUPLOAD
               return 0
 
           def check_frame_content(file_path, timestamp):
-              """Check if a frame at given timestamp has content (not black)"""
               try:
                   temp_file = f"/tmp/check_frame_{random.randint(1000,9999)}.jpg"
                   cmd = [
@@ -1237,7 +1175,6 @@ EOFUPLOAD
                   return False
 
           def generate_best_thumbnail(file_path):
-              """Generate thumbnail from best frame in video"""
               try:
                   duration = get_video_duration(file_path)
                   thumb_path = f"{file_path}_thumb.jpg"
@@ -1305,7 +1242,6 @@ EOFUPLOAD
                       os.rename(best_thumb, thumb_path)
                       return thumb_path if os.path.exists(thumb_path) else None
                   
-                  # Final fallback
                   cmd = [
                       "ffmpeg", "-y", "-ss", "00:00:01",
                       "-i", file_path,
@@ -1322,7 +1258,6 @@ EOFUPLOAD
                   return None
 
           def fix_video_duration(file_path):
-              """Fix duration metadata in video file"""
               try:
                   temp_file = f"{file_path}.fixed.mp4"
                   cmd = [
@@ -1382,10 +1317,6 @@ EOFUPLOAD
 
           chat_id = parse_chat_id(chat_id_raw)
 
-          print("=" * 60)
-          print("📤 Uploading Single Episodes")
-          print("=" * 60)
-
           async def join_chat(client, invite_link):
               if not invite_link:
                   return None
@@ -1426,7 +1357,6 @@ EOFUPLOAD
                   except:
                       pass
               
-              print(f"🎨 Generating thumbnail from best frame...")
               thumb = generate_best_thumbnail(file_path)
               if thumb:
                   print(f"✅ Thumbnail generated successfully")
@@ -1588,11 +1518,21 @@ EOFUPLOAD
               asyncio.run(main())
 EOFUPLOAD
           
-          # Upload single episodes (this runs in parallel with the merged upload)
           echo "🚀 Starting single episode upload (parallel with merged upload)..."
           python3 -u upload_single.py
           
           echo "✅ Single episode upload complete!"
+
+      - name: Wait for Merged Upload to Complete
+        if: steps.merge.outputs.merge_success == 'true'
+        run: |
+          echo "⏳ Waiting for merged upload to complete..."
+          if [ -f /tmp/merged_pid.txt ]; then
+            MERGED_PID=$(cat /tmp/merged_pid.txt)
+            wait $MERGED_PID 2>/dev/null || true
+            rm -f /tmp/merged_pid.txt
+          fi
+          echo "✅ Merged upload process finished"
 
       - name: Verify Merged File with MediaInfo and Fix Duration
         if: steps.merge.outputs.merge_success == 'true'
