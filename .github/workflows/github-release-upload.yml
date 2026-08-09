@@ -214,23 +214,19 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # MODIFIED: Condensed download output
             if [[ "$URL" == *".m3u8"* ]]; then
               echo "📺 HLS stream - Using yt-dlp"
               
-              # Run yt-dlp with progress hidden but info shown
               yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts --concurrent-fragments 16 \
                 --no-progress --no-warnings \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>&1 | grep -E "(Extracting URL|Downloading webpage|Downloading m3u8|Total fragments|Destination|Downloading 1 format)" || true
               
-              # Check if download succeeded
               if [ ! -f "$OUT_FILE" ] || [ ! -s "$OUT_FILE" ]; then
                 echo "⚠️ First attempt failed, trying with ffmpeg..."
                 ffmpeg -nostdin -i "$URL" -c copy "$OUT_FILE" < /dev/null 2>/dev/null
               fi
               DOWNLOAD_STATUS=$?
               
-              # Show download summary
               if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
                 FILE_SIZE=$(du -h "$OUT_FILE" | cut -f1)
                 echo "✅ Downloaded: $OUT_FILE ($FILE_SIZE)"
@@ -254,7 +250,6 @@ jobs:
             if [ $DOWNLOAD_STATUS -eq 0 ] && [ -f "$OUT_FILE" ]; then
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
               
-              # MODIFIED: Lowered threshold to 50KB for very short episodes
               if [ "$FILE_SIZE" -gt 50000 ]; then
                 echo "🔍 Verifying file..."
                 
@@ -354,13 +349,11 @@ jobs:
           
           echo "🔍 Analyzing file properties with MediaInfo..."
           
-          # Arrays to store properties
           declare -A resolutions
           declare -A audio_sample_rates
           declare -A video_codecs
           declare -A audio_codecs
           
-          # First pass: collect all properties
           for f in EP*.mp4; do
             if [ -f "$f" ]; then
               res=$(mediainfo --Inform="Video;%Width%x%Height%" "$f" 2>/dev/null || echo "0x0")
@@ -393,7 +386,6 @@ jobs:
             exit 1
           fi
           
-          # Determine target properties (most common)
           TARGET_RES=$(printf '%s\n' "${resolutions[@]}" | grep -v "0x0" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           if [ -z "$TARGET_RES" ] || [ "$TARGET_RES" = "0x0" ]; then
             TARGET_RES="720x1280"
@@ -425,7 +417,6 @@ jobs:
           echo "   Audio Codec: ${TARGET_AUDIO_CODEC}"
           echo ""
           
-          # Normalize files that don't match target properties
           NORMALIZED_FILES=""
           NEEDS_NORMALIZE=false
           
@@ -437,7 +428,6 @@ jobs:
             CURRENT_VIDEO_CODEC="${video_codecs[$f]}"
             CURRENT_AUDIO_CODEC="${audio_codecs[$f]}"
             
-            # Check if file matches all target properties
             if [ "$CURRENT_RES" == "$TARGET_RES" ] && \
                [ "$CURRENT_SAMPLE_RATE" == "$TARGET_SAMPLE_RATE" ] && \
                [ "$CURRENT_VIDEO_CODEC" == "$TARGET_VIDEO_CODEC" ] && \
@@ -453,7 +443,6 @@ jobs:
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
               EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
               
-              # Re-encode to match all target properties
               ffmpeg -i "$f" \
                 -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black" \
                 -c:v libx264 -preset veryfast -crf 23 \
@@ -466,16 +455,13 @@ jobs:
                 "normalized_$f" 2>/dev/null
               
               if [ -f "normalized_$f" ] && [ -s "normalized_$f" ]; then
-                # Verify the normalized file matches all targets
                 NORM_RES=$(mediainfo --Inform="Video;%Width%x%Height%" "normalized_$f" 2>/dev/null || echo "0x0")
                 NORM_SAMPLE_RATE=$(mediainfo --Inform="Audio;%SamplingRate%" "normalized_$f" 2>/dev/null | tr -d ' ' | cut -d'/' -f1 | cut -d' ' -f1)
-                NORM_VIDEO_CODEC=$(mediainfo --Inform="Video;%CodecID%" "normalized_$f" 2>/dev/null || echo "avc1")
-                NORM_AUDIO_CODEC=$(mediainfo --Inform="Audio;%Format%" "normalized_$f" 2>/dev/null || echo "AAC")
                 
                 if [ "$NORM_RES" == "$TARGET_RES" ] && \
                    [ "$NORM_SAMPLE_RATE" == "$TARGET_SAMPLE_RATE" ]; then
                   echo "✅ Normalized successfully: $f -> normalized_$f"
-                  echo "   ${NORM_RES}, ${NORM_SAMPLE_RATE}Hz, ${NORM_VIDEO_CODEC}, ${NORM_AUDIO_CODEC}"
+                  echo "   ${NORM_RES}, ${NORM_SAMPLE_RATE}Hz"
                   NORMALIZED_FILES="$NORMALIZED_FILES normalized_$f"
                 else
                   echo "⚠️ Normalization verification failed, using original"
@@ -488,7 +474,6 @@ jobs:
             fi
           done
           
-          # Count files to merge
           FILE_COUNT=$(echo "$NORMALIZED_FILES" | wc -w)
           echo ""
           echo "📊 Files to merge: $FILE_COUNT"
@@ -498,7 +483,6 @@ jobs:
             exit 1
           fi
           
-          # Verify all files now have matching properties
           echo "🔍 Verifying all files match target properties..."
           ALL_MATCH=true
           VERIFIED_FILES=""
@@ -528,9 +512,8 @@ jobs:
           
           if [ "$ALL_MATCH" = false ]; then
             echo "❌ Some files still don't match target properties!"
-            echo "🔧 Forcing re-encode of all files to ensure consistency..."
+            echo "🔧 Forcing re-encode of all files..."
             
-            # Force re-encode all files
             VERIFIED_FILES=""
             for f in $NORMALIZED_FILES; do
               if [ ! -f "$f" ] || [ ! -s "$f" ]; then
@@ -562,7 +545,6 @@ jobs:
             VERIFIED_FILES="$NORMALIZED_FILES"
           fi
           
-          # Convert to array
           MERGE_FILES_ARRAY=($VERIFIED_FILES)
           FILE_COUNT=${#MERGE_FILES_ARRAY[@]}
           
@@ -575,8 +557,6 @@ jobs:
           echo "✅ All files now match target properties!"
           echo "📊 FAST MERGE: Using FFmpeg concat demuxer (no re-encoding)"
           
-          # Calculate total duration of all episodes
-          echo "📊 Calculating total duration of all episodes..."
           TOTAL_DURATION=0
           for f in "${MERGE_FILES_ARRAY[@]}"; do
             if [ -f "$f" ] && [ -s "$f" ]; then
@@ -590,13 +570,11 @@ jobs:
           done
           echo "📊 Total expected duration: ${TOTAL_DURATION} seconds ($((TOTAL_DURATION / 60)) minutes)"
           
-          # Create concat list for fast merge (no re-encoding)
           CONCAT_LIST="concat_list.txt"
           > $CONCAT_LIST
           
           for f in "${MERGE_FILES_ARRAY[@]}"; do
             if [ -f "$f" ] && [ -s "$f" ]; then
-              # Verify file is valid before adding
               if mediainfo "$f" > /dev/null 2>&1; then
                 echo "file '$f'" >> $CONCAT_LIST
                 echo "✅ Added: $f ($(du -h $f | cut -f1))"
@@ -608,7 +586,6 @@ jobs:
             fi
           done
           
-          # FAST MERGE: Use concat demuxer with stream copy (no re-encoding)
           echo "🔄 Concatenating files with stream copy (fast)..."
           ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
             -c copy \
@@ -623,22 +600,18 @@ jobs:
           if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
             echo "✅ Fast merge successful (no re-encoding!)"
             
-            # Verify merged file duration matches expected
             MERGED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
             MERGED_DURATION_INT=${MERGED_DURATION%.*}
             echo "📊 Merged file duration: ${MERGED_DURATION_INT} seconds"
             
-            # Check if duration matches expected (allow 5% tolerance)
             DIFF=$((TOTAL_DURATION - MERGED_DURATION_INT))
             if [ ${DIFF#-} -gt $((TOTAL_DURATION / 20)) ] && [ $TOTAL_DURATION -gt 60 ]; then
               echo "❌ DURATION MISMATCH!"
               echo "   Expected: ${TOTAL_DURATION}s ($((TOTAL_DURATION / 60)) minutes)"
               echo "   Actual:   ${MERGED_DURATION_INT}s ($((MERGED_DURATION_INT / 60)) minutes)"
-              echo "   Difference: ${DIFF#-}s"
-              echo "❌ Merge failed - merged file duration doesn't match sum of episodes!"
+              echo "❌ Merge failed - duration mismatch!"
               echo "🔧 Falling back to re-encode merge..."
               
-              # Fallback: Re-encode with concat
               ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
                 -c:v libx264 -preset veryfast -crf 23 \
                 -c:a aac -b:a 128k -ar ${TARGET_SAMPLE_RATE} \
@@ -652,7 +625,6 @@ jobs:
                 "output.mp4" 2>/dev/null
               
               if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
-                # Verify re-encoded duration
                 REENCODED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
                 REENCODED_DURATION_INT=${REENCODED_DURATION%.*}
                 echo "📊 Re-encoded duration: ${REENCODED_DURATION_INT}s"
@@ -660,9 +632,6 @@ jobs:
                 DIFF=$((TOTAL_DURATION - REENCODED_DURATION_INT))
                 if [ ${DIFF#-} -gt $((TOTAL_DURATION / 20)) ] && [ $TOTAL_DURATION -gt 60 ]; then
                   echo "❌ Re-encoded file also has duration mismatch!"
-                  echo "   Expected: ${TOTAL_DURATION}s"
-                  echo "   Actual:   ${REENCODED_DURATION_INT}s"
-                  echo "❌ Merge failed completely!"
                   exit 1
                 else
                   echo "✅ Re-encode merge successful with correct duration!"
@@ -679,7 +648,6 @@ jobs:
             exit 1
           fi
           
-          # Generate thumbnails
           if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
             echo "🖼️ Generating thumbnails..."
             
@@ -691,7 +659,6 @@ jobs:
               -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
               -q:v 2 "square_thumb.jpg" 2>/dev/null
             
-            # Clean up temporary files
             rm -f normalized_*.mp4 forced_*.mp4 concat_list.txt
             
             echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
@@ -721,54 +688,38 @@ jobs:
           fi
           
           echo "========================================="
-          echo "🔍 VERIFYING MERGED FILE WITH MEDIAINFO"
+          echo "🔍 VERIFYING MERGED FILE"
           echo "========================================="
           
-          # Check file size
           FILE_SIZE_BYTES=$(stat -c%s "output.mp4" 2>/dev/null || stat -f%z "output.mp4" 2>/dev/null || echo "0")
           FILE_SIZE_MB=$((FILE_SIZE_BYTES / 1024 / 1024))
-          FILE_SIZE_GB=$((FILE_SIZE_MB / 1024))
           
-          echo "📊 File size: ${FILE_SIZE_MB} MB (${FILE_SIZE_GB} GB)"
+          echo "📊 File size: ${FILE_SIZE_MB} MB"
           
-          # If file is larger than 1.8GB, compress it
           if [ $FILE_SIZE_MB -gt 1800 ]; then
             echo "⚠️ File exceeds 1.8GB (${FILE_SIZE_MB} MB)"
-            echo "🔧 Compressing file to fit Telegram's 2GB limit..."
+            echo "🔧 Compressing file..."
             
-            # Get current video info
-            BITRATE=$(mediainfo --Inform="Video;%BitRate%" "output.mp4" 2>/dev/null | tr -d ' ' || echo "")
-            if [ -z "$BITRATE" ] || [ "$BITRATE" = "0" ]; then
-              BITRATE="2000k"
-            fi
-            
-            # Calculate target bitrate (aim for ~1.5GB)
             DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
             DURATION_INT=${DURATION%.*}
             
             if [ "$DURATION_INT" -gt 0 ]; then
-              # Target ~1.5GB (1500 MB)
               TARGET_SIZE_MB=1500
               TARGET_BITRATE=$((TARGET_SIZE_MB * 8 * 1024 / DURATION_INT))
-              # Ensure minimum bitrate
               if [ $TARGET_BITRATE -lt 500 ]; then
                 TARGET_BITRATE=500
               fi
-              echo "📊 Target bitrate: ${TARGET_BITRATE}k (for ~${TARGET_SIZE_MB}MB)"
+              echo "📊 Target bitrate: ${TARGET_BITRATE}k"
             else
               TARGET_BITRATE=1500
-              echo "⚠️ Could not determine duration, using fallback bitrate: ${TARGET_BITRATE}k"
             fi
             
-            # Compress with two-pass for better quality
             echo "🔧 Compressing with two-pass encoding..."
             
-            # Pass 1
             ffmpeg -y -i "output.mp4" \
               -c:v libx264 -b:v ${TARGET_BITRATE}k -preset medium \
               -pass 1 -f null /dev/null 2>/dev/null
             
-            # Pass 2
             ffmpeg -y -i "output.mp4" \
               -c:v libx264 -b:v ${TARGET_BITRATE}k -preset medium \
               -pass 2 \
@@ -781,22 +732,19 @@ jobs:
               -metadata date="$(date +%Y-%m-%d)" \
               "output_compressed.mp4" 2>/dev/null
             
-            # Clean up pass files
             rm -f ffmpeg2pass-0.log ffmpeg2pass-0.log.mbtree
             
             if [ -f "output_compressed.mp4" ] && [ -s "output_compressed.mp4" ]; then
-              # Check new file size
               NEW_SIZE=$(stat -c%s "output_compressed.mp4" 2>/dev/null || stat -f%z "output_compressed.mp4" 2>/dev/null || echo "0")
               NEW_SIZE_MB=$((NEW_SIZE / 1024 / 1024))
               
               if [ $NEW_SIZE_MB -lt 1800 ]; then
                 mv output_compressed.mp4 output.mp4
-                echo "✅ File compressed successfully! New size: ${NEW_SIZE_MB} MB"
+                echo "✅ File compressed! New size: ${NEW_SIZE_MB} MB"
                 echo "compressed=true" >> $GITHUB_OUTPUT
               else
-                echo "⚠️ Compression didn't reduce file enough (${NEW_SIZE_MB} MB), trying more aggressive compression..."
+                echo "⚠️ Compression didn't reduce enough (${NEW_SIZE_MB} MB), trying CRF..."
                 
-                # More aggressive compression with CRF
                 ffmpeg -y -i "output.mp4" \
                   -c:v libx264 -crf 28 -preset medium \
                   -c:a aac -b:a 96k -ar 44100 \
@@ -814,10 +762,10 @@ jobs:
                   
                   if [ $NEW_SIZE_MB -lt 1800 ]; then
                     mv output_compressed.mp4 output.mp4
-                    echo "✅ File compressed successfully! New size: ${NEW_SIZE_MB} MB"
+                    echo "✅ File compressed! New size: ${NEW_SIZE_MB} MB"
                     echo "compressed=true" >> $GITHUB_OUTPUT
                   else
-                    echo "❌ Even aggressive compression failed to reduce file size"
+                    echo "❌ Compression failed to reduce file size"
                     rm -f output_compressed.mp4
                     echo "compressed=false" >> $GITHUB_OUTPUT
                   fi
@@ -832,9 +780,8 @@ jobs:
             echo "compressed=false" >> $GITHUB_OUTPUT
           fi
           
-          # REGENERATE THUMBNAILS IF COMPRESSED
           if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
-            echo "🖼️ Regenerating thumbnails for final file..."
+            echo "🖼️ Regenerating thumbnails..."
             ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
               -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
               -q:v 2 "thumb.jpg" 2>/dev/null
@@ -844,8 +791,7 @@ jobs:
               -q:v 2 "square_thumb.jpg" 2>/dev/null
           fi
           
-          # Fix duration metadata
-          echo "🔧 Ensuring duration metadata is correct..."
+          echo "🔧 Fixing duration metadata..."
           ffmpeg -i output.mp4 -c copy -map_metadata 0 -movflags +faststart output_fixed.mp4 2>/dev/null
           
           if [ -f "output_fixed.mp4" ] && [ -s "output_fixed.mp4" ]; then
@@ -853,33 +799,25 @@ jobs:
             echo "✅ Duration metadata fixed"
           fi
           
-          # Final verification with MediaInfo
           if mediainfo output.mp4 > /dev/null 2>&1; then
             echo "✅ MediaInfo can read the file"
             echo ""
-            echo "📊 FINAL MediaInfo Output:"
-            echo "----------------------------------------"
             mediainfo output.mp4
-            echo "----------------------------------------"
+            echo ""
             
-            # Extract and display duration
             DURATION=$(mediainfo --Inform="General;%Duration/String3%" output.mp4 2>/dev/null)
             FINAL_SIZE=$(stat -c%s "output.mp4" 2>/dev/null || stat -f%z "output.mp4" 2>/dev/null || echo "0")
             FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
             
             echo "📝 Duration: $DURATION"
             echo "💾 Final size: ${FINAL_SIZE_MB} MB"
-            echo "✅ File is valid with proper metadata"
+            echo "✅ File is valid"
             echo "verify_success=true" >> $GITHUB_OUTPUT
-            
-            # Update merged_file_path for upload
             echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
             
-            # Final size check for upload
             if [ $FINAL_SIZE_MB -gt 2000 ]; then
-              echo "❌ File is still larger than 2GB (${FINAL_SIZE_MB} MB)"
-              echo "   Telegram has a 2GB file size limit."
-              echo "   Please compress the file manually or split it."
+              echo "❌ File exceeds 2GB (${FINAL_SIZE_MB} MB)"
+              echo "   Telegram limit is 2GB!"
               exit 1
             else
               echo "✅ File size: ${FINAL_SIZE_MB} MB (under 2GB limit)"
@@ -904,10 +842,7 @@ jobs:
               REPAIR_SIZE_MB=$((REPAIR_SIZE / 1024 / 1024))
               if [ "$REPAIR_SIZE" -gt 1000000 ] && [ $REPAIR_SIZE_MB -lt 2000 ]; then
                 mv output_repaired.mp4 output.mp4
-                echo "✅ File repaired successfully!"
-                echo ""
-                echo "📊 Repaired MediaInfo Output:"
-                mediainfo output.mp4
+                echo "✅ File repaired!"
                 echo "verify_success=true" >> $GITHUB_OUTPUT
                 echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
               else
@@ -940,6 +875,7 @@ jobs:
           echo "📤 UPLOADING SINGLE EPISODES (BACKGROUND)"
           echo "========================================="
           
+          # Write the upload script to a file
           cat > upload_single.py << 'EOFUPLOAD'
           import os
           import sys
@@ -998,7 +934,6 @@ jobs:
                   return val
 
           def fix_video_duration(file_path):
-              """Fix duration metadata in video file"""
               try:
                   temp_file = f"{file_path}.fixed.mp4"
                   cmd = [
@@ -1012,7 +947,6 @@ jobs:
                   result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
                   
                   if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
-                      # Verify duration is now present
                       cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", temp_file]
                       duration_check = subprocess.check_output(cmd, text=True).strip()
                       if duration_check and duration_check.replace('.', '', 1).isdigit():
@@ -1025,18 +959,15 @@ jobs:
 
           def get_video_metadata(file_path):
               try:
-                  # First try ffprobe for accurate duration
                   cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
                   if result and result.replace('.', '', 1).isdigit():
                       duration = float(result)
                   else:
-                      # Fallback to mediainfo
                       cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
                       result = subprocess.check_output(cmd, text=True).strip()
                       duration = float(result) if result.replace('.', '', 1).isdigit() else 0.0
                   
-                  # Get resolution from mediainfo
                   cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
                   parts = result.split('|')
@@ -1045,7 +976,6 @@ jobs:
                       w = int(parts[0]) if parts[0].isdigit() else 1280
                       h = int(parts[1]) if parts[1].isdigit() else 720
                   else:
-                      # Fallback to ffprobe
                       cmd = ["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "default=noprint_wrappers=1", file_path]
                       result = subprocess.check_output(cmd, text=True).strip()
                       w = 1280
@@ -1124,7 +1054,6 @@ jobs:
               duration, w, h = get_video_metadata(file_path)
               print(f"📊 Video duration: {duration} seconds, {w}x{h}")
               
-              # If duration is 0, try to get it from the file itself
               if duration == 0:
                   try:
                       cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
@@ -1137,7 +1066,6 @@ jobs:
               
               thumb = generate_thumbnail(file_path)
               
-              # Create video attribute with proper duration
               video_attr = DocumentAttributeVideo(
                   duration=duration,
                   w=w if w > 0 else 1280,
@@ -1197,16 +1125,15 @@ jobs:
                       continue
                   ep_num = int(ep_match.group(1))
                   
-                  # Fix duration metadata before upload
-                  print(f"🔧 Fixing duration metadata for Episode {ep_num}...")
+                  print(f"🔧 Fixing duration for Episode {ep_num}...")
                   if fix_video_duration(ep_file):
-                      print(f"✅ Duration metadata fixed for Episode {ep_num}")
+                      print(f"✅ Duration fixed for Episode {ep_num}")
                   else:
-                      print(f"⚠️ Could not fix duration metadata for Episode {ep_num}")
+                      print(f"⚠️ Could not fix duration for Episode {ep_num}")
                   
                   file_size = os.path.getsize(ep_file) / (1024 * 1024)
                   if file_size > 2000:
-                      print(f"⚠️ Episode {ep_num} size ({file_size:.2f} MB) exceeds 2GB! Skipping.")
+                      print(f"⚠️ Episode {ep_num} exceeds 2GB! Skipping.")
                       continue
                   
                   caption = f"📺 Episode {ep_num}"
@@ -1217,17 +1144,17 @@ jobs:
                       success, result = await send_file_with_thumb(client, entity, ep_file, caption, topic_id)
                       if success:
                           count += 1
-                          print(f"✅ Episode {ep_num} uploaded successfully")
+                          print(f"✅ Episode {ep_num} uploaded")
                           await asyncio.sleep(1)
                       else:
-                          print(f"❌ Episode {ep_num} failed to upload")
+                          print(f"❌ Episode {ep_num} failed")
                   except FloodWaitError as e:
                       print(f"⏳ Rate limited: waiting {e.seconds}s")
                       await asyncio.sleep(e.seconds)
                       success, result = await send_file_with_thumb(client, entity, ep_file, caption, topic_id)
                       if success:
                           count += 1
-                          print(f"✅ Episode {ep_num} uploaded successfully")
+                          print(f"✅ Episode {ep_num} uploaded")
                   except Exception as e:
                       print(f"❌ Episode {ep_num} error: {e}")
               
@@ -1298,7 +1225,7 @@ jobs:
           python3 -u upload_single.py &
           EPISODE_PID=$!
           echo "episode_pid=$EPISODE_PID" >> $GITHUB_ENV
-          echo "✅ Episode upload started in background (PID: $EPISODE_PID)"
+          echo "✅ Episode upload started (PID: $EPISODE_PID)"
 
       - name: Upload Merged Video to Telegram (Parallel)
         if: steps.verify.outputs.verify_success == 'true'
@@ -1376,13 +1303,11 @@ jobs:
 
           def get_video_metadata(file_path):
               try:
-                  # Get duration from ffprobe for accuracy
                   cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
                   if result and result.replace('.', '', 1).isdigit():
                       duration = float(result)
                   else:
-                      # Fallback to mediainfo
                       cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
                       result = subprocess.check_output(cmd, text=True).strip()
                       duration = float(result) if result.replace('.', '', 1).isdigit() else 0.0
@@ -1514,14 +1439,13 @@ jobs:
               file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
               if file_size_mb > 2000:
                   print(f"❌ File exceeds 2GB ({file_size_mb:.1f} MB)")
-                  print("⚠️ Telegram limit is 2GB. Please compress the file.")
+                  print("⚠️ Telegram limit is 2GB.")
                   return False
               
               if file_size_mb > 1800:
                   print(f"⚠️ File is large ({file_size_mb:.1f} MB)")
-                  print("   Upload may take some time...")
+                  print("   Upload may take time...")
               
-              # Get duration for display
               duration, w, h = get_video_metadata(video_path)
               print(f"📊 Duration: {duration} seconds")
               
@@ -1597,9 +1521,9 @@ jobs:
           echo "⏳ Waiting for background uploads to complete..."
           
           # Wait for episode upload if it was started
-          if [ -n "${{ env.episode_pid }}" ]; then
-            echo "📤 Waiting for episode upload (PID: ${{ env.episode_pid }})..."
-            wait ${{ env.episode_pid }} 2>/dev/null || true
+          if [ -n "$EPISODE_PID" ]; then
+            echo "📤 Waiting for episode upload (PID: $EPISODE_PID)..."
+            wait $EPISODE_PID 2>/dev/null || true
             echo "✅ Episode upload completed"
           else
             echo "⚠️ No episode upload process found"
