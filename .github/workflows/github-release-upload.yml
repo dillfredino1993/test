@@ -4,6 +4,7 @@ on:
   repository_dispatch:
     types: [github_release_upload]
 
+# Add permissions for deleting workflow runs
 permissions:
   actions: write
   contents: read
@@ -49,11 +50,13 @@ jobs:
         run: |
           mkdir -p downloads && cd downloads
           
+          # Extract URLs cleanly: remove \r carriage returns and trim whitespace
           echo "$CLIENT_PAYLOAD" | tr -d '\r' | jq -r '
             (.episodes[]?.url // .video_urls[]? // .video_url // .url // empty)
             | tostring | gsub("^\\s+|\\s+$"; "")
           ' > urls.txt
           
+          # Remove empty lines
           sed -i '/^$/d' urls.txt
           
           echo "========================================="
@@ -68,17 +71,19 @@ jobs:
             exit 1
           fi
 
-      - name: Download All Episodes
+      - name: Download All Episodes (All-or-Nothing)
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
           LABEL: ${{ github.event.client_payload.label || 'NONE' }}
         run: |
           cd downloads
+          
           TOTAL_EPISODES=$(cat urls.txt | wc -l)
           echo "📥 Need to download $TOTAL_EPISODES episodes"
           
-          cat > verify_and_repair.py << "EOFVERIFY"
+          # Create verify_and_repair.py
+          cat > verify_and_repair.py << 'EOFVERIFY'
           import os
           import sys
           import subprocess
@@ -90,6 +95,7 @@ jobs:
                   cmd = ["mediainfo", "--Output=JSON", file_path]
                   result = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
                   data = json.loads(result)
+                  
                   tracks = data.get("media", {}).get("track", [])
                   for track in tracks:
                       if track.get("@type") == "Video":
@@ -100,10 +106,20 @@ jobs:
           
           def repair_mp4(file_path):
               print("  🔧 Attempting repair...")
+              
               temp_file = f"{file_path}.temp.mp4"
               try:
-                  cmd = ["ffmpeg", "-y", "-err_detect", "ignore_err", "-i", file_path, "-c", "copy", "-movflags", "+faststart", "-ignore_unknown", temp_file]
+                  cmd = [
+                      "ffmpeg", "-y",
+                      "-err_detect", "ignore_err",
+                      "-i", file_path,
+                      "-c", "copy",
+                      "-movflags", "+faststart",
+                      "-ignore_unknown",
+                      temp_file
+                  ]
                   result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                  
                   if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
                       is_valid, _ = check_with_mediainfo(temp_file)
                       if is_valid:
@@ -120,8 +136,20 @@ jobs:
               try:
                   print("  ⚠️ Attempting re-encode...")
                   temp_file = f"{file_path}.temp.mp4"
-                  cmd = ["ffmpeg", "-y", "-err_detect", "ignore_err", "-i", file_path, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", temp_file]
+                  cmd = [
+                      "ffmpeg", "-y",
+                      "-err_detect", "ignore_err",
+                      "-i", file_path,
+                      "-c:v", "libx264",
+                      "-preset", "veryfast",
+                      "-crf", "23",
+                      "-c:a", "aac",
+                      "-b:a", "128k",
+                      "-movflags", "+faststart",
+                      temp_file
+                  ]
                   result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                  
                   if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
                       is_valid, _ = check_with_mediainfo(temp_file)
                       if is_valid:
@@ -134,14 +162,18 @@ jobs:
                   if os.path.exists(temp_file):
                       try: os.remove(temp_file)
                       except: pass
+              
               return False
           
           def main():
               file_path = sys.argv[1]
+              
               if not os.path.exists(file_path):
                   print(f"ERROR: File not found: {file_path}")
                   sys.exit(1)
+              
               is_valid, video_track = check_with_mediainfo(file_path)
+              
               if is_valid and video_track:
                   print("  ✅ Valid file")
                   print(f"  📐 {video_track.get('Width', 'N/A')}x{video_track.get('Height', 'N/A')}")
@@ -149,6 +181,7 @@ jobs:
                   sys.exit(0)
               else:
                   print("  ⚠️ Invalid file, attempting repair...")
+                  
                   if repair_mp4(file_path):
                       is_valid, _ = check_with_mediainfo(file_path)
                       if is_valid:
@@ -183,20 +216,31 @@ jobs:
             
             if [[ "$URL" == *".m3u8"* ]]; then
               echo "📺 HLS stream - Using yt-dlp"
-              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts --concurrent-fragments 16 --no-progress --no-warnings -o "$OUT_FILE" "$URL" < /dev/null 2>&1 | grep -E "(Extracting URL|Downloading webpage|Downloading m3u8|Total fragments|Destination|Downloading 1 format)" || true
+              
+              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts --concurrent-fragments 16 \
+                --no-progress --no-warnings \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>&1 | grep -E "(Extracting URL|Downloading webpage|Downloading m3u8|Total fragments|Destination|Downloading 1 format)" || true
+              
               if [ ! -f "$OUT_FILE" ] || [ ! -s "$OUT_FILE" ]; then
                 echo "⚠️ First attempt failed, trying with ffmpeg..."
                 ffmpeg -nostdin -i "$URL" -c copy "$OUT_FILE" < /dev/null 2>/dev/null
               fi
               DOWNLOAD_STATUS=$?
+              
               if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
                 FILE_SIZE=$(du -h "$OUT_FILE" | cut -f1)
                 echo "✅ Downloaded: $OUT_FILE ($FILE_SIZE)"
               fi
+              
             else
               echo "🎬 Direct file - Using aria2c"
-              aria2c -x 16 -s 16 -k 1M --continue=true --console-log-level=error --summary-interval=0 -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null || curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
+              aria2c -x 16 -s 16 -k 1M --continue=true \
+                --console-log-level=error \
+                --summary-interval=0 \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null || \
+              curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
               DOWNLOAD_STATUS=$?
+              
               if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
                 FILE_SIZE=$(du -h "$OUT_FILE" | cut -f1)
                 echo "✅ Downloaded: $OUT_FILE ($FILE_SIZE)"
@@ -205,18 +249,33 @@ jobs:
             
             if [ $DOWNLOAD_STATUS -eq 0 ] && [ -f "$OUT_FILE" ]; then
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+              
               if [ "$FILE_SIZE" -gt 50000 ]; then
                 echo "🔍 Verifying file..."
+                
                 if python3 verify_and_repair.py "$OUT_FILE" < /dev/null; then
                   echo "✅ File verified"
+                  
                   EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
-                  ffmpeg -nostdin -i "$OUT_FILE" -c copy -metadata title="$EPISODE_TITLE" -metadata episode_id="$EP_NUM" -metadata series="$SERIES_TITLE" -metadata label="$LABEL" -metadata date="$(date +%Y-%m-%d)" -metadata media_type="tv_episode" -movflags +faststart "temp_$OUT_FILE" < /dev/null 2>/dev/null
+                  
+                  ffmpeg -nostdin -i "$OUT_FILE" \
+                    -c copy \
+                    -metadata title="$EPISODE_TITLE" \
+                    -metadata episode_id="$EP_NUM" \
+                    -metadata series="$SERIES_TITLE" \
+                    -metadata label="$LABEL" \
+                    -metadata date="$(date +%Y-%m-%d)" \
+                    -metadata media_type="tv_episode" \
+                    -movflags +faststart \
+                    "temp_$OUT_FILE" < /dev/null 2>/dev/null
+                  
                   if [ $? -eq 0 ] && [ -f "temp_$OUT_FILE" ]; then
                     mv "temp_$OUT_FILE" "$OUT_FILE"
                     echo "✅ Metadata added"
                   else
                     rm -f "temp_$OUT_FILE"
                   fi
+                  
                 else
                   echo "❌ File verification failed"
                   rm -f "$OUT_FILE"
@@ -239,6 +298,7 @@ jobs:
           echo "========================================="
           echo "📊 DOWNLOAD SUMMARY"
           echo "========================================="
+          
           TOTAL_FILES=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           echo "✅ Downloaded: $TOTAL_FILES/$TOTAL_EPISODES episodes"
           
@@ -262,6 +322,7 @@ jobs:
         id: merge
         run: |
           cd downloads
+          
           EP_COUNT=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           if [ "$EP_COUNT" -eq 0 ]; then
             echo "❌ No episodes to merge!"
@@ -271,7 +332,13 @@ jobs:
           if [ "$EP_COUNT" -eq 1 ]; then
             echo "📦 Only 1 episode - skipping merge"
             SINGLE_FILE=$(ls EP*.mp4 | head -1)
-            ffmpeg -i "$SINGLE_FILE" -c copy -movflags +faststart -metadata title="$TITLE" -metadata series="$SERIES_TITLE" -metadata label="$LABEL" -metadata year="$(date +%Y)" -metadata date="$(date +%Y-%m-%d)" "output.mp4" 2>/dev/null
+            ffmpeg -i "$SINGLE_FILE" -c copy -movflags +faststart \
+              -metadata title="$TITLE" \
+              -metadata series="$SERIES_TITLE" \
+              -metadata label="$LABEL" \
+              -metadata year="$(date +%Y)" \
+              -metadata date="$(date +%Y-%m-%d)" \
+              "output.mp4" 2>/dev/null
             echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
             echo "has_merged=true" >> $GITHUB_ENV
             echo "merge_success=true" >> $GITHUB_OUTPUT
@@ -279,6 +346,7 @@ jobs:
           fi
           
           echo "📊 Found $EP_COUNT episodes to merge"
+          
           echo "🔍 Analyzing resolutions with MediaInfo..."
           
           declare -A resolutions
@@ -296,7 +364,9 @@ jobs:
             exit 1
           fi
           
+          # Find the most common resolution as target
           TARGET_RES=$(printf '%s\n' "${resolutions[@]}" | grep -v "0x0" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+          
           if [ -z "$TARGET_RES" ] || [ "$TARGET_RES" = "0x0" ]; then
             echo "⚠️ Using 540x960 as default"
             TARGET_RES="540x960"
@@ -304,8 +374,10 @@ jobs:
           
           TARGET_W=$(echo "$TARGET_RES" | cut -d'x' -f1)
           TARGET_H=$(echo "$TARGET_RES" | cut -d'x' -f2)
+          
           echo "🎯 Target resolution: ${TARGET_W}x${TARGET_H}"
           
+          # Normalize any files that don't match the target resolution
           NORMALIZED_FILES=""
           NEEDS_REENCODE=false
           
@@ -319,9 +391,22 @@ jobs:
             else
               echo "⚠️ Normalizing: $f (${CURRENT_RES} -> ${TARGET_RES})"
               NEEDS_REENCODE=true
+              
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
               EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
-              ffmpeg -i "$f" -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k -metadata title="$EPISODE_TITLE" -metadata episode_id="$EP_NUM" -metadata series="$SERIES_TITLE" -metadata label="$LABEL" -movflags +faststart "normalized_$f" 2>/dev/null
+              
+              # Re-encode to match target resolution
+              ffmpeg -i "$f" \
+                -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black" \
+                -c:v libx264 -preset veryfast -crf 23 \
+                -c:a aac -b:a 128k \
+                -metadata title="$EPISODE_TITLE" \
+                -metadata episode_id="$EP_NUM" \
+                -metadata series="$SERIES_TITLE" \
+                -metadata label="$LABEL" \
+                -movflags +faststart \
+                "normalized_$f" 2>/dev/null
+              
               if [ -f "normalized_$f" ] && [ -s "normalized_$f" ]; then
                 NORM_RES=$(mediainfo --Inform="Video;%Width%x%Height%" "normalized_$f" 2>/dev/null || echo "0x0")
                 if [ "$NORM_RES" == "$TARGET_RES" ]; then
@@ -338,14 +423,19 @@ jobs:
             fi
           done
           
+          # Count files to merge
           FILE_COUNT=$(echo "$NORMALIZED_FILES" | wc -w)
           echo "📊 Files to merge: $FILE_COUNT"
+          
           if [ $FILE_COUNT -eq 0 ]; then
             echo "❌ No files to merge!"
             exit 1
           fi
           
+          # Now all files should have the same resolution - use MKVToolNix
           echo "✅ All videos now have same resolution - Using MKVToolNix merge"
+          
+          # Build merge arguments with proper file validation
           MERGE_FILES=""
           for f in $NORMALIZED_FILES; do
             if [ -f "$f" ] && [ -s "$f" ]; then
@@ -360,6 +450,7 @@ jobs:
             fi
           done
           
+          # Convert to array
           MERGE_FILES_ARRAY=($MERGE_FILES)
           FILE_COUNT=${#MERGE_FILES_ARRAY[@]}
           
@@ -369,6 +460,8 @@ jobs:
           fi
           
           echo "📊 Merging $FILE_COUNT valid files with MKVToolNix..."
+          
+          # Build mkvmerge command with simple append
           MKVMERGE_CMD_SIMPLE="mkvmerge -o merged.mkv --title \"$TITLE\""
           FIRST=true
           for f in "${MERGE_FILES_ARRAY[@]}"; do
@@ -380,19 +473,37 @@ jobs:
             fi
           done
           
+          # Try simple append first (works for same codec files)
           echo "🔄 Attempting simple append merge..."
           eval $MKVMERGE_CMD_SIMPLE 2>&1 || true
           
           if [ -f "merged.mkv" ] && [ -s "merged.mkv" ]; then
             echo "✅ Simple append merge successful"
           else
-            echo "❌ MKVToolNix merge failed! Falling back to FFmpeg concat..."
+            echo "❌ MKVToolNix merge failed!"
+            echo "🔧 Falling back to FFmpeg concat..."
+            
+            # Fallback to FFmpeg concat with proper handling
             CONCAT_LIST="concat_list.txt"
             > $CONCAT_LIST
+            
             for f in "${MERGE_FILES_ARRAY[@]}"; do
               echo "file '$f'" >> $CONCAT_LIST
             done
-            ffmpeg -f concat -safe 0 -i $CONCAT_LIST -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k -metadata title="$TITLE" -metadata series="$SERIES_TITLE" -metadata label="$LABEL" -metadata year="$(date +%Y)" -metadata date="$(date +%Y-%m-%d)" -movflags +faststart -threads $(nproc) merged.mp4 2>/dev/null
+            
+            # Use concat demuxer
+            ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
+              -c:v libx264 -preset veryfast -crf 23 \
+              -c:a aac -b:a 128k \
+              -metadata title="$TITLE" \
+              -metadata series="$SERIES_TITLE" \
+              -metadata label="$LABEL" \
+              -metadata year="$(date +%Y)" \
+              -metadata date="$(date +%Y-%m-%d)" \
+              -movflags +faststart \
+              -threads $(nproc) \
+              merged.mp4 2>/dev/null
+            
             if [ -f "merged.mp4" ] && [ -s "merged.mp4" ]; then
               mv merged.mp4 merged.mkv 2>/dev/null || true
               echo "✅ FFmpeg concat merge successful"
@@ -402,9 +513,17 @@ jobs:
             fi
           fi
           
+          # Convert to MP4 with proper metadata
           if [ -f "merged.mkv" ] && [ -s "merged.mkv" ]; then
             echo "📦 Converting MKV to MP4..."
-            ffmpeg -i merged.mkv -c copy -movflags +faststart -metadata title="$TITLE" -metadata series="$SERIES_TITLE" -metadata label="$LABEL" -metadata year="$(date +%Y)" -metadata date="$(date +%Y-%m-%d)" "output.mp4" 2>/dev/null
+            ffmpeg -i merged.mkv -c copy -movflags +faststart \
+              -metadata title="$TITLE" \
+              -metadata series="$SERIES_TITLE" \
+              -metadata label="$LABEL" \
+              -metadata year="$(date +%Y)" \
+              -metadata date="$(date +%Y-%m-%d)" \
+              "output.mp4" 2>/dev/null
+            
             if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
               echo "✅ Converted to MP4 successfully"
               rm -f merged.mkv
@@ -414,35 +533,47 @@ jobs:
             fi
           fi
           
+          # Generate thumbnails for merged file
           if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
-            echo "🖼️ Generating thumbnails..."
+            echo "🖼️ Generating thumbnails for merged file..."
+            
+            # Generate better thumbnail using multiple positions
             DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 output.mp4 2>/dev/null || echo "0")
             DURATION=${DURATION%.*}
             
-            if [ "$DURATION" -gt 0 ]; then
-              echo "📊 Video duration: $DURATION seconds"
-              ffmpeg -i output.mp4 -ss 00:00:05 -vframes 1 -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" -q:v 2 "thumb.jpg" 2>/dev/null
-              if [ ! -f "thumb.jpg" ] || [ ! -s "thumb.jpg" ]; then
-                ffmpeg -i output.mp4 -ss 00:00:10 -vframes 1 -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" -q:v 2 "thumb.jpg" 2>/dev/null
-              fi
-              if [ ! -f "thumb.jpg" ] || [ ! -s "thumb.jpg" ]; then
-                ffmpeg -i output.mp4 -ss 00:00:30 -vframes 1 -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" -q:v 2 "thumb.jpg" 2>/dev/null
-              fi
-              if [ ! -f "thumb.jpg" ] || [ ! -s "thumb.jpg" ]; then
-                ffmpeg -i output.mp4 -ss 00:00:01 -vframes 1 -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" -q:v 2 "thumb.jpg" 2>/dev/null
-              fi
-            else
-              ffmpeg -i output.mp4 -ss 00:00:00 -vframes 1 -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" -q:v 2 "thumb.jpg" 2>/dev/null
+            if [ "$DURATION" -gt 10 ]; then
+              for pos in 2 5 10 15 30; do
+                if [ $pos -lt $DURATION ]; then
+                  ffmpeg -i "output.mp4" -ss $pos -vframes 1 \
+                    -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
+                    -q:v 2 "thumb_test_${pos}.jpg" 2>/dev/null
+                  
+                  if [ -f "thumb_test_${pos}.jpg" ] && [ $(stat -c%s "thumb_test_${pos}.jpg" 2>/dev/null || echo "0") -gt 5000 ]; then
+                    if ! ffmpeg -i "thumb_test_${pos}.jpg" -vf blackdetect=d=0.01:pix_th=0.10 -f null - 2>&1 | grep -q "black_start"; then
+                      mv "thumb_test_${pos}.jpg" "thumb.jpg"
+                      break
+                    fi
+                  fi
+                  rm -f "thumb_test_${pos}.jpg" 2>/dev/null
+                fi
+              done
             fi
             
+            # Fallback to 1 second if no good frame found
+            if [ ! -f "thumb.jpg" ]; then
+              ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
+                -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
+                -q:v 2 "thumb.jpg" 2>/dev/null
+            fi
+            
+            # Generate square thumbnail
             if [ -f "thumb.jpg" ]; then
-              ffmpeg -i "thumb.jpg" -vf "crop=min(iw,ih):min(iw,ih),scale=512:512:flags=lanczos" -q:v 2 "square_thumb.jpg" 2>/dev/null
-              echo "✅ Square thumbnail generated"
-            else
-              ffmpeg -i output.mp4 -ss 00:00:01 -vframes 1 -vf "crop=min(iw,ih):min(iw,ih),scale=512:512:flags=lanczos" -q:v 2 "square_thumb.jpg" 2>/dev/null
+              ffmpeg -i "thumb.jpg" -vf "crop=min(iw,ih):min(iw,ih),scale=512:512:flags=lanczos" \
+                -q:v 2 "square_thumb.jpg" 2>/dev/null
             fi
             
             rm -f normalized_*.mp4
+            
             echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
             echo "has_merged=true" >> $GITHUB_ENV
             echo "merge_success=true" >> $GITHUB_OUTPUT
@@ -452,17 +583,86 @@ jobs:
             echo "📊 FINAL FILE"
             echo "========================================="
             ls -lh output.mp4
-            if [ -f "thumb.jpg" ]; then
-              echo "📸 Thumbnail: $(du -h thumb.jpg | cut -f1)"
-            fi
             echo "========================================="
           else
             echo "❌ output.mp4 not created!"
             exit 1
           fi
 
-      - name: Upload Merged Video to Telegram (Background)
+      - name: Verify Merged File
+        id: verify
         if: steps.merge.outputs.merge_success == 'true'
+        run: |
+          cd downloads
+          
+          if [ ! -f "output.mp4" ]; then
+            echo "❌ output.mp4 not found!"
+            exit 1
+          fi
+          
+          echo "========================================="
+          echo "🔍 VERIFYING MERGED FILE WITH MEDIAINFO"
+          echo "========================================="
+          
+          # Fix duration if missing
+          echo "🔧 Ensuring duration metadata is correct..."
+          ffmpeg -i output.mp4 -c copy -map_metadata 0 -movflags +faststart output_fixed.mp4 2>/dev/null
+          
+          if [ -f "output_fixed.mp4" ] && [ -s "output_fixed.mp4" ]; then
+            mv output_fixed.mp4 output.mp4
+            echo "✅ Duration metadata fixed"
+          fi
+          
+          if mediainfo output.mp4 > /dev/null 2>&1; then
+            echo "✅ MediaInfo can read the file"
+            echo ""
+            echo "📊 MediaInfo Output:"
+            echo "----------------------------------------"
+            mediainfo output.mp4
+            echo "----------------------------------------"
+            
+            DURATION=$(mediainfo --Inform="General;%Duration/String3%" output.mp4 2>/dev/null)
+            echo "📝 Duration: $DURATION"
+            echo "✅ File is valid with proper metadata"
+            echo "verified=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ MediaInfo cannot read the file!"
+            echo "🔧 Attempting to repair..."
+            
+            ffmpeg -y -err_detect ignore_err -i output.mp4 \
+              -c:v libx264 -preset veryfast -crf 23 \
+              -c:a aac -b:a 128k \
+              -movflags +faststart \
+              -metadata title="$TITLE" \
+              -metadata series="$SERIES_TITLE" \
+              -metadata label="$LABEL" \
+              -metadata date="$(date +%Y-%m-%d)" \
+              "output_repaired.mp4" 2>/dev/null
+            
+            if [ -f "output_repaired.mp4" ]; then
+              REPAIR_SIZE=$(stat -c%s "output_repaired.mp4" 2>/dev/null || echo "0")
+              if [ "$REPAIR_SIZE" -gt 1000000 ]; then
+                mv output_repaired.mp4 output.mp4
+                echo "✅ File repaired successfully!"
+                echo ""
+                echo "📊 Repaired MediaInfo Output:"
+                mediainfo output.mp4
+                echo "verified=true" >> $GITHUB_OUTPUT
+              else
+                echo "❌ Repair failed"
+                rm -f output_repaired.mp4
+                echo "verified=false" >> $GITHUB_OUTPUT
+                exit 1
+              fi
+            else
+              echo "❌ Repair failed"
+              echo "verified=false" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          fi
+
+      - name: Upload Merged Video and Single Episodes (Parallel)
+        if: steps.verify.outputs.verified == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -470,6 +670,9 @@ jobs:
           TG_MERGED_CHAT_ID: ${{ secrets.TELEGRAM_MERGED_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
           TG_MERGED_NAME: ${{ secrets.TELEGRAM_MERGED_NAME }}
           TG_MERGED_INVITE_LINK: ${{ secrets.TELEGRAM_MERGED_INVITE_LINK }}
+          TG_SINGLE_EPISODES_CHAT_ID: ${{ secrets.TELEGRAM_SINGLE_EPISODES_CHAT_ID }}
+          TG_SINGLE_EPISODES_NAME: ${{ secrets.TELEGRAM_SINGLE_EPISODES_NAME }}
+          TG_SINGLE_EPISODES_INVITE_LINK: ${{ secrets.TELEGRAM_SINGLE_EPISODES_INVITE_LINK }}
           MERGED_PATH: ${{ env.merged_file_path }}
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -477,54 +680,65 @@ jobs:
         run: |
           cd downloads
           
-          echo "========================================="
-          echo "📤 STARTING MERGED VIDEO UPLOAD (BACKGROUND)"
-          echo "========================================="
-          
-          cat > upload_merged.py << "EOFUPLOAD"
+          # Create the combined upload script that runs both in parallel
+          cat > parallel_upload.py << 'EOFPARALLEL'
           import os
           import sys
+          import glob
+          import re
           import subprocess
           import asyncio
           import datetime
           import traceback
           import json
           import random
-          
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          if hasattr(sys.stdout, "reconfigure"):
+              sys.stdout.reconfigure(line_buffering=True)
+              sys.stderr.reconfigure(line_buffering=True)
+
           try:
               from telethon import TelegramClient
               from telethon.sessions import StringSession
               from telethon.errors import FloodWaitError
               from telethon.tl.functions.channels import JoinChannelRequest
-              from telethon.tl.functions.messages import ImportChatInviteRequest
+              from telethon.tl.functions.messages import ImportChatInviteRequest, CreateForumTopicRequest
               from telethon.tl.types import DocumentAttributeVideo
               import telethon
               print(f"✅ Telethon version: {telethon.__version__}")
           except ImportError as e:
               print(f"❌ Import error: {e}")
               sys.exit(1)
-          
+
+          # Get credentials
           api_id = os.environ.get("TG_API_ID")
           api_hash = os.environ.get("TG_API_HASH")
           session_string = os.environ.get("TG_SESSION_STRING")
           
-          chat_id_raw = os.environ.get("TG_MERGED_CHAT_ID")
-          chat_name = os.environ.get("TG_MERGED_NAME")
-          invite_link = os.environ.get("TG_MERGED_INVITE_LINK")
-          
+          # Merged video settings
+          merged_chat_id_raw = os.environ.get("TG_MERGED_CHAT_ID")
+          merged_chat_name = os.environ.get("TG_MERGED_NAME")
+          merged_invite_link = os.environ.get("TG_MERGED_INVITE_LINK")
           video_path = os.environ.get("MERGED_PATH")
+          
+          # Single episodes settings
+          single_chat_id_raw = os.environ.get("TG_SINGLE_EPISODES_CHAT_ID")
+          single_chat_name = os.environ.get("TG_SINGLE_EPISODES_NAME")
+          single_invite_link = os.environ.get("TG_SINGLE_EPISODES_INVITE_LINK")
+          
           title = os.environ.get("TITLE")
           series_title = os.environ.get("SERIES_TITLE", "Series")
           label = os.environ.get("LABEL", "NONE")
-          
+
           if not all([api_id, api_hash]):
               print("❌ Missing Telegram API credentials.")
               sys.exit(0)
-          
+
           if not session_string:
               print("❌ Missing session string!")
               sys.exit(0)
-          
+
           def parse_chat_id(val):
               if not val:
                   return None
@@ -533,7 +747,7 @@ jobs:
                   return int(val)
               except ValueError:
                   return val
-          
+
           def get_video_duration(file_path):
               try:
                   cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
@@ -543,26 +757,117 @@ jobs:
               except:
                   pass
               return 0
-          
-          def generate_thumbnail(file_path):
+
+          def check_frame_content(file_path, timestamp):
               try:
-                  thumb_path = f"{file_path}_thumb.jpg"
+                  temp_file = f"/tmp/check_frame_{random.randint(1000,9999)}.jpg"
+                  cmd = [
+                      "ffmpeg", "-y", "-ss", str(timestamp),
+                      "-i", file_path,
+                      "-vframes", "1",
+                      "-vf", "scale=100:100",
+                      temp_file
+                  ]
+                  subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                  
+                  if os.path.exists(temp_file) and os.path.getsize(temp_file) > 1000:
+                      cmd = [
+                          "ffmpeg", "-i", temp_file,
+                          "-vf", "blackdetect=d=0.01:pix_th=0.10",
+                          "-f", "null", "-"
+                      ]
+                      result = subprocess.run(cmd, capture_output=True, text=True)
+                      if "black_start" not in result.stderr:
+                          os.remove(temp_file)
+                          return True
+                  os.remove(temp_file)
+                  return False
+              except:
+                  return False
+
+          def generate_best_thumbnail(file_path):
+              try:
                   duration = get_video_duration(file_path)
-                  if duration > 10:
-                      positions = [5, 10, 15, 30]
+                  thumb_path = f"{file_path}_thumb.jpg"
+                  
+                  if duration < 5:
+                      timestamps = [duration * 0.5]
                   else:
-                      positions = [1, 2]
-                  for pos in positions:
-                      if pos < duration:
-                          cmd = ["ffmpeg", "-y", "-ss", str(pos), "-i", file_path, "-vframes", "1", "-vf", "crop=min(iw,ih):min(iw,ih),scale=512:512:flags=lanczos", "-q:v", "2", thumb_path]
+                      timestamps = [
+                          duration * 0.05,
+                          duration * 0.15,
+                          duration * 0.30,
+                          duration * 0.50,
+                          duration * 0.70
+                      ]
+                      if duration > 10:
+                          timestamps.extend([2, 5, 10])
+                      if duration > 30:
+                          timestamps.append(20)
+                  
+                  best_thumb = None
+                  for ts in timestamps:
+                      if ts >= duration or ts < 0:
+                          continue
+                      
+                      temp_thumb = f"{file_path}_temp_{int(ts)}.jpg"
+                      cmd = [
+                          "ffmpeg", "-y", "-ss", str(ts),
+                          "-i", file_path,
+                          "-vframes", "1",
+                          "-vf", "crop=min(iw,ih):min(iw,ih),scale=512:512:flags=lanczos",
+                          "-q:v", "2",
+                          temp_thumb
+                      ]
+                      subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                      
+                      if os.path.exists(temp_thumb) and os.path.getsize(temp_thumb) > 1000:
+                          if check_frame_content(file_path, ts):
+                              best_thumb = temp_thumb
+                              break
+                          else:
+                              os.remove(temp_thumb)
+                      else:
+                          if os.path.exists(temp_thumb):
+                              os.remove(temp_thumb)
+                  
+                  if not best_thumb:
+                      for ts in timestamps:
+                          if ts >= duration or ts < 0:
+                              continue
+                          temp_thumb = f"{file_path}_temp_{int(ts)}.jpg"
+                          cmd = [
+                              "ffmpeg", "-y", "-ss", str(ts),
+                              "-i", file_path,
+                              "-vframes", "1",
+                              "-vf", "crop=min(iw,ih):min(iw,ih),scale=512:512:flags=lanczos",
+                              "-q:v", "2",
+                              temp_thumb
+                          ]
                           subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                          if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 1000:
-                              return thumb_path
-                  return None
+                          if os.path.exists(temp_thumb) and os.path.getsize(temp_thumb) > 1000:
+                              best_thumb = temp_thumb
+                              break
+                  
+                  if best_thumb and os.path.exists(best_thumb):
+                      os.rename(best_thumb, thumb_path)
+                      return thumb_path if os.path.exists(thumb_path) else None
+                  
+                  cmd = [
+                      "ffmpeg", "-y", "-ss", "00:00:01",
+                      "-i", file_path,
+                      "-vf", "crop=min(iw,ih):min(iw,ih),scale=512:512:flags=lanczos",
+                      "-vframes", "1",
+                      "-q:v", "2",
+                      thumb_path
+                  ]
+                  subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                  return thumb_path if os.path.exists(thumb_path) else None
+                  
               except Exception as e:
                   print(f"⚠️ Error generating thumbnail: {e}")
                   return None
-          
+
           def get_video_metadata(file_path):
               try:
                   cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
@@ -588,9 +893,30 @@ jobs:
               except:
                   pass
               return 0, 1280, 720
-          
-          chat_id = parse_chat_id(chat_id_raw)
-          
+
+          def fix_video_duration(file_path):
+              try:
+                  temp_file = f"{file_path}.fixed.mp4"
+                  cmd = [
+                      "ffmpeg", "-y",
+                      "-i", file_path,
+                      "-c", "copy",
+                      "-map_metadata", "0",
+                      "-movflags", "+faststart",
+                      temp_file
+                  ]
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                  
+                  if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                      cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", temp_file]
+                      duration_check = subprocess.check_output(cmd, text=True).strip()
+                      if duration_check and duration_check.replace('.', '', 1).isdigit():
+                          os.replace(temp_file, file_path)
+                          return True
+                  return False
+              except:
+                  return False
+
           async def join_chat(client, invite_link):
               if not invite_link:
                   return None
@@ -600,7 +926,7 @@ jobs:
               except:
                   pass
               return None
-          
+
           async def resolve_chat(client, chat_id, invite_link, search_name):
               if invite_link:
                   entity = await join_chat(client, invite_link)
@@ -616,7 +942,69 @@ jobs:
                       if search_name.lower() in str(dialog.name).lower():
                           return dialog.entity
               return None
-          
+
+          async def send_file_with_thumb(client, entity, file_path, caption, reply_to=None):
+              duration, w, h = get_video_metadata(file_path)
+              print(f"📊 Video duration: {duration} seconds, {w}x{h}")
+              
+              if duration == 0:
+                  try:
+                      cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      if result and result.replace('.', '', 1).isdigit():
+                          duration = int(float(result))
+                          print(f"📊 Retrieved duration from ffprobe: {duration} seconds")
+                  except:
+                      pass
+              
+              thumb = generate_best_thumbnail(file_path)
+              if thumb:
+                  print(f"✅ Thumbnail generated successfully")
+              else:
+                  print(f"⚠️ Could not generate thumbnail, uploading without thumb")
+              
+              video_attr = DocumentAttributeVideo(
+                  duration=duration,
+                  w=w if w > 0 else 1280,
+                  h=h if h > 0 else 720,
+                  supports_streaming=True
+              )
+              
+              kwargs = {
+                  "entity": entity,
+                  "file": file_path,
+                  "caption": caption,
+                  "attributes": [video_attr],
+                  "supports_streaming": True,
+                  "force_document": False,
+                  "allow_cache": True
+              }
+              
+              if thumb and os.path.exists(thumb):
+                  kwargs["thumb"] = thumb
+              
+              if reply_to:
+                  kwargs["reply_to"] = reply_to
+              
+              try:
+                  result = await client.send_file(**kwargs)
+                  return True, result
+              except Exception as e:
+                  print(f"❌ Send failed: {e}")
+                  if "thumb" in kwargs:
+                      del kwargs["thumb"]
+                      try:
+                          result = await client.send_file(**kwargs)
+                          return True, result
+                      except Exception as e2:
+                          print(f"❌ Send failed without thumb: {e2}")
+                          return False, None
+                  return False, None
+              finally:
+                  if thumb and os.path.exists(thumb):
+                      try: os.remove(thumb)
+                      except: pass
+
           async def upload_merged_video(client, entity):
               if not video_path or not os.path.isfile(video_path):
                   print(f"❌ Video not found: {video_path}")
@@ -628,6 +1016,8 @@ jobs:
                   return False
               
               duration, w, h = get_video_metadata(video_path)
+              print(f"📊 Duration: {duration} seconds")
+              
               now = datetime.datetime.now()
               month_year = now.strftime("%B%Y").upper()
               
@@ -641,241 +1031,30 @@ jobs:
               print(f"💾 File size: {file_size_mb:.1f} MB")
               print(f"⏱️  Duration: {duration} seconds")
               
-              thumb = generate_thumbnail(video_path)
-              
-              video_attr = DocumentAttributeVideo(duration=duration, w=w, h=h, supports_streaming=True)
-              kwargs = {"entity": entity, "file": video_path, "caption": caption, "attributes": [video_attr], "supports_streaming": True, "force_document": False, "allow_cache": True}
-              if thumb and os.path.exists(thumb):
-                  kwargs["thumb"] = thumb
-              
               try:
-                  result = await client.send_file(**kwargs)
-                  if thumb and os.path.exists(thumb):
-                      os.remove(thumb)
-                  print("✅ Merged video uploaded!")
-                  return True
+                  success, result = await send_file_with_thumb(client, entity, video_path, caption)
+                  if success:
+                      print("✅ Merged video uploaded!")
+                      return True
+                  return False
+              except FloodWaitError as e:
+                  print(f"⏳ Rate limited: waiting {e.seconds}s")
+                  await asyncio.sleep(e.seconds)
+                  success, result = await send_file_with_thumb(client, entity, video_path, caption)
+                  return success
               except Exception as e:
                   print(f"❌ Merged upload failed: {e}")
                   return False
-          
-          async def main():
-              try:
-                  print("🔌 Connecting to Telegram...")
-                  client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
-                  await client.connect()
-                  if not await client.is_user_authorized():
-                      print("❌ Session invalid")
-                      return
-                  me = await client.get_me()
-                  print(f"✅ Logged in: {me.first_name}")
-                  entity = await resolve_chat(client, chat_id, invite_link, chat_name)
-                  if not entity:
-                      print("❌ Could not resolve chat for merged video!")
-                      return
-                  print(f"\n📤 Uploading merged to: {entity.title if hasattr(entity, 'title') else entity.id}")
-                  await upload_merged_video(client, entity)
-                  await client.disconnect()
-                  print("\n✅ Merged upload complete!")
-              except Exception as e:
-                  print(f"❌ Error: {e}")
-                  traceback.print_exc()
-          
-          if __name__ == '__main__':
-              asyncio.run(main())
-          EOFUPLOAD
-          
-          python3 -u upload_merged.py &
-          MERGED_PID=$!
-          echo "✅ Merged upload started in background (PID: $MERGED_PID)"
-          echo $MERGED_PID > /tmp/merged_pid.txt
 
-      - name: Upload Single Episodes (Parallel)
-        if: steps.merge.outputs.merge_success == 'true'
-        env:
-          TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          TG_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
-          TG_SINGLE_EPISODES_CHAT_ID: ${{ secrets.TELEGRAM_SINGLE_EPISODES_CHAT_ID }}
-          TG_SINGLE_EPISODES_NAME: ${{ secrets.TELEGRAM_SINGLE_EPISODES_NAME }}
-          TG_SINGLE_EPISODES_INVITE_LINK: ${{ secrets.TELEGRAM_SINGLE_EPISODES_INVITE_LINK }}
-          TITLE: ${{ steps.fname.outputs.formatted_title }}
-          SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
-          LABEL: ${{ steps.fname.outputs.clean_label }}
-        run: |
-          cd downloads
-          
-          echo "========================================="
-          echo "📤 UPLOADING SINGLE EPISODES (PARALLEL)"
-          echo "========================================="
-          
-          cat > upload_single.py << "EOFUPLOAD"
-          import os
-          import sys
-          import glob
-          import re
-          import subprocess
-          import asyncio
-          import datetime
-          import traceback
-          import json
-          import random
-          
-          try:
-              from telethon import TelegramClient
-              from telethon.sessions import StringSession
-              from telethon.errors import FloodWaitError
-              from telethon.tl.functions.channels import JoinChannelRequest
-              from telethon.tl.functions.messages import ImportChatInviteRequest, CreateForumTopicRequest
-              from telethon.tl.types import DocumentAttributeVideo
-              import telethon
-              print(f"✅ Telethon version: {telethon.__version__}")
-          except ImportError as e:
-              print(f"❌ Import error: {e}")
-              sys.exit(1)
-          
-          api_id = os.environ.get("TG_API_ID")
-          api_hash = os.environ.get("TG_API_HASH")
-          session_string = os.environ.get("TG_SESSION_STRING")
-          
-          chat_id_raw = os.environ.get("TG_SINGLE_EPISODES_CHAT_ID")
-          chat_name = os.environ.get("TG_SINGLE_EPISODES_NAME")
-          invite_link = os.environ.get("TG_SINGLE_EPISODES_INVITE_LINK")
-          
-          title = os.environ.get("TITLE")
-          series_title = os.environ.get("SERIES_TITLE", "Series")
-          label = os.environ.get("LABEL", "NONE")
-          
-          if not all([api_id, api_hash]):
-              print("❌ Missing Telegram API credentials.")
-              sys.exit(0)
-          
-          if not session_string:
-              print("❌ Missing session string!")
-              sys.exit(0)
-          
-          def parse_chat_id(val):
-              if not val:
-                  return None
-              val = str(val).strip().strip('"').strip("'")
-              try:
-                  return int(val)
-              except ValueError:
-                  return val
-          
-          def get_video_duration(file_path):
-              try:
-                  cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
-                  result = subprocess.check_output(cmd, text=True).strip()
-                  if result and result.replace('.', '', 1).isdigit():
-                      return float(result)
-              except:
-                  pass
-              return 0
-          
-          def generate_thumbnail(file_path):
-              try:
-                  thumb_path = f"{file_path}_thumb.jpg"
-                  duration = get_video_duration(file_path)
-                  if duration > 10:
-                      positions = [5, 10, 15]
-                  else:
-                      positions = [1, 2]
-                  for pos in positions:
-                      if pos < duration:
-                          cmd = ["ffmpeg", "-y", "-ss", str(pos), "-i", file_path, "-vframes", "1", "-vf", "crop=min(iw,ih):min(iw,ih),scale=512:512:flags=lanczos", "-q:v", "2", thumb_path]
-                          subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                          if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 1000:
-                              return thumb_path
-                  return None
-              except Exception as e:
-                  print(f"⚠️ Error generating thumbnail: {e}")
-                  return None
-          
-          def fix_video_duration(file_path):
-              try:
-                  temp_file = f"{file_path}.fixed.mp4"
-                  cmd = ["ffmpeg", "-y", "-i", file_path, "-c", "copy", "-map_metadata", "0", "-movflags", "+faststart", temp_file]
-                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-                  if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
-                      cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", temp_file]
-                      duration_check = subprocess.check_output(cmd, text=True).strip()
-                      if duration_check and duration_check.replace('.', '', 1).isdigit():
-                          os.replace(temp_file, file_path)
-                          return True
-                  return False
-              except Exception as e:
-                  print(f"⚠️ Could not fix duration: {e}")
-                  return False
-          
-          def get_video_metadata(file_path):
-              try:
-                  cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
-                  result = subprocess.check_output(cmd, text=True).strip()
-                  if result and result.replace('.', '', 1).isdigit():
-                      duration = float(result)
-                  else:
-                      cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
-                      result = subprocess.check_output(cmd, text=True).strip()
-                      duration = float(result) if result.replace('.', '', 1).isdigit() else 0.0
-                  
-                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
-                  result = subprocess.check_output(cmd, text=True).strip()
-                  parts = result.split('|')
-                  
-                  if len(parts) >= 2:
-                      w = int(parts[0]) if parts[0].isdigit() else 1280
-                      h = int(parts[1]) if parts[1].isdigit() else 720
-                  else:
-                      cmd = ["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "default=noprint_wrappers=1", file_path]
-                      result = subprocess.check_output(cmd, text=True).strip()
-                      w = 1280
-                      h = 720
-                      for line in result.split('\n'):
-                          if 'width=' in line:
-                              w = int(line.split('=')[1])
-                          elif 'height=' in line:
-                              h = int(line.split('=')[1])
-                  
-                  return int(duration), w, h
-              except Exception as e:
-                  print(f"⚠️ Error getting metadata: {e}")
-              return 0, 1280, 720
-          
-          chat_id = parse_chat_id(chat_id_raw)
-          
-          async def join_chat(client, invite_link):
-              if not invite_link:
-                  return None
-              try:
-                  entity = await client.get_entity(invite_link)
-                  return entity
-              except:
-                  pass
-              return None
-          
-          async def resolve_chat(client, chat_id, invite_link, search_name):
-              if invite_link:
-                  entity = await join_chat(client, invite_link)
-                  if entity:
-                      return entity
-              if chat_id:
-                  try:
-                      return await client.get_entity(chat_id)
-                  except:
-                      pass
-              if search_name:
-                  async for dialog in client.iter_dialogs(limit=50):
-                      if search_name.lower() in str(dialog.name).lower():
-                          return dialog.entity
-              return None
-          
-          async def upload_episodes(client, entity, topic_id):
-              ep_files = sorted(glob.glob("EP*.mp4"), key=lambda f: int(re.search(r'EP(\d+)\.mp4', f).group(1)) if re.search(r'EP(\d+)\.mp4', f) else 0)
+          async def upload_single_episodes(client, entity):
+              ep_files = sorted(glob.glob("EP*.mp4"), 
+                  key=lambda f: int(re.search(r'EP(\d+)\.mp4', f).group(1)) if re.search(r'EP(\d+)\.mp4', f) else 0)
+              
               if not ep_files:
                   print("❌ No episode files found!")
                   return False
               
-              print(f"📊 Found {len(ep_files)} episodes to upload in order")
+              print(f"📊 Found {len(ep_files)} episodes to upload")
               count = 0
               
               for ep_file in ep_files:
@@ -884,11 +1063,7 @@ jobs:
                       continue
                   ep_num = int(ep_match.group(1))
                   
-                  print(f"🔧 Fixing duration metadata for Episode {ep_num}...")
-                  if fix_video_duration(ep_file):
-                      print(f"✅ Duration metadata fixed for Episode {ep_num}")
-                  else:
-                      print(f"⚠️ Could not fix duration metadata for Episode {ep_num}")
+                  fix_video_duration(ep_file)
                   
                   file_size = os.path.getsize(ep_file) / (1024 * 1024)
                   if file_size > 2000:
@@ -896,132 +1071,86 @@ jobs:
                       continue
                   
                   caption = f"📺 Episode {ep_num}"
+                  
                   print(f"📤 Uploading Episode {ep_num} ({file_size:.1f} MB)...")
                   
-                  duration, w, h = get_video_metadata(ep_file)
-                  thumb = generate_thumbnail(ep_file)
-                  
-                  video_attr = DocumentAttributeVideo(duration=duration, w=w, h=h, supports_streaming=True)
-                  kwargs = {"entity": entity, "file": ep_file, "caption": caption, "attributes": [video_attr], "supports_streaming": True, "force_document": False, "allow_cache": True}
-                  if thumb and os.path.exists(thumb):
-                      kwargs["thumb"] = thumb
-                  if topic_id:
-                      kwargs["reply_to"] = topic_id
-                  
                   try:
-                      result = await client.send_file(**kwargs)
-                      if thumb and os.path.exists(thumb):
-                          os.remove(thumb)
-                      count += 1
-                      print(f"✅ Episode {ep_num} uploaded successfully")
-                      await asyncio.sleep(1)
+                      success, result = await send_file_with_thumb(client, entity, ep_file, caption, None)
+                      if success:
+                          count += 1
+                          print(f"✅ Episode {ep_num} uploaded successfully")
+                          await asyncio.sleep(1)
+                      else:
+                          print(f"❌ Episode {ep_num} failed to upload")
                   except FloodWaitError as e:
                       print(f"⏳ Rate limited: waiting {e.seconds}s")
                       await asyncio.sleep(e.seconds)
-                      result = await client.send_file(**kwargs)
-                      if thumb and os.path.exists(thumb):
-                          os.remove(thumb)
-                      count += 1
-                      print(f"✅ Episode {ep_num} uploaded successfully")
+                      success, result = await send_file_with_thumb(client, entity, ep_file, caption, None)
+                      if success:
+                          count += 1
+                          print(f"✅ Episode {ep_num} uploaded successfully")
                   except Exception as e:
                       print(f"❌ Episode {ep_num} error: {e}")
               
               print(f"✅ Uploaded {count}/{len(ep_files)} episodes")
               return count > 0
-          
+
           async def main():
               try:
                   print("🔌 Connecting to Telegram...")
+                  
                   client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
                   await client.connect()
+                  
                   if not await client.is_user_authorized():
                       print("❌ Session invalid")
                       return
+                  
                   me = await client.get_me()
                   print(f"✅ Logged in: {me.first_name}")
-                  entity = await resolve_chat(client, chat_id, invite_link, chat_name)
-                  if not entity:
-                      print("❌ Could not resolve chat for episodes!")
-                      return
-                  print(f"\n📤 Uploading episodes to: {entity.title if hasattr(entity, 'title') else entity.id}")
                   
-                  topic_id = None
-                  if hasattr(entity, 'forum') and entity.forum:
-                      try:
-                          topic_name = f"[{label}]-{series_title}"
-                          print(f"📝 Creating forum topic: {topic_name[:50]}")
-                          result = await client(CreateForumTopicRequest(peer=entity, title=topic_name[:50]))
-                          if hasattr(result, 'updates'):
-                              for update in result.updates:
-                                  if hasattr(update, 'id'):
-                                      topic_id = update.id
-                                      break
-                          if not topic_id and hasattr(result, 'id'):
-                              topic_id = result.id
-                          if topic_id:
-                              print(f"✅ Topic created: {topic_name[:50]} (ID: {topic_id})")
-                      except Exception as e:
-                          print(f"⚠️ Could not create topic: {e}")
+                  # Resolve merged video chat
+                  merged_entity = await resolve_chat(client, parse_chat_id(merged_chat_id_raw), merged_invite_link, merged_chat_name)
                   
-                  await upload_episodes(client, entity, topic_id)
+                  # Resolve single episodes chat
+                  single_entity = await resolve_chat(client, parse_chat_id(single_chat_id_raw), single_invite_link, single_chat_name)
+                  
+                  # Upload both in parallel using asyncio.gather
+                  tasks = []
+                  
+                  if merged_entity:
+                      print(f"\n📤 Will upload merged video to: {merged_entity.title if hasattr(merged_entity, 'title') else merged_entity.id}")
+                      tasks.append(upload_merged_video(client, merged_entity))
+                  else:
+                      print("❌ Could not resolve merged video chat!")
+                  
+                  if single_entity:
+                      print(f"\n📤 Will upload single episodes to: {single_entity.title if hasattr(single_entity, 'title') else single_entity.id}")
+                      tasks.append(upload_single_episodes(client, single_entity))
+                  else:
+                      print("❌ Could not resolve single episodes chat!")
+                  
+                  if tasks:
+                      results = await asyncio.gather(*tasks, return_exceptions=True)
+                      for i, result in enumerate(results):
+                          if isinstance(result, Exception):
+                              print(f"❌ Upload task {i} failed: {result}")
+                  else:
+                      print("❌ No valid upload targets found!")
+                  
                   await client.disconnect()
-                  print("\n✅ Episode upload complete!")
+                  print("\n✅ All uploads complete!")
+                          
               except Exception as e:
                   print(f"❌ Error: {e}")
                   traceback.print_exc()
-          
+
           if __name__ == '__main__':
               asyncio.run(main())
-          EOFUPLOAD
+          EOFPARALLEL
           
-          echo "🚀 Starting single episode upload (parallel with merged upload)..."
-          python3 -u upload_single.py
-          echo "✅ Single episode upload complete!"
-
-      - name: Wait for Merged Upload
-        if: steps.merge.outputs.merge_success == 'true'
-        run: |
-          echo "⏳ Waiting for merged upload to complete..."
-          if [ -f /tmp/merged_pid.txt ]; then
-            MERGED_PID=$(cat /tmp/merged_pid.txt)
-            wait $MERGED_PID 2>/dev/null || true
-            rm -f /tmp/merged_pid.txt
-          fi
-          echo "✅ Merged upload process finished"
-
-      - name: Verify Merged File
-        if: steps.merge.outputs.merge_success == 'true'
-        run: |
-          cd downloads
-          if [ ! -f "output.mp4" ]; then
-            echo "❌ output.mp4 not found!"
-            exit 1
-          fi
-          
-          echo "========================================="
-          echo "🔍 VERIFYING MERGED FILE WITH MEDIAINFO"
-          echo "========================================="
-          
-          ffmpeg -i output.mp4 -c copy -map_metadata 0 -movflags +faststart output_fixed.mp4 2>/dev/null
-          if [ -f "output_fixed.mp4" ] && [ -s "output_fixed.mp4" ]; then
-            mv output_fixed.mp4 output.mp4
-            echo "✅ Duration metadata fixed"
-          fi
-          
-          if mediainfo output.mp4 > /dev/null 2>&1; then
-            echo "✅ MediaInfo can read the file"
-            echo ""
-            echo "📊 MediaInfo Output:"
-            echo "----------------------------------------"
-            mediainfo output.mp4
-            echo "----------------------------------------"
-            DURATION=$(mediainfo --Inform="General;%Duration/String3%" output.mp4 2>/dev/null)
-            echo "📝 Duration: $DURATION"
-            echo "✅ File is valid with proper metadata"
-          else
-            echo "❌ MediaInfo cannot read the file!"
-            exit 1
-          fi
+          echo "🚀 Starting parallel uploads (merged + single episodes)..."
+          python3 -u parallel_upload.py
 
       - name: Cleanup - Delete Workflow Run if Successful
         if: success()
@@ -1033,6 +1162,7 @@ jobs:
             const repo = context.repo;
             
             console.log(`🧹 Cleaning up workflow run ${runId}`);
+            console.log(`📦 Repository: ${repo.owner}/${repo.repo}`);
             
             try {
               await github.rest.actions.deleteWorkflowRun({
@@ -1042,5 +1172,11 @@ jobs:
               });
               console.log(`✅ Successfully deleted workflow run ${runId}`);
             } catch (error) {
-              console.log(`⚠️ Could not delete workflow run: ${error.message}`);
+              console.log(`❌ Failed to delete workflow run: ${error.message}`);
+              if (error.status === 403) {
+                console.log('⚠️ Permission denied. The token may not have "actions: write" permission.');
+              } else if (error.status === 404) {
+                console.log('⚠️ Workflow run not found. It may have been already deleted.');
+              }
+              console.log('ℹ️ Continuing workflow execution...');
             }
