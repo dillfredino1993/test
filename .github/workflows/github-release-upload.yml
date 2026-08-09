@@ -921,8 +921,8 @@ jobs:
             fi
           fi
 
-      - name: Upload Single Episodes (Only if Merge Successful)
-        if: steps.merge.outputs.merge_success == 'true'
+      - name: Upload Single Episodes (Background)
+        if: steps.verify.outputs.verify_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -937,7 +937,7 @@ jobs:
           cd downloads
           
           echo "========================================="
-          echo "📤 UPLOADING SINGLE EPISODES (IN ORDER)"
+          echo "📤 UPLOADING SINGLE EPISODES (BACKGROUND)"
           echo "========================================="
           
           cat > upload_single.py << 'EOFUPLOAD'
@@ -1091,7 +1091,7 @@ jobs:
           chat_id = parse_chat_id(chat_id_raw)
 
           print("=" * 60)
-          print("📤 Uploading Single Episodes")
+          print("📤 Uploading Single Episodes (Background)")
           print("=" * 60)
 
           async def join_chat(client, invite_link):
@@ -1294,10 +1294,13 @@ jobs:
               asyncio.run(main())
           EOFUPLOAD
           
-          echo "🚀 Starting episode upload..."
-          python3 -u upload_single.py
+          echo "🚀 Starting episode upload in background..."
+          python3 -u upload_single.py &
+          EPISODE_PID=$!
+          echo "episode_pid=$EPISODE_PID" >> $GITHUB_ENV
+          echo "✅ Episode upload started in background (PID: $EPISODE_PID)"
 
-      - name: Upload Merged Video to Telegram
+      - name: Upload Merged Video to Telegram (Parallel)
         if: steps.verify.outputs.verify_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -1429,7 +1432,7 @@ jobs:
           chat_id = parse_chat_id(chat_id_raw)
 
           print("=" * 60)
-          print("📤 Uploading Merged Video")
+          print("📤 Uploading Merged Video (Parallel)")
           print("=" * 60)
 
           async def join_chat(client, invite_link):
@@ -1585,8 +1588,24 @@ jobs:
               asyncio.run(main())
           EOFUPLOAD
           
-          echo "🚀 Starting merged video upload..."
+          echo "🚀 Starting merged video upload (running in parallel)..."
           python3 -u upload_merged.py
+
+      - name: Wait for Background Uploads to Complete
+        if: steps.verify.outputs.verify_success == 'true'
+        run: |
+          echo "⏳ Waiting for background uploads to complete..."
+          
+          # Wait for episode upload if it was started
+          if [ -n "${{ env.episode_pid }}" ]; then
+            echo "📤 Waiting for episode upload (PID: ${{ env.episode_pid }})..."
+            wait ${{ env.episode_pid }} 2>/dev/null || true
+            echo "✅ Episode upload completed"
+          else
+            echo "⚠️ No episode upload process found"
+          fi
+          
+          echo "✅ All uploads completed!"
 
       - name: Cleanup - Delete Workflow Run if Successful
         if: success()
