@@ -8,7 +8,6 @@ on:
 permissions:
   actions: write
   contents: read
-  metadata: read
 
 jobs:
   upload:
@@ -691,6 +690,218 @@ jobs:
             exit 1
           fi
 
+      - name: Verify, Compress if Needed, and Fix Duration
+        if: steps.merge.outputs.merge_success == 'true'
+        id: verify
+        run: |
+          cd downloads
+          
+          if [ ! -f "output.mp4" ]; then
+            echo "❌ output.mp4 not found!"
+            exit 1
+          fi
+          
+          echo "========================================="
+          echo "🔍 VERIFYING MERGED FILE WITH MEDIAINFO"
+          echo "========================================="
+          
+          # Check file size
+          FILE_SIZE_BYTES=$(stat -c%s "output.mp4" 2>/dev/null || stat -f%z "output.mp4" 2>/dev/null || echo "0")
+          FILE_SIZE_MB=$((FILE_SIZE_BYTES / 1024 / 1024))
+          FILE_SIZE_GB=$((FILE_SIZE_MB / 1024))
+          
+          echo "📊 File size: ${FILE_SIZE_MB} MB (${FILE_SIZE_GB} GB)"
+          
+          # If file is larger than 1.8GB, compress it
+          if [ $FILE_SIZE_MB -gt 1800 ]; then
+            echo "⚠️ File exceeds 1.8GB (${FILE_SIZE_MB} MB)"
+            echo "🔧 Compressing file to fit Telegram's 2GB limit..."
+            
+            # Get current video info
+            BITRATE=$(mediainfo --Inform="Video;%BitRate%" "output.mp4" 2>/dev/null | tr -d ' ' || echo "")
+            if [ -z "$BITRATE" ] || [ "$BITRATE" = "0" ]; then
+              BITRATE="2000k"
+            fi
+            
+            # Calculate target bitrate (aim for ~1.5GB)
+            DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
+            DURATION_INT=${DURATION%.*}
+            
+            if [ "$DURATION_INT" -gt 0 ]; then
+              # Target ~1.5GB (1500 MB)
+              TARGET_SIZE_MB=1500
+              TARGET_BITRATE=$((TARGET_SIZE_MB * 8 * 1024 / DURATION_INT))
+              # Ensure minimum bitrate
+              if [ $TARGET_BITRATE -lt 500 ]; then
+                TARGET_BITRATE=500
+              fi
+              echo "📊 Target bitrate: ${TARGET_BITRATE}k (for ~${TARGET_SIZE_MB}MB)"
+            else
+              TARGET_BITRATE=1500
+              echo "⚠️ Could not determine duration, using fallback bitrate: ${TARGET_BITRATE}k"
+            fi
+            
+            # Compress with two-pass for better quality
+            echo "🔧 Compressing with two-pass encoding..."
+            
+            # Pass 1
+            ffmpeg -y -i "output.mp4" \
+              -c:v libx264 -b:v ${TARGET_BITRATE}k -preset medium \
+              -pass 1 -f null /dev/null 2>/dev/null
+            
+            # Pass 2
+            ffmpeg -y -i "output.mp4" \
+              -c:v libx264 -b:v ${TARGET_BITRATE}k -preset medium \
+              -pass 2 \
+              -c:a aac -b:a 128k -ar 44100 \
+              -movflags +faststart \
+              -metadata title="$TITLE" \
+              -metadata series="$SERIES_TITLE" \
+              -metadata label="$LABEL" \
+              -metadata year="$(date +%Y)" \
+              -metadata date="$(date +%Y-%m-%d)" \
+              "output_compressed.mp4" 2>/dev/null
+            
+            # Clean up pass files
+            rm -f ffmpeg2pass-0.log ffmpeg2pass-0.log.mbtree
+            
+            if [ -f "output_compressed.mp4" ] && [ -s "output_compressed.mp4" ]; then
+              # Check new file size
+              NEW_SIZE=$(stat -c%s "output_compressed.mp4" 2>/dev/null || stat -f%z "output_compressed.mp4" 2>/dev/null || echo "0")
+              NEW_SIZE_MB=$((NEW_SIZE / 1024 / 1024))
+              
+              if [ $NEW_SIZE_MB -lt 1800 ]; then
+                mv output_compressed.mp4 output.mp4
+                echo "✅ File compressed successfully! New size: ${NEW_SIZE_MB} MB"
+                echo "compressed=true" >> $GITHUB_OUTPUT
+              else
+                echo "⚠️ Compression didn't reduce file enough (${NEW_SIZE_MB} MB), trying more aggressive compression..."
+                
+                # More aggressive compression with CRF
+                ffmpeg -y -i "output.mp4" \
+                  -c:v libx264 -crf 28 -preset medium \
+                  -c:a aac -b:a 96k -ar 44100 \
+                  -movflags +faststart \
+                  -metadata title="$TITLE" \
+                  -metadata series="$SERIES_TITLE" \
+                  -metadata label="$LABEL" \
+                  -metadata year="$(date +%Y)" \
+                  -metadata date="$(date +%Y-%m-%d)" \
+                  "output_compressed.mp4" 2>/dev/null
+                
+                if [ -f "output_compressed.mp4" ] && [ -s "output_compressed.mp4" ]; then
+                  NEW_SIZE=$(stat -c%s "output_compressed.mp4" 2>/dev/null || stat -f%z "output_compressed.mp4" 2>/dev/null || echo "0")
+                  NEW_SIZE_MB=$((NEW_SIZE / 1024 / 1024))
+                  
+                  if [ $NEW_SIZE_MB -lt 1800 ]; then
+                    mv output_compressed.mp4 output.mp4
+                    echo "✅ File compressed successfully! New size: ${NEW_SIZE_MB} MB"
+                    echo "compressed=true" >> $GITHUB_OUTPUT
+                  else
+                    echo "❌ Even aggressive compression failed to reduce file size"
+                    rm -f output_compressed.mp4
+                    echo "compressed=false" >> $GITHUB_OUTPUT
+                  fi
+                fi
+              fi
+            else
+              echo "❌ Compression failed"
+              echo "compressed=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "✅ File size is under 1.8GB, no compression needed"
+            echo "compressed=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # REGENERATE THUMBNAILS IF COMPRESSED
+          if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
+            echo "🖼️ Regenerating thumbnails for final file..."
+            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
+              -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
+              -q:v 2 "thumb.jpg" 2>/dev/null
+            
+            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
+              -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
+              -q:v 2 "square_thumb.jpg" 2>/dev/null
+          fi
+          
+          # Fix duration metadata
+          echo "🔧 Ensuring duration metadata is correct..."
+          ffmpeg -i output.mp4 -c copy -map_metadata 0 -movflags +faststart output_fixed.mp4 2>/dev/null
+          
+          if [ -f "output_fixed.mp4" ] && [ -s "output_fixed.mp4" ]; then
+            mv output_fixed.mp4 output.mp4
+            echo "✅ Duration metadata fixed"
+          fi
+          
+          # Final verification with MediaInfo
+          if mediainfo output.mp4 > /dev/null 2>&1; then
+            echo "✅ MediaInfo can read the file"
+            echo ""
+            echo "📊 FINAL MediaInfo Output:"
+            echo "----------------------------------------"
+            mediainfo output.mp4
+            echo "----------------------------------------"
+            
+            # Extract and display duration
+            DURATION=$(mediainfo --Inform="General;%Duration/String3%" output.mp4 2>/dev/null)
+            FINAL_SIZE=$(stat -c%s "output.mp4" 2>/dev/null || stat -f%z "output.mp4" 2>/dev/null || echo "0")
+            FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
+            
+            echo "📝 Duration: $DURATION"
+            echo "💾 Final size: ${FINAL_SIZE_MB} MB"
+            echo "✅ File is valid with proper metadata"
+            echo "verify_success=true" >> $GITHUB_OUTPUT
+            
+            # Update merged_file_path for upload
+            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
+            
+            # Final size check for upload
+            if [ $FINAL_SIZE_MB -gt 2000 ]; then
+              echo "❌ File is still larger than 2GB (${FINAL_SIZE_MB} MB)"
+              echo "   Telegram has a 2GB file size limit."
+              echo "   Please compress the file manually or split it."
+              exit 1
+            else
+              echo "✅ File size: ${FINAL_SIZE_MB} MB (under 2GB limit)"
+            fi
+          else
+            echo "❌ MediaInfo cannot read the file!"
+            echo "🔧 Attempting to repair..."
+            
+            ffmpeg -y -err_detect ignore_err -i output.mp4 \
+              -c:v libx264 -preset veryfast -crf 23 \
+              -c:a aac -b:a 128k -ar 44100 \
+              -movflags +faststart \
+              -metadata title="$TITLE" \
+              -metadata series="$SERIES_TITLE" \
+              -metadata label="$LABEL" \
+              -metadata year="$(date +%Y)" \
+              -metadata date="$(date +%Y-%m-%d)" \
+              "output_repaired.mp4" 2>/dev/null
+            
+            if [ -f "output_repaired.mp4" ]; then
+              REPAIR_SIZE=$(stat -c%s "output_repaired.mp4" 2>/dev/null || echo "0")
+              REPAIR_SIZE_MB=$((REPAIR_SIZE / 1024 / 1024))
+              if [ "$REPAIR_SIZE" -gt 1000000 ] && [ $REPAIR_SIZE_MB -lt 2000 ]; then
+                mv output_repaired.mp4 output.mp4
+                echo "✅ File repaired successfully!"
+                echo ""
+                echo "📊 Repaired MediaInfo Output:"
+                mediainfo output.mp4
+                echo "verify_success=true" >> $GITHUB_OUTPUT
+                echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
+              else
+                echo "❌ Repair failed or file still too large"
+                rm -f output_repaired.mp4
+                exit 1
+              fi
+            else
+              echo "❌ Repair failed"
+              exit 1
+            fi
+          fi
+
       - name: Upload Single Episodes (Only if Merge Successful)
         if: steps.merge.outputs.merge_success == 'true'
         env:
@@ -1067,78 +1278,8 @@ jobs:
           echo "🚀 Starting episode upload..."
           python3 -u upload_single.py
 
-      - name: Verify Merged File with MediaInfo and Fix Duration
-        if: steps.merge.outputs.merge_success == 'true'
-        run: |
-          cd downloads
-          
-          if [ ! -f "output.mp4" ]; then
-            echo "❌ output.mp4 not found!"
-            exit 1
-          fi
-          
-          echo "========================================="
-          echo "🔍 VERIFYING MERGED FILE WITH MEDIAINFO"
-          echo "========================================="
-          
-          # Fix duration if missing
-          echo "🔧 Ensuring duration metadata is correct..."
-          ffmpeg -i output.mp4 -c copy -map_metadata 0 -movflags +faststart output_fixed.mp4 2>/dev/null
-          
-          if [ -f "output_fixed.mp4" ] && [ -s "output_fixed.mp4" ]; then
-            mv output_fixed.mp4 output.mp4
-            echo "✅ Duration metadata fixed"
-          fi
-          
-          if mediainfo output.mp4 > /dev/null 2>&1; then
-            echo "✅ MediaInfo can read the file"
-            echo ""
-            echo "📊 MediaInfo Output:"
-            echo "----------------------------------------"
-            mediainfo output.mp4
-            echo "----------------------------------------"
-            
-            # Extract and display duration
-            DURATION=$(mediainfo --Inform="General;%Duration/String3%" output.mp4 2>/dev/null)
-            echo "📝 Duration: $DURATION"
-            echo "✅ File is valid with proper metadata"
-            echo "verify_success=true" >> $GITHUB_OUTPUT
-          else
-            echo "❌ MediaInfo cannot read the file!"
-            echo "🔧 Attempting to repair..."
-            
-            ffmpeg -y -err_detect ignore_err -i output.mp4 \
-              -c:v libx264 -preset veryfast -crf 23 \
-              -c:a aac -b:a 128k \
-              -movflags +faststart \
-              -metadata title="$TITLE" \
-              -metadata series="$SERIES_TITLE" \
-              -metadata label="$LABEL" \
-              -metadata date="$(date +%Y-%m-%d)" \
-              "output_repaired.mp4" 2>/dev/null
-            
-            if [ -f "output_repaired.mp4" ]; then
-              REPAIR_SIZE=$(stat -c%s "output_repaired.mp4" 2>/dev/null || echo "0")
-              if [ "$REPAIR_SIZE" -gt 1000000 ]; then
-                mv output_repaired.mp4 output.mp4
-                echo "✅ File repaired successfully!"
-                echo ""
-                echo "📊 Repaired MediaInfo Output:"
-                mediainfo output.mp4
-                echo "verify_success=true" >> $GITHUB_OUTPUT
-              else
-                echo "❌ Repair failed"
-                rm -f output_repaired.mp4
-                exit 1
-              fi
-            else
-              echo "❌ Repair failed"
-              exit 1
-            fi
-          fi
-
       - name: Upload Merged Video to Telegram
-        if: steps.merge.outputs.merge_success == 'true'
+        if: steps.verify.outputs.verify_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -1350,8 +1491,13 @@ jobs:
               
               file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
               if file_size_mb > 2000:
-                  print(f"❌ File exceeds 2GB")
+                  print(f"❌ File exceeds 2GB ({file_size_mb:.1f} MB)")
+                  print("⚠️ Telegram limit is 2GB. Please compress the file.")
                   return False
+              
+              if file_size_mb > 1800:
+                  print(f"⚠️ File is large ({file_size_mb:.1f} MB)")
+                  print("   Upload may take some time...")
               
               # Get duration for display
               duration, w, h = get_video_metadata(video_path)
