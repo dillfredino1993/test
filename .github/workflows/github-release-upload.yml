@@ -196,8 +196,7 @@ jobs:
           EP_INDEX=1
           FAILED_EPISODES=""
           
-          while IFS= read -r URL || [ -n "$URL" ]; do
-            # Safely trim whitespace and \r without xargs stripping backslashes or special chars
+           while IFS= read -u 3 -r URL || [ -n "$URL" ]; do
             URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [ -z "$URL" ]; then continue; fi
             
@@ -210,16 +209,17 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
+            # 2. Redirect standard input using < /dev/null for all downloaders
             if [[ "$URL" == *".m3u8"* ]]; then
               echo "📺 HLS stream - Using yt-dlp"
-              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts --concurrent-fragments 16 -o "$OUT_FILE" "$URL" || \
-              yt-dlp -o "$OUT_FILE" "$URL" || \
-              ffmpeg -i "$URL" -c copy "$OUT_FILE"
+              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts --concurrent-fragments 16 -o "$OUT_FILE" "$URL" < /dev/null || \
+              yt-dlp -o "$OUT_FILE" "$URL" < /dev/null || \
+              ffmpeg -nostdin -i "$URL" -c copy "$OUT_FILE" < /dev/null
               DOWNLOAD_STATUS=$?
             else
               echo "🎬 Direct file - Using aria2c"
-              aria2c -x 16 -s 16 -k 1M --continue=true -o "$OUT_FILE" "$URL" || \
-              curl -sSL "$URL" -o "$OUT_FILE"
+              aria2c -x 16 -s 16 -k 1M --continue=true -o "$OUT_FILE" "$URL" < /dev/null || \
+              curl -sSL "$URL" -o "$OUT_FILE" < /dev/null
               DOWNLOAD_STATUS=$?
             fi
             
@@ -230,12 +230,12 @@ jobs:
                 echo "✅ Downloaded $OUT_FILE ($(du -h "$OUT_FILE" | cut -f1))"
                 echo "🔍 Verifying file..."
                 
-                if python3 verify_and_repair.py "$OUT_FILE"; then
+                if python3 verify_and_repair.py "$OUT_FILE" < /dev/null; then
                   echo "✅ File verified"
                   
                   EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
                   
-                  ffmpeg -i "$OUT_FILE" \
+                  ffmpeg -nostdin -i "$OUT_FILE" \
                     -c copy \
                     -metadata title="$EPISODE_TITLE" \
                     -metadata episode_id="$EP_NUM" \
@@ -244,7 +244,7 @@ jobs:
                     -metadata date="$(date +%Y-%m-%d)" \
                     -metadata media_type="tv_episode" \
                     -movflags +faststart \
-                    "temp_$OUT_FILE" 2>/dev/null
+                    "temp_$OUT_FILE" < /dev/null 2>/dev/null
                   
                   if [ $? -eq 0 ] && [ -f "temp_$OUT_FILE" ]; then
                     mv "temp_$OUT_FILE" "$OUT_FILE"
@@ -270,7 +270,7 @@ jobs:
             
             EP_INDEX=$((EP_INDEX + 1))
             echo ""
-          done < urls.txt
+          done 3< urls.txt
           
           echo "========================================="
           echo "📊 DOWNLOAD SUMMARY"
