@@ -573,91 +573,110 @@ jobs:
           
           echo ""
           echo "✅ All files now match target properties!"
-          echo "📊 Merging $FILE_COUNT files with MKVToolNix..."
+          echo "📊 FAST MERGE: Using FFmpeg concat demuxer (no re-encoding)"
           
-          # Build mkvmerge command with proper append-to mappings
-          MKVMERGE_CMD="mkvmerge -o merged.mkv --title \"$TITLE\""
+          # Calculate total duration of all episodes
+          echo "📊 Calculating total duration of all episodes..."
+          TOTAL_DURATION=0
+          for f in "${MERGE_FILES_ARRAY[@]}"; do
+            if [ -f "$f" ] && [ -s "$f" ]; then
+              DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "0")
+              DURATION_INT=${DURATION%.*}
+              if [ "$DURATION_INT" -gt 0 ]; then
+                TOTAL_DURATION=$((TOTAL_DURATION + DURATION_INT))
+                echo "   $f: ${DURATION_INT}s"
+              fi
+            fi
+          done
+          echo "📊 Total expected duration: ${TOTAL_DURATION} seconds ($((TOTAL_DURATION / 60)) minutes)"
           
-          # Add first file
-          FIRST_FILE="${MERGE_FILES_ARRAY[0]}"
-          MKVMERGE_CMD="$MKVMERGE_CMD \"$FIRST_FILE\""
+          # Create concat list for fast merge (no re-encoding)
+          CONCAT_LIST="concat_list.txt"
+          > $CONCAT_LIST
           
-          # Add remaining files with append-to mappings
-          for i in "${!MERGE_FILES_ARRAY[@]}"; do
-            if [ $i -eq 0 ]; then continue; fi
-            FILE="${MERGE_FILES_ARRAY[$i]}"
-            PREV_FILE="${MERGE_FILES_ARRAY[$((i-1))]}"
-            
-            # Determine track mapping (video track 0, audio track 1)
-            MKVMERGE_CMD="$MKVMERGE_CMD +\"$FILE\""
-            
-            # Add explicit track mappings for reliable appending
-            # Video track: file i:0 -> file i-1:0
-            # Audio track: file i:1 -> file i-1:1
-            MKVMERGE_CMD="$MKVMERGE_CMD --append-to $i:0:$((i-1)):0 $i:1:$((i-1)):1"
+          for f in "${MERGE_FILES_ARRAY[@]}"; do
+            if [ -f "$f" ] && [ -s "$f" ]; then
+              # Verify file is valid before adding
+              if mediainfo "$f" > /dev/null 2>&1; then
+                echo "file '$f'" >> $CONCAT_LIST
+                echo "✅ Added: $f ($(du -h $f | cut -f1))"
+              else
+                echo "⚠️ Skipping invalid file: $f"
+              fi
+            else
+              echo "⚠️ File missing or empty: $f"
+            fi
           done
           
-          echo "🔄 Running MKVToolNix merge..."
+          # FAST MERGE: Use concat demuxer with stream copy (no re-encoding)
+          echo "🔄 Concatenating files with stream copy (fast)..."
+          ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
+            -c copy \
+            -movflags +faststart \
+            -metadata title="$TITLE" \
+            -metadata series="$SERIES_TITLE" \
+            -metadata label="$LABEL" \
+            -metadata year="$(date +%Y)" \
+            -metadata date="$(date +%Y-%m-%d)" \
+            "output.mp4" 2>/dev/null
           
-          # Execute merge
-          eval $MKVMERGE_CMD 2>&1
-          MERGE_STATUS=$?
-          
-          if [ $MERGE_STATUS -eq 0 ] && [ -f "merged.mkv" ] && [ -s "merged.mkv" ]; then
-            echo "✅ MKVToolNix merge successful!"
-          else
-            echo "❌ MKVToolNix merge failed (status: $MERGE_STATUS)"
-            echo "🔧 Falling back to FFmpeg concat..."
+          if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
+            echo "✅ Fast merge successful (no re-encoding!)"
             
-            # Fallback: Use FFmpeg concat
-            CONCAT_LIST="concat_list.txt"
-            > $CONCAT_LIST
+            # Verify merged file duration matches expected
+            MERGED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
+            MERGED_DURATION_INT=${MERGED_DURATION%.*}
+            echo "📊 Merged file duration: ${MERGED_DURATION_INT} seconds"
             
-            for f in "${MERGE_FILES_ARRAY[@]}"; do
-              if [ -f "$f" ] && [ -s "$f" ]; then
-                echo "file '$f'" >> $CONCAT_LIST
+            # Check if duration matches expected (allow 5% tolerance)
+            DIFF=$((TOTAL_DURATION - MERGED_DURATION_INT))
+            if [ ${DIFF#-} -gt $((TOTAL_DURATION / 20)) ] && [ $TOTAL_DURATION -gt 60 ]; then
+              echo "❌ DURATION MISMATCH!"
+              echo "   Expected: ${TOTAL_DURATION}s ($((TOTAL_DURATION / 60)) minutes)"
+              echo "   Actual:   ${MERGED_DURATION_INT}s ($((MERGED_DURATION_INT / 60)) minutes)"
+              echo "   Difference: ${DIFF#-}s"
+              echo "❌ Merge failed - merged file duration doesn't match sum of episodes!"
+              echo "🔧 Falling back to re-encode merge..."
+              
+              # Fallback: Re-encode with concat
+              ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
+                -c:v libx264 -preset veryfast -crf 23 \
+                -c:a aac -b:a 128k -ar ${TARGET_SAMPLE_RATE} \
+                -metadata title="$TITLE" \
+                -metadata series="$SERIES_TITLE" \
+                -metadata label="$LABEL" \
+                -metadata year="$(date +%Y)" \
+                -metadata date="$(date +%Y-%m-%d)" \
+                -movflags +faststart \
+                -threads $(nproc) \
+                "output.mp4" 2>/dev/null
+              
+              if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
+                # Verify re-encoded duration
+                REENCODED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
+                REENCODED_DURATION_INT=${REENCODED_DURATION%.*}
+                echo "📊 Re-encoded duration: ${REENCODED_DURATION_INT}s"
+                
+                DIFF=$((TOTAL_DURATION - REENCODED_DURATION_INT))
+                if [ ${DIFF#-} -gt $((TOTAL_DURATION / 20)) ] && [ $TOTAL_DURATION -gt 60 ]; then
+                  echo "❌ Re-encoded file also has duration mismatch!"
+                  echo "   Expected: ${TOTAL_DURATION}s"
+                  echo "   Actual:   ${REENCODED_DURATION_INT}s"
+                  echo "❌ Merge failed completely!"
+                  exit 1
+                else
+                  echo "✅ Re-encode merge successful with correct duration!"
+                fi
+              else
+                echo "❌ Re-encode merge failed!"
+                exit 1
               fi
-            done
-            
-            ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
-              -c:v libx264 -preset veryfast -crf 23 \
-              -c:a aac -b:a 128k -ar ${TARGET_SAMPLE_RATE} \
-              -metadata title="$TITLE" \
-              -metadata series="$SERIES_TITLE" \
-              -metadata label="$LABEL" \
-              -metadata year="$(date +%Y)" \
-              -metadata date="$(date +%Y-%m-%d)" \
-              -movflags +faststart \
-              -threads $(nproc) \
-              merged.mp4 2>/dev/null
-            
-            if [ -f "merged.mp4" ] && [ -s "merged.mp4" ]; then
-              mv merged.mp4 merged.mkv 2>/dev/null || true
-              echo "✅ FFmpeg concat merge successful"
             else
-              echo "❌ FFmpeg concat merge failed!"
-              exit 1
+              echo "✅ Duration verified: ${MERGED_DURATION_INT}s matches expected (${TOTAL_DURATION}s)"
             fi
-          fi
-          
-          # Convert to MP4 with proper metadata
-          if [ -f "merged.mkv" ] && [ -s "merged.mkv" ]; then
-            echo "📦 Converting MKV to MP4..."
-            ffmpeg -i merged.mkv -c copy -movflags +faststart \
-              -metadata title="$TITLE" \
-              -metadata series="$SERIES_TITLE" \
-              -metadata label="$LABEL" \
-              -metadata year="$(date +%Y)" \
-              -metadata date="$(date +%Y-%m-%d)" \
-              "output.mp4" 2>/dev/null
-            
-            if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
-              echo "✅ Converted to MP4 successfully"
-              rm -f merged.mkv
-            else
-              echo "⚠️ Conversion failed, using MKV file"
-              mv merged.mkv output.mp4 2>/dev/null || true
-            fi
+          else
+            echo "❌ Fast merge failed!"
+            exit 1
           fi
           
           # Generate thumbnails
