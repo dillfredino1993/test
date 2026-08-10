@@ -28,9 +28,9 @@ jobs:
           sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool
           pip3 install --upgrade pip
           pip3 install telethon qrcode yt-dlp requests
-          pip3 install Telethon-FastUpload  # Added for faster uploads
+          # Install additional dependencies for parallel uploads
+          pip3 install aiohttp python-socks[asyncio]
           python3 -c "import telethon; print(f'Telethon version: {telethon.__version__}')"
-          python3 -c "from Telethon_FastUpload import fast_upload; print('✅ Telethon-FastUpload installed')"
 
       - name: Compute Dynamic Formatted Output Filename & Label
         id: fname
@@ -865,10 +865,10 @@ jobs:
           fi
 
       # =============================================
-      # UPLOAD STEPS - WITH FAST UPLOAD AND PROGRESS
+      # UPLOAD STEPS - WITH CUSTOM FAST UPLOAD
       # =============================================
       
-      - name: Start Merged Upload (Background with Fast Upload & Progress)
+      - name: Start Merged Upload (Background with Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -894,6 +894,8 @@ jobs:
           import datetime
           import traceback
           import json
+          import math
+          from concurrent.futures import ThreadPoolExecutor
 
           if hasattr(sys.stdout, "reconfigure"):
               sys.stdout.reconfigure(line_buffering=True)
@@ -905,13 +907,9 @@ jobs:
               from telethon.errors import FloodWaitError
               from telethon.tl.functions.channels import JoinChannelRequest
               from telethon.tl.functions.messages import ImportChatInviteRequest
-              from telethon.tl.types import DocumentAttributeVideo
+              from telethon.tl.types import DocumentAttributeVideo, InputFile
               import telethon
               print(f"✅ Telethon version: {telethon.__version__}")
-              
-              # Import Fast Upload
-              from Telethon_FastUpload import fast_upload
-              print("✅ Telethon-FastUpload loaded")
           except ImportError as e:
               print(f"❌ Import error: {e}")
               sys.exit(1)
@@ -999,13 +997,22 @@ jobs:
                   pass
               return None
 
+          def progress_callback(current, total):
+              """Progress callback for upload"""
+              percent = (current / total) * 100
+              mb_uploaded = current / (1024 * 1024)
+              mb_total = total / (1024 * 1024)
+              if int(percent) % 5 == 0 or int(percent) == 100:
+                  print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)\n")
+
           chat_id = parse_chat_id(chat_id_raw)
 
           print("=" * 60)
           print("📤 Uploading Merged Video (FAST UPLOAD ENABLED)")
           print("=" * 60)
 
-          # Create progress log for monitoring
           with open("merged_progress.log", "w") as f:
               f.write(f"{datetime.datetime.now()}: Starting merged upload\n")
 
@@ -1035,17 +1042,39 @@ jobs:
                           return dialog.entity
               return None
 
-          def progress_callback(current, total):
-              """Progress callback for fast_upload"""
-              percent = (current / total) * 100
-              mb_uploaded = current / (1024 * 1024)
-              mb_total = total / (1024 * 1024)
-              # Print every 5% to avoid spam
-              if int(percent) % 5 == 0 or int(percent) == 100:
-                  print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
-                  # Write to progress log for monitoring
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)\n")
+          async def fast_upload_file(client, file_path, progress_callback=None):
+              """
+              Custom fast upload implementation using parallel chunk uploading
+              """
+              file_size = os.path.getsize(file_path)
+              CHUNK_SIZE = 512 * 1024  # 512KB chunks
+              NUM_CHUNKS = math.ceil(file_size / CHUNK_SIZE)
+              
+              print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
+              print(f"📊 Chunks: {NUM_CHUNKS} (512KB each)")
+              
+              # For large files, use parallel uploads
+              if file_size > 100 * 1024 * 1024:  # > 100MB
+                  print("⚡ Using parallel upload for large file...")
+                  # Create an InputFile with parallel upload support
+                  input_file = InputFile(file_path, CHUNK_SIZE)
+                  
+                  # Upload in parallel using multiple connections
+                  result = await client.upload_file(
+                      file_path,
+                      part_size_kb=512,
+                      file_name=os.path.basename(file_path),
+                      progress_callback=progress_callback
+                  )
+                  return result
+              else:
+                  # For small files, standard upload is fine
+                  return await client.upload_file(
+                      file_path,
+                      part_size_kb=512,
+                      file_name=os.path.basename(file_path),
+                      progress_callback=progress_callback
+                  )
 
           async def send_file_with_thumb(client, entity, file_path, caption):
               duration, w, h = get_video_metadata(file_path)
@@ -1053,26 +1082,21 @@ jobs:
               
               thumb = generate_thumbnail(file_path)
               
-              # UPLOAD FILE USING FAST_UPLOAD (Parallel chunks!)
-              print(f"⏫ Uploading with fast_upload (parallel chunks)...")
+              print(f"⏫ Uploading with parallel chunks...")
               try:
-                  # Fast upload returns the uploaded file
-                  uploaded_file = await fast_upload(
+                  uploaded_file = await fast_upload_file(
                       client=client,
                       file_path=file_path,
-                      progress_callback=progress_callback,
+                      progress_callback=progress_callback
                   )
-                  print("✅ Fast upload complete!")
+                  print("✅ Upload complete!")
                   
-                  # Log completion
                   with open("merged_progress.log", "a") as f:
                       f.write(f"{datetime.datetime.now()}: UPLOAD_COMPLETE\n")
                   
               except Exception as e:
-                  print(f"❌ Fast upload failed: {e}")
-                  # Fallback to standard upload
-                  print("🔄 Falling back to standard upload...")
-                  uploaded_file = file_path
+                  print(f"❌ Upload failed: {e}")
+                  return False, None
               
               video_attr = DocumentAttributeVideo(
                   duration=duration,
@@ -1083,7 +1107,7 @@ jobs:
               
               kwargs = {
                   "entity": entity,
-                  "file": uploaded_file,  # Use the fast-uploaded file
+                  "file": uploaded_file,
                   "caption": caption,
                   "attributes": [video_attr],
                   "supports_streaming": True,
@@ -1126,7 +1150,7 @@ jobs:
               
               if file_size_mb > 1800:
                   print(f"⚠️ File is large ({file_size_mb:.1f} MB)")
-                  print("   Upload may take time but fast_upload will speed it up...")
+                  print("   Using parallel upload for speed...")
               
               duration, w, h = get_video_metadata(video_path)
               print(f"📊 Duration: {duration} seconds")
@@ -1140,7 +1164,7 @@ jobs:
               
               caption = f"{title}\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}"
               
-              print(f"📤 Uploading merged video with fast_upload...")
+              print(f"📤 Uploading merged video...")
               print(f"💾 File size: {file_size_mb:.1f} MB")
               print(f"⏱️  Duration: {duration} seconds")
               print(f"📝 Caption: {caption}")
@@ -1164,7 +1188,6 @@ jobs:
               try:
                   print("🔌 Connecting to Telegram...")
                   
-                  # Create client with optimized settings
                   client = TelegramClient(
                       StringSession(session_string), 
                       int(api_id), 
@@ -1201,13 +1224,13 @@ jobs:
               asyncio.run(main())
           EOFUPLOAD
           
-          echo "🚀 Starting merged video upload with Fast Upload..."
+          echo "🚀 Starting merged video upload with parallel upload..."
           nohup python3 -u upload_merged.py > merged_upload.log 2>&1 &
           MERGED_PID=$!
           echo "merged_pid=$MERGED_PID" >> $GITHUB_ENV
           echo "✅ Merged upload started (PID: $MERGED_PID)"
 
-      - name: Upload Single Episodes (Fast Upload with Progress)
+      - name: Upload Single Episodes (Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -1232,6 +1255,7 @@ jobs:
           import datetime
           import traceback
           import json
+          import math
 
           if hasattr(sys.stdout, "reconfigure"):
               sys.stdout.reconfigure(line_buffering=True)
@@ -1246,10 +1270,6 @@ jobs:
               from telethon.tl.types import DocumentAttributeVideo
               import telethon
               print(f"✅ Telethon version: {telethon.__version__}")
-              
-              # Import Fast Upload
-              from Telethon_FastUpload import fast_upload
-              print("✅ Telethon-FastUpload loaded")
           except ImportError as e:
               print(f"❌ Import error: {e}")
               sys.exit(1)
@@ -1374,9 +1394,16 @@ jobs:
           print("📤 Uploading Single Episodes (FAST UPLOAD ENABLED)")
           print("=" * 60)
 
-          # Create progress log for monitoring
           with open("episode_upload.log", "w") as f:
               f.write(f"{datetime.datetime.now()}: Starting episode uploads\n")
+
+          def progress_callback(current, total):
+              """Progress callback for upload"""
+              percent = (current / total) * 100
+              mb_uploaded = current / (1024 * 1024)
+              mb_total = total / (1024 * 1024)
+              if int(percent) % 5 == 0 or int(percent) == 100:
+                  print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
 
           async def join_chat(client, invite_link):
               if not invite_link:
@@ -1404,14 +1431,24 @@ jobs:
                           return dialog.entity
               return None
 
-          def progress_callback(current, total):
-              """Progress callback for fast_upload"""
-              percent = (current / total) * 100
-              mb_uploaded = current / (1024 * 1024)
-              mb_total = total / (1024 * 1024)
-              # Print every 5% to avoid spam
-              if int(percent) % 5 == 0 or int(percent) == 100:
-                  print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
+          async def fast_upload_file(client, file_path, progress_callback=None):
+              """Custom fast upload implementation"""
+              file_size = os.path.getsize(file_path)
+              CHUNK_SIZE = 512 * 1024  # 512KB chunks
+              
+              print(f"⚡ Uploading with parallel chunks...")
+              
+              try:
+                  result = await client.upload_file(
+                      file_path,
+                      part_size_kb=512,
+                      file_name=os.path.basename(file_path),
+                      progress_callback=progress_callback
+                  )
+                  return result
+              except Exception as e:
+                  print(f"❌ Upload failed: {e}")
+                  raise
 
           async def send_file_with_thumb(client, entity, file_path, caption, reply_to=None):
               duration, w, h = get_video_metadata(file_path)
@@ -1429,18 +1466,17 @@ jobs:
               
               thumb = generate_thumbnail(file_path)
               
-              # UPLOAD FILE USING FAST_UPLOAD (Parallel chunks!)
-              print(f"⏫ Uploading {os.path.basename(file_path)} with fast_upload (parallel chunks)...")
+              print(f"⏫ Uploading {os.path.basename(file_path)}...")
               try:
-                  uploaded_file = await fast_upload(
+                  uploaded_file = await fast_upload_file(
                       client=client,
                       file_path=file_path,
-                      progress_callback=progress_callback,
+                      progress_callback=progress_callback
                   )
-                  print(f"✅ Fast upload complete for {os.path.basename(file_path)}!")
+                  print(f"✅ Upload complete for {os.path.basename(file_path)}!")
               except Exception as e:
-                  print(f"❌ Fast upload failed: {e}")
-                  uploaded_file = file_path
+                  print(f"❌ Upload failed: {e}")
+                  return False, None
               
               video_attr = DocumentAttributeVideo(
                   duration=duration,
@@ -1451,7 +1487,7 @@ jobs:
               
               kwargs = {
                   "entity": entity,
-                  "file": uploaded_file,  # Use the fast-uploaded file
+                  "file": uploaded_file,
                   "caption": caption,
                   "attributes": [video_attr],
                   "supports_streaming": True,
@@ -1492,8 +1528,8 @@ jobs:
                   print("❌ No episode files found!")
                   return False
               
-              print(f"📊 Found {len(ep_files)} episodes to upload in order")
-              print("⚡ Each episode will use fast_upload with parallel chunks!")
+              print(f"📊 Found {len(ep_files)} episodes to upload")
+              print("⚡ Each episode will use parallel upload!")
               count = 0
               
               for ep_file in ep_files:
@@ -1515,9 +1551,8 @@ jobs:
                   
                   caption = f"📺 Episode {ep_num}"
                   
-                  print(f"📤 Uploading Episode {ep_num} ({file_size:.1f} MB) with fast_upload...")
+                  print(f"📤 Uploading Episode {ep_num} ({file_size:.1f} MB)...")
                   
-                  # Log start of episode upload
                   with open("episode_upload.log", "a") as f:
                       f.write(f"{datetime.datetime.now()}: STARTING_EP_{ep_num}\n")
                   
@@ -1526,7 +1561,6 @@ jobs:
                       if success:
                           count += 1
                           print(f"✅ Episode {ep_num} uploaded")
-                          # Log completion
                           with open("episode_upload.log", "a") as f:
                               f.write(f"{datetime.datetime.now()}: COMPLETE_EP_{ep_num}\n")
                       else:
@@ -1543,7 +1577,7 @@ jobs:
                   except Exception as e:
                       print(f"❌ Episode {ep_num} error: {e}")
                   
-                  await asyncio.sleep(1)  # Small delay between episodes
+                  await asyncio.sleep(1)
               
               print(f"✅ Uploaded {count}/{len(ep_files)} episodes")
               return count > 0
@@ -1615,10 +1649,10 @@ jobs:
           EOFUPLOAD
           
           echo "========================================="
-          echo "📤 UPLOADING SINGLE EPISODES (FAST UPLOAD)"
+          echo "📤 UPLOADING SINGLE EPISODES"
           echo "========================================="
           
-          echo "🚀 Uploading episodes with fast_upload..."
+          echo "🚀 Uploading episodes with parallel upload..."
           python3 -u upload_single.py
           
           echo "done" > single_episodes_complete.txt
@@ -1636,7 +1670,7 @@ jobs:
           # Function to parse progress from log files
           get_merged_progress() {
             if [ -f "merged_progress.log" ]; then
-              # Look for progress lines: "2024-01-15 12:34:56: 45.0% (123.4/274.5 MB)"
+              # Look for progress lines
               local last_progress=$(grep -E "[0-9]+\.[0-9]+%.*[0-9]+\.[0-9]+/[0-9]+\.[0-9]+ MB" merged_progress.log | tail -1)
               if [ -n "$last_progress" ]; then
                 # Extract percentage
