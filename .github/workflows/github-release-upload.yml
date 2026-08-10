@@ -28,7 +28,9 @@ jobs:
           sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool
           pip3 install --upgrade pip
           pip3 install telethon qrcode yt-dlp requests
+          pip3 install Telethon-FastUpload  # Added for faster uploads
           python3 -c "import telethon; print(f'Telethon version: {telethon.__version__}')"
+          python3 -c "from Telethon_FastUpload import fast_upload; print('✅ Telethon-FastUpload installed')"
 
       - name: Compute Dynamic Formatted Output Filename & Label
         id: fname
@@ -863,10 +865,10 @@ jobs:
           fi
 
       # =============================================
-      # UPLOAD STEPS - RUN IN PARALLEL, WAIT FOR BOTH
+      # UPLOAD STEPS - UPDATED WITH FAST UPLOAD
       # =============================================
       
-      - name: Start Merged Upload (Background)
+      - name: Start Merged Upload (Background with Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -906,6 +908,10 @@ jobs:
               from telethon.tl.types import DocumentAttributeVideo
               import telethon
               print(f"✅ Telethon version: {telethon.__version__}")
+              
+              # Import Fast Upload
+              from Telethon_FastUpload import fast_upload
+              print("✅ Telethon-FastUpload loaded")
           except ImportError as e:
               print(f"❌ Import error: {e}")
               sys.exit(1)
@@ -996,7 +1002,7 @@ jobs:
           chat_id = parse_chat_id(chat_id_raw)
 
           print("=" * 60)
-          print("📤 Uploading Merged Video")
+          print("📤 Uploading Merged Video (FAST UPLOAD ENABLED)")
           print("=" * 60)
 
           async def join_chat(client, invite_link):
@@ -1025,11 +1031,38 @@ jobs:
                           return dialog.entity
               return None
 
+          def progress_callback(current, total):
+              """Progress callback for fast_upload"""
+              percent = (current / total) * 100
+              mb_uploaded = current / (1024 * 1024)
+              mb_total = total / (1024 * 1024)
+              # Print every 5% to avoid spam
+              if int(percent) % 5 == 0:
+                  print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
+
           async def send_file_with_thumb(client, entity, file_path, caption):
               duration, w, h = get_video_metadata(file_path)
               print(f"📊 Video duration: {duration} seconds, {w}x{h}")
               
               thumb = generate_thumbnail(file_path)
+              
+              # UPLOAD FILE USING FAST_UPLOAD (Parallel chunks!)
+              print(f"⏫ Uploading with fast_upload (parallel chunks)...")
+              try:
+                  # Fast upload returns the uploaded file
+                  uploaded_file = await fast_upload(
+                      client=client,
+                      file_path=file_path,
+                      progress_callback=progress_callback,
+                      # Optional: customize chunk size (default is 512KB)
+                      # chunk_size=1024*1024,  # 1MB chunks for even faster uploads
+                  )
+                  print("✅ Fast upload complete!")
+              except Exception as e:
+                  print(f"❌ Fast upload failed: {e}")
+                  # Fallback to standard upload
+                  print("🔄 Falling back to standard upload...")
+                  uploaded_file = file_path
               
               video_attr = DocumentAttributeVideo(
                   duration=duration,
@@ -1040,7 +1073,7 @@ jobs:
               
               kwargs = {
                   "entity": entity,
-                  "file": file_path,
+                  "file": uploaded_file,  # Use the fast-uploaded file
                   "caption": caption,
                   "attributes": [video_attr],
                   "supports_streaming": True,
@@ -1083,7 +1116,7 @@ jobs:
               
               if file_size_mb > 1800:
                   print(f"⚠️ File is large ({file_size_mb:.1f} MB)")
-                  print("   Upload may take time...")
+                  print("   Upload may take time but fast_upload will speed it up...")
               
               duration, w, h = get_video_metadata(video_path)
               print(f"📊 Duration: {duration} seconds")
@@ -1097,7 +1130,7 @@ jobs:
               
               caption = f"{title}\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}"
               
-              print(f"📤 Uploading merged video...")
+              print(f"📤 Uploading merged video with fast_upload...")
               print(f"💾 File size: {file_size_mb:.1f} MB")
               print(f"⏱️  Duration: {duration} seconds")
               print(f"📝 Caption: {caption}")
@@ -1121,7 +1154,14 @@ jobs:
               try:
                   print("🔌 Connecting to Telegram...")
                   
-                  client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
+                  # Create client with optimized settings
+                  client = TelegramClient(
+                      StringSession(session_string), 
+                      int(api_id), 
+                      api_hash,
+                      connection_retries=5,
+                      flood_sleep_threshold=180
+                  )
                   await client.connect()
                   
                   if not await client.is_user_authorized():
@@ -1151,13 +1191,13 @@ jobs:
               asyncio.run(main())
           EOFUPLOAD
           
-          echo "🚀 Starting merged video upload in background..."
+          echo "🚀 Starting merged video upload with Fast Upload..."
           nohup python3 -u upload_merged.py > merged_upload.log 2>&1 &
           MERGED_PID=$!
           echo "merged_pid=$MERGED_PID" >> $GITHUB_ENV
           echo "✅ Merged upload started (PID: $MERGED_PID)"
 
-      - name: Upload Single Episodes
+      - name: Upload Single Episodes (Fast Upload Enabled)
         if: steps.verify.outputs.verify_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -1196,6 +1236,10 @@ jobs:
               from telethon.tl.types import DocumentAttributeVideo
               import telethon
               print(f"✅ Telethon version: {telethon.__version__}")
+              
+              # Import Fast Upload
+              from Telethon_FastUpload import fast_upload
+              print("✅ Telethon-FastUpload loaded")
           except ImportError as e:
               print(f"❌ Import error: {e}")
               sys.exit(1)
@@ -1317,7 +1361,7 @@ jobs:
           chat_id = parse_chat_id(chat_id_raw)
 
           print("=" * 60)
-          print("📤 Uploading Single Episodes")
+          print("📤 Uploading Single Episodes (FAST UPLOAD ENABLED)")
           print("=" * 60)
 
           async def join_chat(client, invite_link):
@@ -1346,6 +1390,15 @@ jobs:
                           return dialog.entity
               return None
 
+          def progress_callback(current, total):
+              """Progress callback for fast_upload"""
+              percent = (current / total) * 100
+              mb_uploaded = current / (1024 * 1024)
+              mb_total = total / (1024 * 1024)
+              # Print every 5% to avoid spam
+              if int(percent) % 5 == 0:
+                  print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
+
           async def send_file_with_thumb(client, entity, file_path, caption, reply_to=None):
               duration, w, h = get_video_metadata(file_path)
               print(f"📊 Video duration: {duration} seconds, {w}x{h}")
@@ -1362,6 +1415,19 @@ jobs:
               
               thumb = generate_thumbnail(file_path)
               
+              # UPLOAD FILE USING FAST_UPLOAD (Parallel chunks!)
+              print(f"⏫ Uploading {os.path.basename(file_path)} with fast_upload (parallel chunks)...")
+              try:
+                  uploaded_file = await fast_upload(
+                      client=client,
+                      file_path=file_path,
+                      progress_callback=progress_callback,
+                  )
+                  print(f"✅ Fast upload complete for {os.path.basename(file_path)}!")
+              except Exception as e:
+                  print(f"❌ Fast upload failed: {e}")
+                  uploaded_file = file_path
+              
               video_attr = DocumentAttributeVideo(
                   duration=duration,
                   w=w if w > 0 else 1280,
@@ -1371,7 +1437,7 @@ jobs:
               
               kwargs = {
                   "entity": entity,
-                  "file": file_path,
+                  "file": uploaded_file,  # Use the fast-uploaded file
                   "caption": caption,
                   "attributes": [video_attr],
                   "supports_streaming": True,
@@ -1413,6 +1479,7 @@ jobs:
                   return False
               
               print(f"📊 Found {len(ep_files)} episodes to upload in order")
+              print("⚡ Each episode will use fast_upload with parallel chunks!")
               count = 0
               
               for ep_file in ep_files:
@@ -1434,7 +1501,7 @@ jobs:
                   
                   caption = f"📺 Episode {ep_num}"
                   
-                  print(f"📤 Uploading Episode {ep_num} ({file_size:.1f} MB)...")
+                  print(f"📤 Uploading Episode {ep_num} ({file_size:.1f} MB) with fast_upload...")
                   
                   try:
                       success, result = await send_file_with_thumb(client, entity, ep_file, caption, topic_id)
@@ -1461,7 +1528,13 @@ jobs:
               try:
                   print("🔌 Connecting to Telegram...")
                   
-                  client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
+                  client = TelegramClient(
+                      StringSession(session_string), 
+                      int(api_id), 
+                      api_hash,
+                      connection_retries=5,
+                      flood_sleep_threshold=180
+                  )
                   await client.connect()
                   
                   if not await client.is_user_authorized():
@@ -1518,10 +1591,10 @@ jobs:
           EOFUPLOAD
           
           echo "========================================="
-          echo "📤 UPLOADING SINGLE EPISODES"
+          echo "📤 UPLOADING SINGLE EPISODES (FAST UPLOAD)"
           echo "========================================="
           
-          echo "🚀 Uploading episodes..."
+          echo "🚀 Uploading episodes with fast_upload..."
           python3 -u upload_single.py
           
           echo "done" > single_episodes_complete.txt
