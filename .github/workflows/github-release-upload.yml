@@ -865,10 +865,10 @@ jobs:
           fi
 
       # =============================================
-      # UPLOAD STEPS - UPDATED WITH FAST UPLOAD
+      # UPLOAD STEPS - WITH FAST UPLOAD AND PROGRESS
       # =============================================
       
-      - name: Start Merged Upload (Background with Fast Upload)
+      - name: Start Merged Upload (Background with Fast Upload & Progress)
         if: steps.verify.outputs.verify_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -1005,6 +1005,10 @@ jobs:
           print("📤 Uploading Merged Video (FAST UPLOAD ENABLED)")
           print("=" * 60)
 
+          # Create progress log for monitoring
+          with open("merged_progress.log", "w") as f:
+              f.write(f"{datetime.datetime.now()}: Starting merged upload\n")
+
           async def join_chat(client, invite_link):
               if not invite_link:
                   return None
@@ -1037,8 +1041,11 @@ jobs:
               mb_uploaded = current / (1024 * 1024)
               mb_total = total / (1024 * 1024)
               # Print every 5% to avoid spam
-              if int(percent) % 5 == 0:
+              if int(percent) % 5 == 0 or int(percent) == 100:
                   print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
+                  # Write to progress log for monitoring
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)\n")
 
           async def send_file_with_thumb(client, entity, file_path, caption):
               duration, w, h = get_video_metadata(file_path)
@@ -1054,10 +1061,13 @@ jobs:
                       client=client,
                       file_path=file_path,
                       progress_callback=progress_callback,
-                      # Optional: customize chunk size (default is 512KB)
-                      # chunk_size=1024*1024,  # 1MB chunks for even faster uploads
                   )
                   print("✅ Fast upload complete!")
+                  
+                  # Log completion
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: UPLOAD_COMPLETE\n")
+                  
               except Exception as e:
                   print(f"❌ Fast upload failed: {e}")
                   # Fallback to standard upload
@@ -1197,7 +1207,7 @@ jobs:
           echo "merged_pid=$MERGED_PID" >> $GITHUB_ENV
           echo "✅ Merged upload started (PID: $MERGED_PID)"
 
-      - name: Upload Single Episodes (Fast Upload Enabled)
+      - name: Upload Single Episodes (Fast Upload with Progress)
         if: steps.verify.outputs.verify_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -1364,6 +1374,10 @@ jobs:
           print("📤 Uploading Single Episodes (FAST UPLOAD ENABLED)")
           print("=" * 60)
 
+          # Create progress log for monitoring
+          with open("episode_upload.log", "w") as f:
+              f.write(f"{datetime.datetime.now()}: Starting episode uploads\n")
+
           async def join_chat(client, invite_link):
               if not invite_link:
                   return None
@@ -1396,7 +1410,7 @@ jobs:
               mb_uploaded = current / (1024 * 1024)
               mb_total = total / (1024 * 1024)
               # Print every 5% to avoid spam
-              if int(percent) % 5 == 0:
+              if int(percent) % 5 == 0 or int(percent) == 100:
                   print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
 
           async def send_file_with_thumb(client, entity, file_path, caption, reply_to=None):
@@ -1503,12 +1517,18 @@ jobs:
                   
                   print(f"📤 Uploading Episode {ep_num} ({file_size:.1f} MB) with fast_upload...")
                   
+                  # Log start of episode upload
+                  with open("episode_upload.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: STARTING_EP_{ep_num}\n")
+                  
                   try:
                       success, result = await send_file_with_thumb(client, entity, ep_file, caption, topic_id)
                       if success:
                           count += 1
                           print(f"✅ Episode {ep_num} uploaded")
-                          await asyncio.sleep(1)
+                          # Log completion
+                          with open("episode_upload.log", "a") as f:
+                              f.write(f"{datetime.datetime.now()}: COMPLETE_EP_{ep_num}\n")
                       else:
                           print(f"❌ Episode {ep_num} failed")
                   except FloodWaitError as e:
@@ -1518,8 +1538,12 @@ jobs:
                       if success:
                           count += 1
                           print(f"✅ Episode {ep_num} uploaded")
+                          with open("episode_upload.log", "a") as f:
+                              f.write(f"{datetime.datetime.now()}: COMPLETE_EP_{ep_num}\n")
                   except Exception as e:
                       print(f"❌ Episode {ep_num} error: {e}")
+                  
+                  await asyncio.sleep(1)  # Small delay between episodes
               
               print(f"✅ Uploaded {count}/{len(ep_files)} episodes")
               return count > 0
@@ -1600,54 +1624,315 @@ jobs:
           echo "done" > single_episodes_complete.txt
           echo "✅ All episodes uploaded successfully!"
 
-      - name: Wait for All Uploads to Complete
+      - name: Wait for All Uploads with Enhanced Progress Monitoring
         if: steps.verify.outputs.verify_success == 'true'
         run: |
           cd downloads
           
           echo "========================================="
-          echo "⏳ WAITING FOR ALL UPLOADS TO COMPLETE"
+          echo "⏳ MONITORING UPLOAD PROGRESS"
           echo "========================================="
           
-          # Check if episodes are done (they should be)
-          if [ -f "single_episodes_complete.txt" ]; then
-            echo "✅ Single episodes upload completed!"
-          else
-            echo "⚠️ Waiting for episodes to complete..."
-            while [ ! -f "single_episodes_complete.txt" ]; do
-              sleep 5
-              echo "⏳ Waiting for episodes..."
-            done
-            echo "✅ Single episodes upload completed!"
-          fi
-          
-          # Wait for merged upload to complete
-          if [ -n "${{ env.merged_pid }}" ]; then
-            echo "📤 Waiting for merged upload (PID: ${{ env.merged_pid }})..."
-            
-            # Wait for the process to finish
-            while kill -0 ${{ env.merged_pid }} 2>/dev/null; do
-              echo "⏳ Merged upload still running..."
-              sleep 10
-            done
-            
-            echo "✅ Merged upload completed!"
-            
-            # Show log
-            if [ -f "merged_upload.log" ]; then
-              echo ""
-              echo "📋 Merged upload log (last 50 lines):"
-              echo "========================================="
-              tail -50 merged_upload.log
-              echo "========================================="
+          # Function to parse progress from log files
+          get_merged_progress() {
+            if [ -f "merged_progress.log" ]; then
+              # Look for progress lines: "2024-01-15 12:34:56: 45.0% (123.4/274.5 MB)"
+              local last_progress=$(grep -E "[0-9]+\.[0-9]+%.*[0-9]+\.[0-9]+/[0-9]+\.[0-9]+ MB" merged_progress.log | tail -1)
+              if [ -n "$last_progress" ]; then
+                # Extract percentage
+                local percent=$(echo "$last_progress" | grep -oE "[0-9.]+\%" | sed 's/%//')
+                # Extract uploaded and total
+                local uploaded=$(echo "$last_progress" | grep -oE "[0-9.]+\/[0-9.]+ MB" | sed 's/ MB//')
+                echo "$percent|$uploaded"
+              else
+                # Check if upload is complete
+                if grep -q "UPLOAD_COMPLETE" merged_progress.log; then
+                  echo "100|complete"
+                else
+                  echo "0|0.0/0.0"
+                fi
+              fi
+            else
+              echo "0|0.0/0.0"
             fi
-          else
-            echo "⚠️ No merged PID found - merged upload may not have started"
+          }
+          
+          # Function to get episode upload progress
+          get_episode_progress() {
+            if [ -f "single_episodes_complete.txt" ]; then
+              echo "100|complete"
+              return
+            fi
+            
+            if [ -f "episode_upload.log" ]; then
+              # Count total episodes
+              local total_eps=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
+              # Count completed episodes
+              local completed=$(grep -c "COMPLETE_EP_" episode_upload.log 2>/dev/null || echo "0")
+              
+              if [ "$total_eps" -gt 0 ]; then
+                local percent=$((completed * 100 / total_eps))
+                echo "$percent|${completed}/${total_eps}"
+              else
+                echo "0|0/0"
+              fi
+            else
+              echo "0|0/0"
+            fi
+          }
+          
+          # Function to calculate ETA
+          calculate_eta() {
+            local current=$1
+            local total=$2
+            local elapsed_seconds=$3
+            
+            if [ "$current" = "0" ] || [ "$total" = "0" ]; then
+              echo "Calculating..."
+              return
+            fi
+            
+            local percent=$(echo "scale=2; ($current / $total) * 100" | bc 2>/dev/null || echo "0")
+            if [ "$(echo "$percent > 0" | bc)" = "0" ]; then
+              echo "Calculating..."
+              return
+            fi
+            
+            local remaining_percent=$(echo "scale=2; 100 - $percent" | bc 2>/dev/null || echo "0")
+            if [ "$(echo "$remaining_percent <= 0" | bc)" = "1" ]; then
+              echo "0s"
+              return
+            fi
+            
+            local elapsed_seconds_float=$(echo "$elapsed_seconds" | bc -l 2>/dev/null || echo "1")
+            local rate=$(echo "scale=2; $current / $elapsed_seconds_float" | bc -l 2>/dev/null || echo "1")
+            if [ "$(echo "$rate < 0.001" | bc)" = "1" ]; then
+              echo "Calculating..."
+              return
+            fi
+            
+            local remaining_mb=$(echo "scale=2; $total - $current" | bc -l 2>/dev/null || echo "0")
+            local eta_seconds=$(echo "scale=0; $remaining_mb / $rate" | bc -l 2>/dev/null || echo "0")
+            
+            if [ "$eta_seconds" -lt 1 ]; then
+              echo "0s"
+            elif [ "$eta_seconds" -lt 60 ]; then
+              echo "${eta_seconds}s"
+            elif [ "$eta_seconds" -lt 3600 ]; then
+              local minutes=$((eta_seconds / 60))
+              local seconds=$((eta_seconds % 60))
+              echo "${minutes}m ${seconds}s"
+            else
+              local hours=$((eta_seconds / 3600))
+              local minutes=$(((eta_seconds % 3600) / 60))
+              echo "${hours}h ${minutes}m"
+            fi
+          }
+          
+          # Function to get current episode
+          get_current_episode() {
+            if [ -f "episode_upload.log" ]; then
+              local current=$(grep "STARTING_EP_" episode_upload.log 2>/dev/null | tail -1 | grep -oE "[0-9]+" | head -1)
+              if [ -n "$current" ]; then
+                echo "$current"
+              else
+                echo "-"
+              fi
+            else
+              echo "-"
+            fi
+          }
+          
+          # Main monitoring loop
+          START_TIME=$(date +%s)
+          MERGED_COMPLETE=false
+          EPISODES_COMPLETE=false
+          
+          echo ""
+          echo "🔄 Monitoring upload progress..."
+          echo "   (Updates every 5 seconds)"
+          echo ""
+          
+          while true; do
+            clear 2>/dev/null || printf "\033c" 2>/dev/null || echo ""
+            
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            
+            # Format elapsed time
+            if [ $ELAPSED -lt 60 ]; then
+              ELAPSED_STR="${ELAPSED}s"
+            elif [ $ELAPSED -lt 3600 ]; then
+              ELAPSED_STR="$((ELAPSED / 60))m $((ELAPSED % 60))s"
+            else
+              ELAPSED_STR="$((ELAPSED / 3600))h $(((ELAPSED % 3600) / 60))m"
+            fi
+            
+            echo "╔══════════════════════════════════════════════════════════════╗"
+            echo "║           📤 UPLOAD PROGRESS MONITOR                        ║"
+            echo "╠══════════════════════════════════════════════════════════════╣"
+            echo "║ ⏱️  Elapsed Time: $(printf "%-40s" "$ELAPSED_STR")║"
+            echo "║                                                              ║"
+            
+            # Merged Upload Progress
+            MERGED_PROGRESS=$(get_merged_progress)
+            MERGED_PERCENT=$(echo "$MERGED_PROGRESS" | cut -d'|' -f1)
+            MERGED_DATA=$(echo "$MERGED_PROGRESS" | cut -d'|' -f2)
+            
+            if [ "$MERGED_DATA" = "complete" ]; then
+              MERGED_COMPLETE=true
+              echo "║ 📹 Merged Video:                                        ║"
+              echo "║    Status: ✅ COMPLETE                                   ║"
+              echo "║    Progress: 100%                                       ║"
+              BAR_LENGTH=40
+              BAR=""
+              for ((i=0; i<$BAR_LENGTH; i++)); do BAR="${BAR}█"; done
+              echo "║    [${BAR}] ║"
+              echo "║                                                              ║"
+            elif [ "$MERGED_PERCENT" != "0" ] && [ "$MERGED_PERCENT" != "100" ]; then
+              echo "║ 📹 Merged Video:                                        ║"
+              echo "║    Progress: $(printf "%-51s" "${MERGED_PERCENT}%")║"
+              
+              # Create progress bar
+              BAR_LENGTH=40
+              FILLED=$(echo "scale=0; ($MERGED_PERCENT * $BAR_LENGTH) / 100" | bc 2>/dev/null || echo "0")
+              BAR=""
+              for ((i=0; i<$FILLED && i<$BAR_LENGTH; i++)); do BAR="${BAR}█"; done
+              for ((i=$FILLED; i<$BAR_LENGTH; i++)); do BAR="${BAR}░"; done
+              echo "║    [${BAR}] ║"
+              
+              # ETA calculation
+              if [[ "$MERGED_DATA" == *"/"* ]]; then
+                UPLOADED=$(echo "$MERGED_DATA" | cut -d'/' -f1)
+                TOTAL=$(echo "$MERGED_DATA" | cut -d'/' -f2)
+                
+                if [[ "$UPLOADED" =~ ^[0-9.]+$ ]] && [[ "$TOTAL" =~ ^[0-9.]+$ ]]; then
+                  ETA=$(calculate_eta "$UPLOADED" "$TOTAL" "$ELAPSED")
+                  SPEED=$(echo "scale=2; $UPLOADED / $ELAPSED" | bc -l 2>/dev/null || echo "0")
+                  if [ "$SPEED" != "0" ] && [ "$SPEED" != ".00" ]; then
+                    echo "║    Speed: $(printf "%-49s" "${SPEED} MB/s")║"
+                  fi
+                  echo "║    ETA: $(printf "%-51s" "$ETA")║"
+                fi
+              fi
+              echo "║                                                              ║"
+            else
+              echo "║ 📹 Merged Video: Starting...                             ║"
+              echo "║                                                              ║"
+            fi
+            
+            # Episode Upload Progress
+            echo "║ 📺 Single Episodes:                                        ║"
+            
+            EP_PROGRESS=$(get_episode_progress)
+            EP_PERCENT=$(echo "$EP_PROGRESS" | cut -d'|' -f1)
+            EP_DATA=$(echo "$EP_PROGRESS" | cut -d'|' -f2)
+            
+            if [ "$EP_DATA" = "complete" ]; then
+              EPISODES_COMPLETE=true
+              echo "║    Status: ✅ COMPLETE                                     ║"
+              BAR_LENGTH=40
+              BAR=""
+              for ((i=0; i<$BAR_LENGTH; i++)); do BAR="${BAR}█"; done
+              echo "║    [${BAR}] ║"
+            else
+              TOTAL_EPISODES=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
+              COMPLETED=$(echo "$EP_DATA" | cut -d'/' -f1 2>/dev/null || echo "0")
+              
+              if [ "$TOTAL_EPISODES" -gt 0 ]; then
+                echo "║    Progress: $(printf "%-51s" "${EP_PERCENT}% (${COMPLETED}/${TOTAL_EPISODES} episodes)")║"
+                
+                # Create progress bar
+                BAR_LENGTH=40
+                FILLED=$((EP_PERCENT * BAR_LENGTH / 100))
+                BAR=""
+                for ((i=0; i<$FILLED && i<$BAR_LENGTH; i++)); do BAR="${BAR}█"; done
+                for ((i=$FILLED; i<$BAR_LENGTH; i++)); do BAR="${BAR}░"; done
+                echo "║    [${BAR}] ║"
+                
+                # Get current episode
+                CURRENT_EP=$(get_current_episode)
+                if [ "$CURRENT_EP" != "-" ]; then
+                  echo "║    Current: Episode $(printf "%-42s" "$CURRENT_EP")║"
+                fi
+                
+                # ETA for episodes
+                if [ "$COMPLETED" -gt 0 ] && [ "$ELAPSED" -gt 10 ]; then
+                  AVG_TIME_PER_EP=$((ELAPSED / COMPLETED))
+                  REMAINING=$((TOTAL_EPISODES - COMPLETED))
+                  ETA_SECONDS=$((AVG_TIME_PER_EP * REMAINING))
+                  if [ $ETA_SECONDS -lt 60 ]; then
+                    EP_ETA="${ETA_SECONDS}s"
+                  elif [ $ETA_SECONDS -lt 3600 ]; then
+                    EP_ETA="$((ETA_SECONDS / 60))m $((ETA_SECONDS % 60))s"
+                  else
+                    EP_ETA="$((ETA_SECONDS / 3600))h $(((ETA_SECONDS % 3600) / 60))m"
+                  fi
+                  echo "║    ETA: $(printf "%-51s" "$EP_ETA")║"
+                fi
+              else
+                echo "║    Status: No episodes found                             ║"
+              fi
+            fi
+            echo "║                                                              ║"
+            echo "╚══════════════════════════════════════════════════════════════╝"
+            
+            # Check if both uploads are complete
+            if [ "$MERGED_COMPLETE" = true ] && [ "$EPISODES_COMPLETE" = true ]; then
+              echo ""
+              echo "✅ ALL UPLOADS COMPLETED!"
+              echo ""
+              break
+            fi
+            
+            # Check for errors (brief check)
+            if [ -f "merged_upload.log" ]; then
+              if tail -20 merged_upload.log 2>/dev/null | grep -q "❌"; then
+                echo ""
+                echo "⚠️  Warning: Possible errors detected in merged upload log"
+                echo "   Check merged_upload.log for details"
+              fi
+            fi
+            
+            sleep 5
+          done
+          
+          echo "========================================="
+          echo "✅ ALL UPLOADS COMPLETED SUCCESSFULLY!"
+          echo "========================================="
+          
+          # Show final logs
+          if [ -f "merged_upload.log" ]; then
+            echo ""
+            echo "📋 Final merged upload log:"
+            echo "========================================="
+            tail -20 merged_upload.log
+            echo "========================================="
           fi
           
           echo ""
+          echo "📊 Upload Summary:"
           echo "========================================="
-          echo "✅ ALL UPLOADS COMPLETED SUCCESSFULLY!"
+          echo "⏱️  Total Time: $ELAPSED_STR"
+          
+          # Get final merged file size
+          if [ -f "merged_progress.log" ]; then
+            FINAL_SIZE=$(grep -E "[0-9]+\.[0-9]+/[0-9]+\.[0-9]+ MB" merged_progress.log | tail -1 | grep -oE "[0-9.]+\/[0-9.]+ MB" | tail -1)
+            if [ -n "$FINAL_SIZE" ]; then
+              echo "📹 Merged Video Size: $FINAL_SIZE"
+            fi
+          fi
+          
+          EP_COUNT=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
+          if [ -f "single_episodes_complete.txt" ]; then
+            echo "📺 Episodes Uploaded: $EP_COUNT"
+          fi
+          
+          # Calculate total uploaded
+          echo "========================================="
+          if [ -f "single_episodes_complete.txt" ] && [ -f "merged_progress.log" ] && grep -q "UPLOAD_COMPLETE" merged_progress.log; then
+            echo "🎉 All uploads completed successfully!"
+          fi
           echo "========================================="
 
       - name: Cleanup - Delete Workflow Run if Successful
