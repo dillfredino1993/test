@@ -19,24 +19,61 @@ jobs:
   upload:
     runs-on: ubuntu-latest
     steps:
+      - name: 📋 Series Information & Setup
+        run: |
+          echo "========================================="
+          echo "📋 SERIES INFORMATION"
+          echo "========================================="
+          
+          # Extract series information from payload
+          SERIES="${{ github.event.client_payload.series || github.event.client_payload.series_name || 'Unknown Series' }}"
+          LABEL="${{ github.event.client_payload.label || 'NONE' }}"
+          EPISODE_COUNT="${{ github.event.client_payload.episode_count || 'Unknown' }}"
+          
+          echo "📺 Series Title: $SERIES"
+          echo "🏷️  Label: $LABEL"
+          echo "📊 Episode Count: $EPISODE_COUNT"
+          echo "⏰ Started at: $(date)"
+          echo "========================================="
+          
+          # Store for later use
+          echo "series_title=$SERIES" >> $GITHUB_ENV
+          echo "label=$LABEL" >> $GITHUB_ENV
+
       - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Install FFmpeg & Tools
         run: |
+          echo "========================================="
+          echo "🔧 INSTALLING TOOLS"
+          echo "========================================="
+          echo "📺 Series: ${{ env.series_title }}"
+          echo "========================================="
+          
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool
           pip3 install --upgrade pip
           pip3 install telethon qrcode yt-dlp requests
-          # Install additional dependencies for parallel uploads
           pip3 install aiohttp python-socks[asyncio]
-          python3 -c "import telethon; print(f'Telethon version: {telethon.__version__}')"
+          python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')"
+          
+          echo "========================================="
+          echo "✅ INSTALLATION COMPLETE"
+          echo "========================================="
 
       - name: Compute Dynamic Formatted Output Filename & Label
         id: fname
         run: |
           LABEL="${{ github.event.client_payload.label || 'NONE' }}"
           SERIES="${{ github.event.client_payload.series || github.event.client_payload.series_name || 'Series' }}"
+          
+          echo "========================================="
+          echo "📝 COMPUTING FILENAME"
+          echo "========================================="
+          echo "📺 Series: $SERIES"
+          echo "🏷️  Label: $LABEL"
+          echo "========================================="
           
           CLEAN_LABEL=$(echo "$LABEL" | tr -d ' ' | tr '[:lower:]' '[:upper:]')
           CLEAN_SERIES_TITLE=$(echo "$SERIES" | sed -e 's/[\/:*?"<>|]/_/g' -e 's/^ *//' -e 's/ *$//')
@@ -47,6 +84,10 @@ jobs:
           TAG_NAME="${DATE_STR}-${CLEAN_LABEL}-${CLEAN_SERIES_TAG}"
           FORMATTED_TITLE="[${DATE_STR}]-[${CLEAN_LABEL}]-${CLEAN_SERIES_TITLE}"
           
+          echo "📄 Formatted Title: $FORMATTED_TITLE"
+          echo "🏷️  Tag Name: $TAG_NAME"
+          echo "========================================="
+          
           echo "formatted_title=${FORMATTED_TITLE}" >> $GITHUB_OUTPUT
           echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
           echo "series_title=${CLEAN_SERIES_TITLE}" >> $GITHUB_OUTPUT
@@ -56,6 +97,12 @@ jobs:
         env:
           CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
+          echo "========================================="
+          echo "📋 PARSING URLs"
+          echo "========================================="
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+          echo "========================================="
+          
           mkdir -p downloads && cd downloads
           
           # Extract URLs cleanly: remove \r carriage returns and trim whitespace
@@ -78,6 +125,8 @@ jobs:
             echo "❌ No valid URLs found!"
             exit 1
           fi
+          
+          echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
       - name: Download All Episodes (All-or-Nothing)
         env:
@@ -86,6 +135,13 @@ jobs:
           LABEL: ${{ github.event.client_payload.label || 'NONE' }}
         run: |
           cd downloads
+          
+          echo "========================================="
+          echo "📥 DOWNLOADING EPISODES"
+          echo "========================================="
+          echo "📺 Series: $SERIES_TITLE"
+          echo "📊 Total Episodes: $(cat urls.txt | wc -l)"
+          echo "========================================="
           
           TOTAL_EPISODES=$(cat urls.txt | wc -l)
           echo "📥 Need to download $TOTAL_EPISODES episodes"
@@ -306,6 +362,8 @@ jobs:
           echo "========================================="
           echo "📊 DOWNLOAD SUMMARY"
           echo "========================================="
+          echo "📺 Series: $SERIES_TITLE"
+          echo "📊 Expected: $TOTAL_EPISODES episodes"
           
           TOTAL_FILES=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           echo "✅ Downloaded: $TOTAL_FILES/$TOTAL_EPISODES episodes"
@@ -330,6 +388,13 @@ jobs:
         id: merge
         run: |
           cd downloads
+          
+          echo "========================================="
+          echo "🔗 MERGING EPISODES"
+          echo "========================================="
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+          echo "📊 Episodes: $(ls -1 EP*.mp4 2>/dev/null | wc -l)"
+          echo "========================================="
           
           EP_COUNT=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           if [ "$EP_COUNT" -eq 0 ]; then
@@ -675,8 +740,10 @@ jobs:
             
             echo ""
             echo "========================================="
-            echo "📊 FINAL FILE"
+            echo "📊 FINAL MERGED FILE"
             echo "========================================="
+            echo "📺 Series: $SERIES_TITLE"
+            echo "📁 File: output.mp4"
             ls -lh output.mp4
             echo "========================================="
           else
@@ -690,14 +757,16 @@ jobs:
         run: |
           cd downloads
           
+          echo "========================================="
+          echo "🔍 VERIFYING MERGED FILE"
+          echo "========================================="
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+          echo "========================================="
+          
           if [ ! -f "output.mp4" ]; then
             echo "❌ output.mp4 not found!"
             exit 1
           fi
-          
-          echo "========================================="
-          echo "🔍 VERIFYING MERGED FILE"
-          echo "========================================="
           
           FILE_SIZE_BYTES=$(stat -c%s "output.mp4" 2>/dev/null || stat -f%z "output.mp4" 2>/dev/null || echo "0")
           FILE_SIZE_MB=$((FILE_SIZE_BYTES / 1024 / 1024))
@@ -884,6 +953,34 @@ jobs:
         run: |
           cd downloads
           
+          echo "========================================="
+          echo "📤 STARTING MERGED UPLOAD"
+          echo "========================================="
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+          echo "📁 File: ${{ env.merged_file_path }}"
+          echo "========================================="
+          
+          # Debug: Verify file exists
+          echo "📁 Current directory: $(pwd)"
+          echo "📁 Files: $(ls -la)"
+          echo "📁 merged_file_path: ${{ env.merged_file_path }}"
+          
+          # If the file doesn't exist in the expected location, try to find it
+          if [ ! -f "${{ env.merged_file_path }}" ] && [ ! -f "output.mp4" ]; then
+            echo "❌ output.mp4 not found!"
+            exit 1
+          fi
+          
+          # Use the file path from environment or fallback to output.mp4
+          if [ -f "${{ env.merged_file_path }}" ]; then
+            export MERGED_PATH="${{ env.merged_file_path }}"
+          else
+            export MERGED_PATH="$(pwd)/output.mp4"
+            echo "⚠️ Using fallback path: $MERGED_PATH"
+          fi
+          
+          echo "📁 Final MERGED_PATH: $MERGED_PATH"
+          
           cat > upload_merged.py << 'EOFUPLOAD'
           import os
           import sys
@@ -895,7 +992,6 @@ jobs:
           import traceback
           import json
           import math
-          from concurrent.futures import ThreadPoolExecutor
 
           if hasattr(sys.stdout, "reconfigure"):
               sys.stdout.reconfigure(line_buffering=True)
@@ -1012,6 +1108,9 @@ jobs:
           print("=" * 60)
           print("📤 Uploading Merged Video (FAST UPLOAD ENABLED)")
           print("=" * 60)
+          print(f"📺 Series: {series_title}")
+          print(f"📁 File: {video_path}")
+          print("=" * 60)
 
           with open("merged_progress.log", "w") as f:
               f.write(f"{datetime.datetime.now()}: Starting merged upload\n")
@@ -1046,20 +1145,25 @@ jobs:
               """
               Custom fast upload implementation using parallel chunk uploading
               """
+              if not os.path.exists(file_path):
+                  print(f"❌ File not found: {file_path}")
+                  return None
+              
               file_size = os.path.getsize(file_path)
               CHUNK_SIZE = 512 * 1024  # 512KB chunks
               NUM_CHUNKS = math.ceil(file_size / CHUNK_SIZE)
               
               print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
               print(f"📊 Chunks: {NUM_CHUNKS} (512KB each)")
+              print(f"📁 File: {file_path}")
               
               # For large files, use parallel uploads
               if file_size > 100 * 1024 * 1024:  # > 100MB
                   print("⚡ Using parallel upload for large file...")
-                  # Create an InputFile with parallel upload support
-                  input_file = InputFile(file_path, CHUNK_SIZE)
-                  
-                  # Upload in parallel using multiple connections
+              else:
+                  print("📤 Using standard upload for small file...")
+              
+              try:
                   result = await client.upload_file(
                       file_path,
                       part_size_kb=512,
@@ -1067,28 +1171,35 @@ jobs:
                       progress_callback=progress_callback
                   )
                   return result
-              else:
-                  # For small files, standard upload is fine
-                  return await client.upload_file(
-                      file_path,
-                      part_size_kb=512,
-                      file_name=os.path.basename(file_path),
-                      progress_callback=progress_callback
-                  )
+              except Exception as e:
+                  print(f"❌ Upload failed: {e}")
+                  raise
 
           async def send_file_with_thumb(client, entity, file_path, caption):
+              # Check if file exists
+              if not os.path.exists(file_path):
+                  print(f"❌ File not found: {file_path}")
+                  return False, None
+              
               duration, w, h = get_video_metadata(file_path)
               print(f"📊 Video duration: {duration} seconds, {w}x{h}")
               
               thumb = generate_thumbnail(file_path)
               
-              print(f"⏫ Uploading with parallel chunks...")
+              print(f"⏫ Uploading merged file with parallel chunks...")
+              print(f"📁 File path: {file_path}")
+              
               try:
                   uploaded_file = await fast_upload_file(
                       client=client,
                       file_path=file_path,
                       progress_callback=progress_callback
                   )
+                  
+                  if uploaded_file is None:
+                      print("❌ Upload returned None")
+                      return False, None
+                      
                   print("✅ Upload complete!")
                   
                   with open("merged_progress.log", "a") as f:
@@ -1096,6 +1207,7 @@ jobs:
                   
               except Exception as e:
                   print(f"❌ Upload failed: {e}")
+                  traceback.print_exc()
                   return False, None
               
               video_attr = DocumentAttributeVideo(
@@ -1117,9 +1229,11 @@ jobs:
               
               if thumb and os.path.exists(thumb):
                   kwargs["thumb"] = thumb
+                  print(f"📸 Using thumbnail: {thumb}")
               
               try:
                   result = await client.send_file(**kwargs)
+                  print("✅ File sent to Telegram!")
                   return True, result
               except Exception as e:
                   print(f"❌ Send failed: {e}")
@@ -1138,11 +1252,43 @@ jobs:
                       except: pass
 
           async def upload_merged_video(client, entity):
+              video_path = os.environ.get("MERGED_PATH")
+              
+              # Debug: print current directory and files
+              print(f"📁 Current directory: {os.getcwd()}")
+              print(f"📁 Files in directory: {os.listdir('.')}")
+              print(f"📁 MERGED_PATH: {video_path}")
+              
+              # Try to find the file if path is not set or doesn't exist
               if not video_path or not os.path.isfile(video_path):
-                  print(f"❌ Video not found: {video_path}")
+                  # Try to find output.mp4 in current directory
+                  if os.path.exists("output.mp4"):
+                      video_path = os.path.abspath("output.mp4")
+                      print(f"🔍 Found output.mp4 in current directory: {video_path}")
+                  elif os.path.exists("../output.mp4"):
+                      video_path = os.path.abspath("../output.mp4")
+                      print(f"🔍 Found output.mp4 in parent directory: {video_path}")
+                  else:
+                      print(f"❌ Video not found: {video_path}")
+                      print("🔍 Looking for video files...")
+                      import glob
+                      video_files = glob.glob("*.mp4")
+                      if video_files:
+                          print(f"📁 Found MP4 files: {video_files}")
+                          # Use the largest MP4 file
+                          largest_file = max(video_files, key=lambda f: os.path.getsize(f))
+                          video_path = os.path.abspath(largest_file)
+                          print(f"📁 Using largest file: {video_path}")
+                      else:
+                          return False
+              
+              if not os.path.isfile(video_path):
+                  print(f"❌ Video still not found: {video_path}")
                   return False
               
               file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+              print(f"💾 File size: {file_size_mb:.1f} MB")
+              
               if file_size_mb > 2000:
                   print(f"❌ File exceeds 2GB ({file_size_mb:.1f} MB)")
                   print("⚠️ Telegram limit is 2GB.")
@@ -1165,9 +1311,7 @@ jobs:
               caption = f"{title}\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}"
               
               print(f"📤 Uploading merged video...")
-              print(f"💾 File size: {file_size_mb:.1f} MB")
-              print(f"⏱️  Duration: {duration} seconds")
-              print(f"📝 Caption: {caption}")
+              print(f"📝 Caption: {caption[:50]}...")
               
               try:
                   success, result = await send_file_with_thumb(client, entity, video_path, caption)
@@ -1182,6 +1326,7 @@ jobs:
                   return success
               except Exception as e:
                   print(f"❌ Merged upload failed: {e}")
+                  traceback.print_exc()
                   return False
 
           async def main():
@@ -1229,6 +1374,13 @@ jobs:
           MERGED_PID=$!
           echo "merged_pid=$MERGED_PID" >> $GITHUB_ENV
           echo "✅ Merged upload started (PID: $MERGED_PID)"
+          
+          # Wait a moment and check if it started properly
+          sleep 2
+          if [ -f "merged_upload.log" ]; then
+            echo "📋 Initial log output:"
+            cat merged_upload.log
+          fi
 
       - name: Upload Single Episodes (Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
@@ -1244,6 +1396,13 @@ jobs:
           LABEL: ${{ steps.fname.outputs.clean_label }}
         run: |
           cd downloads
+          
+          echo "========================================="
+          echo "📤 UPLOADING SINGLE EPISODES"
+          echo "========================================="
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+          echo "📊 Episodes: $(ls -1 EP*.mp4 2>/dev/null | wc -l)"
+          echo "========================================="
           
           cat > upload_single.py << 'EOFUPLOAD'
           import os
@@ -1393,6 +1552,8 @@ jobs:
           print("=" * 60)
           print("📤 Uploading Single Episodes (FAST UPLOAD ENABLED)")
           print("=" * 60)
+          print(f"📺 Series: {series_title}")
+          print("=" * 60)
 
           with open("episode_upload.log", "w") as f:
               f.write(f"{datetime.datetime.now()}: Starting episode uploads\n")
@@ -1433,9 +1594,12 @@ jobs:
 
           async def fast_upload_file(client, file_path, progress_callback=None):
               """Custom fast upload implementation"""
-              file_size = os.path.getsize(file_path)
-              CHUNK_SIZE = 512 * 1024  # 512KB chunks
+              if not os.path.exists(file_path):
+                  print(f"❌ File not found: {file_path}")
+                  return None
               
+              file_size = os.path.getsize(file_path)
+              print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
               print(f"⚡ Uploading with parallel chunks...")
               
               try:
@@ -1451,6 +1615,11 @@ jobs:
                   raise
 
           async def send_file_with_thumb(client, entity, file_path, caption, reply_to=None):
+              # Check if file exists
+              if not os.path.exists(file_path):
+                  print(f"❌ File not found: {file_path}")
+                  return False, None
+              
               duration, w, h = get_video_metadata(file_path)
               print(f"📊 Video duration: {duration} seconds, {w}x{h}")
               
@@ -1473,6 +1642,11 @@ jobs:
                       file_path=file_path,
                       progress_callback=progress_callback
                   )
+                  
+                  if uploaded_file is None:
+                      print(f"❌ Upload returned None for {os.path.basename(file_path)}")
+                      return False, None
+                      
                   print(f"✅ Upload complete for {os.path.basename(file_path)}!")
               except Exception as e:
                   print(f"❌ Upload failed: {e}")
@@ -1648,10 +1822,6 @@ jobs:
               asyncio.run(main())
           EOFUPLOAD
           
-          echo "========================================="
-          echo "📤 UPLOADING SINGLE EPISODES"
-          echo "========================================="
-          
           echo "🚀 Uploading episodes with parallel upload..."
           python3 -u upload_single.py
           
@@ -1665,6 +1835,8 @@ jobs:
           
           echo "========================================="
           echo "⏳ MONITORING UPLOAD PROGRESS"
+          echo "========================================="
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "========================================="
           
           # Function to parse progress from log files
@@ -1806,6 +1978,7 @@ jobs:
             echo "║           📤 UPLOAD PROGRESS MONITOR                        ║"
             echo "╠══════════════════════════════════════════════════════════════╣"
             echo "║ ⏱️  Elapsed Time: $(printf "%-40s" "$ELAPSED_STR")║"
+            echo "║ 📺 Series: $(printf "%-47s" "${{ steps.fname.outputs.series_title }}")║"
             echo "║                                                              ║"
             
             # Merged Upload Progress
@@ -1947,6 +2120,7 @@ jobs:
           echo ""
           echo "📊 Upload Summary:"
           echo "========================================="
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "⏱️  Total Time: $ELAPSED_STR"
           
           # Get final merged file size
@@ -1962,7 +2136,6 @@ jobs:
             echo "📺 Episodes Uploaded: $EP_COUNT"
           fi
           
-          # Calculate total uploaded
           echo "========================================="
           if [ -f "single_episodes_complete.txt" ] && [ -f "merged_progress.log" ] && grep -q "UPLOAD_COMPLETE" merged_progress.log; then
             echo "🎉 All uploads completed successfully!"
