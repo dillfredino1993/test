@@ -168,6 +168,185 @@ jobs:
               except:
                   return False, None
           
+          def compress_video(file_path, target_size_mb=80):
+              """Compress video to target size using FFmpeg with improved quality"""
+              print(f"  🔧 Compressing: {os.path.basename(file_path)} to < {target_size_mb}MB")
+              
+              file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+              if file_size_mb <= target_size_mb:
+                  print(f"  ✅ File already under {target_size_mb}MB ({file_size_mb:.1f}MB)")
+                  return True
+              
+              # Get video duration
+              try:
+                  cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+                  duration = float(subprocess.check_output(cmd, text=True).strip())
+                  
+                  if duration == 0:
+                      cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
+                      duration_str = subprocess.check_output(cmd, text=True).strip()
+                      duration = float(duration_str) / 1000 if duration_str else 0
+              except:
+                  duration = 0
+              
+              if duration <= 0:
+                  print("  ⚠️ Could not determine duration, using default compression")
+                  crf_value = 28
+              else:
+                  # Calculate bitrate to achieve target size
+                  # target_size_mb * 8 (bits) / duration (seconds)
+                  target_bitrate = (target_size_mb * 8 * 1024) / duration
+                  
+                  # Cap bitrate for quality preservation
+                  if target_bitrate > 2000:
+                      target_bitrate = 2000
+                  elif target_bitrate < 500:
+                      target_bitrate = 500
+                  
+                  # Determine CRF based on bitrate
+                  if target_bitrate >= 1500:
+                      crf_value = 23
+                  elif target_bitrate >= 1000:
+                      crf_value = 26
+                  elif target_bitrate >= 700:
+                      crf_value = 28
+                  else:
+                      crf_value = 30
+              
+              base_name = os.path.splitext(file_path)[0]
+              temp_file = f"{base_name}_compressed.mp4"
+              
+              print(f"  📊 Duration: {duration:.1f}s, Target bitrate: {target_bitrate:.0f}k, CRF: {crf_value}")
+              
+              # First attempt: CRF encoding (better quality)
+              cmd = [
+                  "ffmpeg", "-y",
+                  "-i", file_path,
+                  "-c:v", "libx264",
+                  "-preset", "medium",
+                  "-crf", str(crf_value),
+                  "-c:a", "aac",
+                  "-b:a", "128k",
+                  "-ar", "44100",
+                  "-movflags", "+faststart",
+                  "-metadata", f"title={os.environ.get('TITLE', '')}",
+                  "-metadata", f"series={os.environ.get('SERIES_TITLE', '')}",
+                  "-metadata", f"label={os.environ.get('LABEL', '')}",
+                  temp_file
+              ]
+              
+              try:
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                  
+                  if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                      new_size_mb = os.path.getsize(temp_file) / (1024 * 1024)
+                      print(f"  ✅ CRF compression complete: {new_size_mb:.1f}MB")
+                      
+                      if new_size_mb <= target_size_mb:
+                          shutil.move(temp_file, file_path)
+                          return True
+                      else:
+                          print(f"  ⚠️ CRF compression still too large ({new_size_mb:.1f}MB > {target_size_mb}MB)")
+                          
+                          # Try two-pass encoding for better control
+                          print("  🔧 Trying two-pass encoding...")
+                          return compress_two_pass(file_path, target_size_mb, duration)
+                  else:
+                      print(f"  ❌ CRF compression failed: {result.stderr[:200]}")
+                      return False
+              except subprocess.TimeoutExpired:
+                  print("  ❌ CRF compression timeout")
+                  return False
+              finally:
+                  if os.path.exists(temp_file):
+                      try: os.remove(temp_file)
+                      except: pass
+          
+          def compress_two_pass(file_path, target_size_mb, duration):
+              """Two-pass VBR encoding for better size control"""
+              if duration <= 0:
+                  return False
+              
+              # Slightly under target to account for overhead
+              target_bitrate = ((target_size_mb * 0.9) * 8 * 1024) / duration
+              
+              if target_bitrate < 400:
+                  target_bitrate = 400
+              elif target_bitrate > 2500:
+                  target_bitrate = 2500
+              
+              base_name = os.path.splitext(file_path)[0]
+              temp_file = f"{base_name}_2pass.mp4"
+              
+              print(f"  📊 Two-pass: {target_bitrate:.0f}k bitrate")
+              
+              # Pass 1 - Analysis
+              cmd_pass1 = [
+                  "ffmpeg", "-y",
+                  "-i", file_path,
+                  "-c:v", "libx264",
+                  "-b:v", f"{target_bitrate:.0f}k",
+                  "-preset", "medium",
+                  "-pass", "1",
+                  "-an",  # No audio in first pass
+                  "-f", "null",
+                  "/dev/null"
+              ]
+              
+              # Pass 2 - Encoding
+              cmd_pass2 = [
+                  "ffmpeg", "-y",
+                  "-i", file_path,
+                  "-c:v", "libx264",
+                  "-b:v", f"{target_bitrate:.0f}k",
+                  "-preset", "medium",
+                  "-pass", "2",
+                  "-c:a", "aac",
+                  "-b:a", "128k",
+                  "-ar", "44100",
+                  "-movflags", "+faststart",
+                  "-metadata", f"title={os.environ.get('TITLE', '')}",
+                  "-metadata", f"series={os.environ.get('SERIES_TITLE', '')}",
+                  "-metadata", f"label={os.environ.get('LABEL', '')}",
+                  temp_file
+              ]
+              
+              try:
+                  print("  🔄 Pass 1/2...")
+                  subprocess.run(cmd_pass1, capture_output=True, text=True, timeout=300, check=True)
+                  
+                  print("  🔄 Pass 2/2...")
+                  subprocess.run(cmd_pass2, capture_output=True, text=True, timeout=600, check=True)
+                  
+                  if os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                      new_size_mb = os.path.getsize(temp_file) / (1024 * 1024)
+                      print(f"  ✅ Two-pass compression complete: {new_size_mb:.1f}MB")
+                      
+                      if new_size_mb <= target_size_mb:
+                          shutil.move(temp_file, file_path)
+                          return True
+                      else:
+                          print(f"  ⚠️ Still too large: {new_size_mb:.1f}MB > {target_size_mb}MB")
+                          # Keep the compressed file anyway if it's smaller than original
+                          if new_size_mb < os.path.getsize(file_path) / (1024 * 1024):
+                              shutil.move(temp_file, file_path)
+                              return True
+                          return False
+                  
+                  return False
+              except subprocess.TimeoutExpired:
+                  print("  ❌ Two-pass encoding timeout")
+                  return False
+              except subprocess.CalledProcessError as e:
+                  print(f"  ❌ Two-pass encoding error: {e}")
+                  return False
+              finally:
+                  # Clean up pass files
+                  for f in ["ffmpeg2pass-0.log", "ffmpeg2pass-0.log.mbtree"]:
+                      if os.path.exists(f):
+                          try: os.remove(f)
+                          except: pass
+          
           def repair_mp4(file_path):
               print("  🔧 Attempting repair...")
               
@@ -229,34 +408,90 @@ jobs:
               
               return False
           
-          def main():
-              file_path = sys.argv[1]
-              
+          def process_video(file_path, max_size_mb=80):
+              """Process video: verify, repair, compress if needed"""
               if not os.path.exists(file_path):
                   print(f"ERROR: File not found: {file_path}")
-                  sys.exit(1)
+                  return False
               
+              file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+              print(f"📊 Original size: {file_size_mb:.1f}MB")
+              
+              # First verify
               is_valid, video_track = check_with_mediainfo(file_path)
               
-              if is_valid and video_track:
-                  print("  ✅ Valid file")
-                  print(f"  📐 {video_track.get('Width', 'N/A')}x{video_track.get('Height', 'N/A')}")
-                  print(f"  🎞️  {video_track.get('CodecID', 'N/A')}")
-                  sys.exit(0)
-              else:
+              if not is_valid:
                   print("  ⚠️ Invalid file, attempting repair...")
-                  
-                  if repair_mp4(file_path):
-                      is_valid, _ = check_with_mediainfo(file_path)
-                      if is_valid:
-                          print("  ✅ Successfully repaired!")
-                          sys.exit(0)
-                      else:
-                          print("  ❌ Repair failed")
-                          sys.exit(1)
-                  else:
+                  if not repair_mp4(file_path):
                       print("  ❌ Repair failed")
-                      sys.exit(1)
+                      return False
+                  is_valid, video_track = check_with_mediainfo(file_path)
+                  if not is_valid:
+                      print("  ❌ File still invalid after repair")
+                      return False
+              
+              # Check size and compress if needed
+              file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+              if file_size_mb > max_size_mb:
+                  print(f"  ⚠️ File exceeds {max_size_mb}MB ({file_size_mb:.1f}MB)")
+                  
+                  # Try compression
+                  if compress_video(file_path, max_size_mb):
+                      final_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                      print(f"  ✅ Compression successful: {final_size_mb:.1f}MB")
+                  else:
+                      print(f"  ❌ Compression failed, file remains {file_size_mb:.1f}MB")
+                      
+                      # Final attempt: use very aggressive compression
+                      print("  🔧 Attempting aggressive compression...")
+                      base_name = os.path.splitext(file_path)[0]
+                      temp_file = f"{base_name}_agg.mp4"
+                      
+                      cmd = [
+                          "ffmpeg", "-y",
+                          "-i", file_path,
+                          "-c:v", "libx264",
+                          "-preset", "fast",
+                          "-crf", "32",
+                          "-c:a", "aac",
+                          "-b:a", "96k",
+                          "-ar", "44100",
+                          "-movflags", "+faststart",
+                          "-metadata", f"title={os.environ.get('TITLE', '')}",
+                          "-metadata", f"series={os.environ.get('SERIES_TITLE', '')}",
+                          "-metadata", f"label={os.environ.get('LABEL', '')}",
+                          temp_file
+                      ]
+                      
+                      try:
+                          subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=True)
+                          if os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                              new_size_mb = os.path.getsize(temp_file) / (1024 * 1024)
+                              if new_size_mb < file_size_mb:
+                                  shutil.move(temp_file, file_path)
+                                  print(f"  ✅ Aggressive compression: {new_size_mb:.1f}MB")
+                              else:
+                                  os.remove(temp_file)
+                      except:
+                          pass
+              
+              # Final verification
+              is_valid, video_track = check_with_mediainfo(file_path)
+              if is_valid and video_track:
+                  print(f"  ✅ Final check passed")
+                  print(f"  📐 {video_track.get('Width', 'N/A')}x{video_track.get('Height', 'N/A')}")
+                  print(f"  💾 {os.path.getsize(file_path) / (1024*1024):.1f}MB")
+                  return True
+              else:
+                  print("  ❌ Final verification failed")
+                  return False
+          
+          def main():
+              file_path = sys.argv[1]
+              max_size = int(sys.argv[2]) if len(sys.argv) > 2 else 80
+              
+              success = process_video(file_path, max_size)
+              sys.exit(0 if success else 1)
           
           if __name__ == "__main__":
               main()
@@ -264,6 +499,7 @@ jobs:
           
           EP_INDEX=1
           FAILED_EPISODES=""
+          COMPRESSED_EPISODES=""
           
           while IFS= read -u 3 -r URL || [ -n "$URL" ]; do
             URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
@@ -315,10 +551,21 @@ jobs:
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
               
               if [ "$FILE_SIZE" -gt 50000 ]; then
-                echo "🔍 Verifying file..."
+                echo "🔍 Verifying and processing file..."
+                echo "   Max size: 80MB"
                 
-                if python3 verify_and_repair.py "$OUT_FILE" < /dev/null; then
-                  echo "✅ File verified"
+                if python3 verify_and_repair.py "$OUT_FILE" 80 < /dev/null; then
+                  echo "✅ File verified and processed"
+                  
+                  # Check if file was compressed
+                  FINAL_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                  FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
+                  
+                  if [ $FINAL_SIZE_MB -le 80 ]; then
+                    echo "✅ File size: ${FINAL_SIZE_MB}MB (within 80MB limit)"
+                  else
+                    echo "⚠️ File still exceeds 80MB (${FINAL_SIZE_MB}MB), but continuing..."
+                  fi
                   
                   EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
                   
@@ -360,13 +607,24 @@ jobs:
           done 3< urls.txt
           
           echo "========================================="
-          echo "📊 DOWNLOAD SUMMARY"
+          echo "📊 DOWNLOAD & COMPRESSION SUMMARY"
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Expected: $TOTAL_EPISODES episodes"
           
           TOTAL_FILES=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           echo "✅ Downloaded: $TOTAL_FILES/$TOTAL_EPISODES episodes"
+          
+          # Show file sizes after compression
+          echo ""
+          echo "📊 Final episode sizes:"
+          for f in EP*.mp4; do
+            if [ -f "$f" ]; then
+              SIZE_MB=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null | awk '{print $1/1024/1024}')
+              printf "   %-10s: %.1f MB\n" "$f" "$SIZE_MB"
+            fi
+          done
+          echo ""
           
           if [ -n "$FAILED_EPISODES" ]; then
             echo "❌ FAILED EPISODES: $FAILED_EPISODES"
@@ -381,7 +639,7 @@ jobs:
             exit 1
           fi
           
-          echo "✅ All $TOTAL_EPISODES episodes downloaded successfully!"
+          echo "✅ All $TOTAL_EPISODES episodes downloaded and processed successfully!"
           echo "========================================="
 
       - name: Smart Merge Episodes
