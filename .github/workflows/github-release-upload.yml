@@ -128,7 +128,7 @@ jobs:
           
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
-      - name: Download All Episodes (All-or-Nothing)
+      - name: Download & Compress Episodes with NCA Toolkit API
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -137,369 +137,326 @@ jobs:
           cd downloads
           
           echo "========================================="
-          echo "📥 DOWNLOADING EPISODES"
+          echo "📥 DOWNLOADING & COMPRESSING EPISODES"
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Total Episodes: $(cat urls.txt | wc -l)"
           echo "========================================="
           
-          TOTAL_EPISODES=$(cat urls.txt | wc -l)
-          echo "📥 Need to download $TOTAL_EPISODES episodes"
-          
-          # Create verify_and_repair.py
-          cat > verify_and_repair.py << 'EOFVERIFY'
+          # Create NCA Toolkit compression script
+          cat > nca_compress.py << 'EOFNCA'
           import os
           import sys
-          import subprocess
+          import time
           import json
-          import shutil
+          import requests
+          import subprocess
+          from pathlib import Path
           
-          def check_with_mediainfo(file_path):
-              try:
-                  cmd = ["mediainfo", "--Output=JSON", file_path]
-                  result = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
-                  data = json.loads(result)
+          class NCAToolkitCompressor:
+              def __init__(self):
+                  # NCA Toolkit API endpoints
+                  self.base_url = "https://api.ncatoolkit.com"
+                  self.convert_endpoint = f"{self.base_url}/v1/media/convert"
+                  self.process_endpoint = f"{self.base_url}/v1/media/process"
+                  self.status_endpoint = f"{self.base_url}/v1/media/status"
                   
-                  tracks = data.get("media", {}).get("track", [])
-                  for track in tracks:
-                      if track.get("@type") == "Video":
-                          return True, track
-                  return False, None
-              except:
-                  return False, None
+              def compress_video_from_url(self, video_url, target_size_mb=80):
+                  """
+                  Compress video using NCA Toolkit API
+                  Returns path to downloaded compressed file or None on failure
+                  """
+                  print(f"  ☁️ Compressing with NCA Toolkit API...")
+                  
+                  # Generate a unique filename
+                  import hashlib
+                  url_hash = hashlib.md5(video_url.encode()).hexdigest()[:10]
+                  output_filename = f"compressed_{url_hash}_{int(time.time())}.mp4"
+                  
+                  # Prepare the conversion request
+                  payload = {
+                      "input": video_url,
+                      "output": {
+                          "format": "mp4",
+                          "codec": "h264",
+                          "quality": "medium",
+                          "bitrate": f"{target_size_mb * 8}k",
+                          "resolution": "auto"
+                      },
+                      "options": {
+                          "audio_codec": "aac",
+                          "audio_bitrate": "128k",
+                          "optimize_for_streaming": True
+                      }
+                  }
+                  
+                  try:
+                      print(f"  📤 Sending conversion request...")
+                      
+                      # Try the conversion endpoint
+                      response = requests.post(
+                          self.convert_endpoint,
+                          json=payload,
+                          headers={
+                              'Content-Type': 'application/json',
+                              'Accept': 'application/json'
+                          },
+                          timeout=30
+                      )
+                      
+                      if response.status_code == 200:
+                          result = response.json()
+                          
+                          # Check if we have a job ID to poll
+                          job_id = result.get('job_id') or result.get('id') or result.get('jobId')
+                          
+                          if job_id:
+                              print(f"  📋 Job ID: {job_id}")
+                              print(f"  ⏳ Waiting for conversion to complete...")
+                              return self._poll_for_completion(job_id, output_filename)
+                          else:
+                              # Direct response might contain the download URL
+                              download_url = result.get('download_url') or result.get('url') or result.get('output_url')
+                              if download_url:
+                                  print(f"  📥 Downloading converted file...")
+                                  return self._download_file(download_url, output_filename)
+                              else:
+                                  print(f"  ⚠️ No download URL in response")
+                                  return self._try_alt_method(video_url, target_size_mb, output_filename)
+                      else:
+                          print(f"  ⚠️ Conversion endpoint returned {response.status_code}")
+                          return self._try_alt_method(video_url, target_size_mb, output_filename)
+                          
+                  except requests.exceptions.Timeout:
+                      print(f"  ❌ NCA API timeout")
+                      return self._try_alt_method(video_url, target_size_mb, output_filename)
+                  except Exception as e:
+                      print(f"  ❌ NCA API error: {e}")
+                      return self._try_alt_method(video_url, target_size_mb, output_filename)
+                  
+                  return None
+              
+              def _try_alt_method(self, video_url, target_size_mb, output_filename):
+                  """Try alternative processing method"""
+                  print(f"  🔄 Trying alternative processing method...")
+                  
+                  # Try the process endpoint
+                  payload = {
+                      "url": video_url,
+                      "action": "compress",
+                      "format": "mp4",
+                      "quality": "medium",
+                      "max_size_mb": target_size_mb
+                  }
+                  
+                  try:
+                      response = requests.post(
+                          self.process_endpoint,
+                          json=payload,
+                          headers={'Content-Type': 'application/json'},
+                          timeout=30
+                      )
+                      
+                      if response.status_code == 200:
+                          result = response.json()
+                          download_url = result.get('download_url') or result.get('url') or result.get('output_url')
+                          if download_url:
+                              print(f"  📥 Downloading converted file...")
+                              return self._download_file(download_url, output_filename)
+                          else:
+                              # Check if we got a job ID
+                              job_id = result.get('job_id') or result.get('id')
+                              if job_id:
+                                  return self._poll_for_completion(job_id, output_filename)
+                      else:
+                          print(f"  ❌ Alternative method failed: {response.status_code}")
+                          
+                  except Exception as e:
+                      print(f"  ❌ Alternative method error: {e}")
+                  
+                  return None
+              
+              def _poll_for_completion(self, job_id, output_filename, max_attempts=30):
+                  """Poll for job completion"""
+                  status_url = f"{self.status_endpoint}/{job_id}"
+                  
+                  for attempt in range(max_attempts):
+                      try:
+                          response = requests.get(status_url, timeout=10)
+                          
+                          if response.status_code == 200:
+                              status_data = response.json()
+                              status = status_data.get('status', '').lower()
+                              
+                              if status in ['completed', 'done', 'finished', 'success']:
+                                  print(f"  ✅ Conversion completed!")
+                                  download_url = status_data.get('download_url') or status_data.get('url') or status_data.get('output_url')
+                                  if download_url:
+                                      return self._download_file(download_url, output_filename)
+                                  else:
+                                      print(f"  ⚠️ No download URL in completion response")
+                                      return None
+                                      
+                              elif status in ['failed', 'error']:
+                                  error_msg = status_data.get('error', 'Unknown error')
+                                  print(f"  ❌ Conversion failed: {error_msg}")
+                                  return None
+                                  
+                              else:
+                                  # Still processing
+                                  progress = status_data.get('progress', 0)
+                                  print(f"  ⏳ Processing... {progress}% complete")
+                                  
+                          else:
+                              print(f"  ⚠️ Status check returned {response.status_code}")
+                              
+                      except Exception as e:
+                          print(f"  ⚠️ Error checking status: {e}")
+                      
+                      # Wait before polling again
+                      time.sleep(5)
+                  
+                  print(f"  ❌ Conversion timed out after {max_attempts} attempts")
+                  return None
+              
+              def _download_file(self, download_url, output_filename):
+                  """Download the processed file"""
+                  try:
+                      response = requests.get(download_url, stream=True, timeout=300)
+                      
+                      if response.status_code == 200:
+                          total_size = int(response.headers.get('content-length', 0))
+                          
+                          with open(output_filename, 'wb') as f:
+                              downloaded = 0
+                              for chunk in response.iter_content(chunk_size=8192):
+                                  if chunk:
+                                      f.write(chunk)
+                                      downloaded += len(chunk)
+                                      if total_size > 0:
+                                          percent = (downloaded / total_size) * 100
+                                          if int(percent) % 10 == 0:
+                                              print(f"  📥 Downloading... {percent:.0f}%")
+                          
+                          if os.path.exists(output_filename) and os.path.getsize(output_filename) > 0:
+                              file_size = os.path.getsize(output_filename)
+                              file_size_mb = file_size / (1024 * 1024)
+                              print(f"  ✅ Download complete: {file_size_mb:.1f}MB")
+                              return output_filename
+                          else:
+                              print(f"  ❌ Downloaded file is empty or invalid")
+                              return None
+                      else:
+                          print(f"  ❌ Failed to download: {response.status_code}")
+                          return None
+                          
+                  except Exception as e:
+                      print(f"  ❌ Download error: {e}")
+                      return None
           
-          def compress_video(file_path, target_size_mb=80):
-              """Compress video to target size using FFmpeg with improved quality"""
-              print(f"  🔧 Compressing: {os.path.basename(file_path)} to < {target_size_mb}MB")
+          def compress_locally(file_path, target_size_mb=80):
+              """Fallback to local FFmpeg compression"""
+              print(f"  🔧 Using local compression...")
               
-              file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-              if file_size_mb <= target_size_mb:
-                  print(f"  ✅ File already under {target_size_mb}MB ({file_size_mb:.1f}MB)")
-                  return True
-              
-              # Get video duration
               try:
-                  cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+                  # Get video duration
+                  cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", 
+                         "-of", "default=noprint_wrappers=1:nokey=1", file_path]
                   duration = float(subprocess.check_output(cmd, text=True).strip())
                   
-                  if duration == 0:
-                      cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
-                      duration_str = subprocess.check_output(cmd, text=True).strip()
-                      duration = float(duration_str) / 1000 if duration_str else 0
-              except:
-                  duration = 0
-              
-              if duration <= 0:
-                  print("  ⚠️ Could not determine duration, using default compression")
-                  crf_value = 28
-              else:
-                  # Calculate bitrate to achieve target size
-                  # target_size_mb * 8 (bits) / duration (seconds)
-                  target_bitrate = (target_size_mb * 8 * 1024) / duration
-                  
-                  # Cap bitrate for quality preservation
-                  if target_bitrate > 2000:
-                      target_bitrate = 2000
-                  elif target_bitrate < 500:
-                      target_bitrate = 500
-                  
-                  # Determine CRF based on bitrate
-                  if target_bitrate >= 1500:
-                      crf_value = 23
-                  elif target_bitrate >= 1000:
-                      crf_value = 26
-                  elif target_bitrate >= 700:
-                      crf_value = 28
-                  else:
-                      crf_value = 30
-              
-              base_name = os.path.splitext(file_path)[0]
-              temp_file = f"{base_name}_compressed.mp4"
-              
-              print(f"  📊 Duration: {duration:.1f}s, Target bitrate: {target_bitrate:.0f}k, CRF: {crf_value}")
-              
-              # First attempt: CRF encoding (better quality)
-              cmd = [
-                  "ffmpeg", "-y",
-                  "-i", file_path,
-                  "-c:v", "libx264",
-                  "-preset", "medium",
-                  "-crf", str(crf_value),
-                  "-c:a", "aac",
-                  "-b:a", "128k",
-                  "-ar", "44100",
-                  "-movflags", "+faststart",
-                  "-metadata", f"title={os.environ.get('TITLE', '')}",
-                  "-metadata", f"series={os.environ.get('SERIES_TITLE', '')}",
-                  "-metadata", f"label={os.environ.get('LABEL', '')}",
-                  temp_file
-              ]
-              
-              try:
-                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-                  
-                  if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
-                      new_size_mb = os.path.getsize(temp_file) / (1024 * 1024)
-                      print(f"  ✅ CRF compression complete: {new_size_mb:.1f}MB")
-                      
-                      if new_size_mb <= target_size_mb:
-                          shutil.move(temp_file, file_path)
-                          return True
-                      else:
-                          print(f"  ⚠️ CRF compression still too large ({new_size_mb:.1f}MB > {target_size_mb}MB)")
-                          
-                          # Try two-pass encoding for better control
-                          print("  🔧 Trying two-pass encoding...")
-                          return compress_two_pass(file_path, target_size_mb, duration)
-                  else:
-                      print(f"  ❌ CRF compression failed: {result.stderr[:200]}")
+                  if duration <= 0:
+                      print("  ⚠️ Could not determine duration")
                       return False
-              except subprocess.TimeoutExpired:
-                  print("  ❌ CRF compression timeout")
-                  return False
-              finally:
-                  if os.path.exists(temp_file):
-                      try: os.remove(temp_file)
-                      except: pass
-          
-          def compress_two_pass(file_path, target_size_mb, duration):
-              """Two-pass VBR encoding for better size control"""
-              if duration <= 0:
-                  return False
-              
-              # Slightly under target to account for overhead
-              target_bitrate = ((target_size_mb * 0.9) * 8 * 1024) / duration
-              
-              if target_bitrate < 400:
-                  target_bitrate = 400
-              elif target_bitrate > 2500:
-                  target_bitrate = 2500
-              
-              base_name = os.path.splitext(file_path)[0]
-              temp_file = f"{base_name}_2pass.mp4"
-              
-              print(f"  📊 Two-pass: {target_bitrate:.0f}k bitrate")
-              
-              # Pass 1 - Analysis
-              cmd_pass1 = [
-                  "ffmpeg", "-y",
-                  "-i", file_path,
-                  "-c:v", "libx264",
-                  "-b:v", f"{target_bitrate:.0f}k",
-                  "-preset", "medium",
-                  "-pass", "1",
-                  "-an",  # No audio in first pass
-                  "-f", "null",
-                  "/dev/null"
-              ]
-              
-              # Pass 2 - Encoding
-              cmd_pass2 = [
-                  "ffmpeg", "-y",
-                  "-i", file_path,
-                  "-c:v", "libx264",
-                  "-b:v", f"{target_bitrate:.0f}k",
-                  "-preset", "medium",
-                  "-pass", "2",
-                  "-c:a", "aac",
-                  "-b:a", "128k",
-                  "-ar", "44100",
-                  "-movflags", "+faststart",
-                  "-metadata", f"title={os.environ.get('TITLE', '')}",
-                  "-metadata", f"series={os.environ.get('SERIES_TITLE', '')}",
-                  "-metadata", f"label={os.environ.get('LABEL', '')}",
-                  temp_file
-              ]
-              
-              try:
-                  print("  🔄 Pass 1/2...")
-                  subprocess.run(cmd_pass1, capture_output=True, text=True, timeout=300, check=True)
                   
-                  print("  🔄 Pass 2/2...")
-                  subprocess.run(cmd_pass2, capture_output=True, text=True, timeout=600, check=True)
+                  # Calculate target bitrate
+                  target_bitrate = (target_size_mb * 8 * 1024) / duration
+                  target_bitrate = min(max(target_bitrate, 500), 2000)
+                  
+                  base_name = os.path.splitext(file_path)[0]
+                  temp_file = f"{base_name}_compressed.mp4"
+                  
+                  cmd = [
+                      "ffmpeg", "-y",
+                      "-i", file_path,
+                      "-c:v", "libx264",
+                      "-preset", "medium",
+                      "-b:v", f"{int(target_bitrate)}k",
+                      "-c:a", "aac",
+                      "-b:a", "128k",
+                      "-ar", "44100",
+                      "-movflags", "+faststart",
+                      temp_file
+                  ]
+                  
+                  subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
                   
                   if os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
                       new_size_mb = os.path.getsize(temp_file) / (1024 * 1024)
-                      print(f"  ✅ Two-pass compression complete: {new_size_mb:.1f}MB")
-                      
-                      if new_size_mb <= target_size_mb:
-                          shutil.move(temp_file, file_path)
+                      if new_size_mb <= target_size_mb * 1.1:
+                          os.replace(temp_file, file_path)
+                          print(f"  ✅ Local compression complete: {new_size_mb:.1f}MB")
                           return True
                       else:
-                          print(f"  ⚠️ Still too large: {new_size_mb:.1f}MB > {target_size_mb}MB")
-                          # Keep the compressed file anyway if it's smaller than original
-                          if new_size_mb < os.path.getsize(file_path) / (1024 * 1024):
-                              shutil.move(temp_file, file_path)
-                              return True
+                          print(f"  ⚠️ Still too large: {new_size_mb:.1f}MB")
+                          os.remove(temp_file)
                           return False
                   
                   return False
-              except subprocess.TimeoutExpired:
-                  print("  ❌ Two-pass encoding timeout")
+              except Exception as e:
+                  print(f"  ❌ Local compression error: {e}")
                   return False
-              except subprocess.CalledProcessError as e:
-                  print(f"  ❌ Two-pass encoding error: {e}")
-                  return False
-              finally:
-                  # Clean up pass files
-                  for f in ["ffmpeg2pass-0.log", "ffmpeg2pass-0.log.mbtree"]:
-                      if os.path.exists(f):
-                          try: os.remove(f)
-                          except: pass
           
-          def repair_mp4(file_path):
-              print("  🔧 Attempting repair...")
-              
-              temp_file = f"{file_path}.temp.mp4"
-              try:
-                  cmd = [
-                      "ffmpeg", "-y",
-                      "-err_detect", "ignore_err",
-                      "-i", file_path,
-                      "-c", "copy",
-                      "-movflags", "+faststart",
-                      "-ignore_unknown",
-                      temp_file
-                  ]
-                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-                  
-                  if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
-                      is_valid, _ = check_with_mediainfo(temp_file)
-                      if is_valid:
-                          shutil.move(temp_file, file_path)
-                          print("  ✅ Repaired with ffmpeg remux")
-                          return True
-              except:
-                  pass
-              finally:
-                  if os.path.exists(temp_file):
-                      try: os.remove(temp_file)
-                      except: pass
-              
-              try:
-                  print("  ⚠️ Attempting re-encode...")
-                  temp_file = f"{file_path}.temp.mp4"
-                  cmd = [
-                      "ffmpeg", "-y",
-                      "-err_detect", "ignore_err",
-                      "-i", file_path,
-                      "-c:v", "libx264",
-                      "-preset", "veryfast",
-                      "-crf", "23",
-                      "-c:a", "aac",
-                      "-b:a", "128k",
-                      "-movflags", "+faststart",
-                      temp_file
-                  ]
-                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-                  
-                  if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
-                      is_valid, _ = check_with_mediainfo(temp_file)
-                      if is_valid:
-                          shutil.move(temp_file, file_path)
-                          print("  ✅ Repaired with re-encode")
-                          return True
-              except:
-                  pass
-              finally:
-                  if os.path.exists(temp_file):
-                      try: os.remove(temp_file)
-                      except: pass
-              
-              return False
-          
-          def process_video(file_path, max_size_mb=80):
-              """Process video: verify, repair, compress if needed"""
+          def process_episode(file_path, target_size_mb=80):
+              """Process episode with NCA Toolkit API or local fallback"""
               if not os.path.exists(file_path):
-                  print(f"ERROR: File not found: {file_path}")
+                  print(f"❌ File not found: {file_path}")
                   return False
               
               file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
               print(f"📊 Original size: {file_size_mb:.1f}MB")
               
-              # First verify
-              is_valid, video_track = check_with_mediainfo(file_path)
-              
-              if not is_valid:
-                  print("  ⚠️ Invalid file, attempting repair...")
-                  if not repair_mp4(file_path):
-                      print("  ❌ Repair failed")
-                      return False
-                  is_valid, video_track = check_with_mediainfo(file_path)
-                  if not is_valid:
-                      print("  ❌ File still invalid after repair")
-                      return False
-              
-              # Check size and compress if needed
-              file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-              if file_size_mb > max_size_mb:
-                  print(f"  ⚠️ File exceeds {max_size_mb}MB ({file_size_mb:.1f}MB)")
-                  
-                  # Try compression
-                  if compress_video(file_path, max_size_mb):
-                      final_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-                      print(f"  ✅ Compression successful: {final_size_mb:.1f}MB")
-                  else:
-                      print(f"  ❌ Compression failed, file remains {file_size_mb:.1f}MB")
-                      
-                      # Final attempt: use very aggressive compression
-                      print("  🔧 Attempting aggressive compression...")
-                      base_name = os.path.splitext(file_path)[0]
-                      temp_file = f"{base_name}_agg.mp4"
-                      
-                      cmd = [
-                          "ffmpeg", "-y",
-                          "-i", file_path,
-                          "-c:v", "libx264",
-                          "-preset", "fast",
-                          "-crf", "32",
-                          "-c:a", "aac",
-                          "-b:a", "96k",
-                          "-ar", "44100",
-                          "-movflags", "+faststart",
-                          "-metadata", f"title={os.environ.get('TITLE', '')}",
-                          "-metadata", f"series={os.environ.get('SERIES_TITLE', '')}",
-                          "-metadata", f"label={os.environ.get('LABEL', '')}",
-                          temp_file
-                      ]
-                      
-                      try:
-                          subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=True)
-                          if os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
-                              new_size_mb = os.path.getsize(temp_file) / (1024 * 1024)
-                              if new_size_mb < file_size_mb:
-                                  shutil.move(temp_file, file_path)
-                                  print(f"  ✅ Aggressive compression: {new_size_mb:.1f}MB")
-                              else:
-                                  os.remove(temp_file)
-                      except:
-                          pass
-              
-              # Final verification
-              is_valid, video_track = check_with_mediainfo(file_path)
-              if is_valid and video_track:
-                  print(f"  ✅ Final check passed")
-                  print(f"  📐 {video_track.get('Width', 'N/A')}x{video_track.get('Height', 'N/A')}")
-                  print(f"  💾 {os.path.getsize(file_path) / (1024*1024):.1f}MB")
+              if file_size_mb <= target_size_mb:
+                  print(f"✅ File already under {target_size_mb}MB")
                   return True
-              else:
-                  print("  ❌ Final verification failed")
-                  return False
-          
-          def main():
-              file_path = sys.argv[1]
-              max_size = int(sys.argv[2]) if len(sys.argv) > 2 else 80
               
-              success = process_video(file_path, max_size)
-              sys.exit(0 if success else 1)
+              print(f"⚠️ File exceeds {target_size_mb}MB")
+              
+              # Try NCA Toolkit API first
+              try:
+                  compressor = NCAToolkitCompressor()
+                  compressed_file = compressor.compress_video_from_url(file_path, target_size_mb)
+                  
+                  if compressed_file and os.path.exists(compressed_file):
+                      compressed_size = os.path.getsize(compressed_file) / (1024 * 1024)
+                      if compressed_size <= target_size_mb * 1.1:
+                          os.replace(compressed_file, file_path)
+                          print(f"  ✅ NCA Toolkit compression successful: {compressed_size:.1f}MB")
+                          return True
+                      else:
+                          print(f"  ⚠️ Compressed file still too large: {compressed_size:.1f}MB")
+                          os.remove(compressed_file)
+              except Exception as e:
+                  print(f"  ⚠️ NCA Toolkit compression failed: {e}")
+              
+              # Fallback to local compression
+              print("  🔄 Falling back to local compression...")
+              return compress_locally(file_path, target_size_mb)
           
           if __name__ == "__main__":
-              main()
-          EOFVERIFY
+              if len(sys.argv) < 2:
+                  print("Usage: python nca_compress.py <file_path> [target_size_mb]")
+                  sys.exit(1)
+              
+              file_path = sys.argv[1]
+              target_size = int(sys.argv[2]) if len(sys.argv) > 2 else 80
+              
+              success = process_episode(file_path, target_size)
+              sys.exit(0 if success else 1)
+          EOFNCA
           
+          TOTAL_EPISODES=$(cat urls.txt | wc -l)
           EP_INDEX=1
           FAILED_EPISODES=""
-          COMPRESSED_EPISODES=""
           
           while IFS= read -u 3 -r URL || [ -n "$URL" ]; do
             URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
@@ -509,91 +466,34 @@ jobs:
             OUT_FILE="EP${EP_NUM}.mp4"
             
             echo "========================================="
-            echo "📥 Downloading Episode $EP_INDEX/$TOTAL_EPISODES"
+            echo "📥 Processing Episode $EP_INDEX/$TOTAL_EPISODES"
             echo "📎 URL: $URL"
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
+            # Download the episode first
             if [[ "$URL" == *".m3u8"* ]]; then
               echo "📺 HLS stream - Using yt-dlp"
-              
-              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts --concurrent-fragments 16 \
+              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts \
                 --no-progress --no-warnings \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>&1 | grep -E "(Extracting URL|Downloading webpage|Downloading m3u8|Total fragments|Destination|Downloading 1 format)" || true
-              
-              if [ ! -f "$OUT_FILE" ] || [ ! -s "$OUT_FILE" ]; then
-                echo "⚠️ First attempt failed, trying with ffmpeg..."
-                ffmpeg -nostdin -i "$URL" -c copy "$OUT_FILE" < /dev/null 2>/dev/null
-              fi
-              DOWNLOAD_STATUS=$?
-              
-              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
-                FILE_SIZE=$(du -h "$OUT_FILE" | cut -f1)
-                echo "✅ Downloaded: $OUT_FILE ($FILE_SIZE)"
-              fi
-              
+                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
             else
               echo "🎬 Direct file - Using aria2c"
               aria2c -x 16 -s 16 -k 1M --continue=true \
                 --console-log-level=error \
-                --summary-interval=0 \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null || \
               curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
-              DOWNLOAD_STATUS=$?
-              
-              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
-                FILE_SIZE=$(du -h "$OUT_FILE" | cut -f1)
-                echo "✅ Downloaded: $OUT_FILE ($FILE_SIZE)"
-              fi
             fi
             
-            if [ $DOWNLOAD_STATUS -eq 0 ] && [ -f "$OUT_FILE" ]; then
-              FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
-              
-              if [ "$FILE_SIZE" -gt 50000 ]; then
-                echo "🔍 Verifying and processing file..."
-                echo "   Max size: 80MB"
-                
-                if python3 verify_and_repair.py "$OUT_FILE" 80 < /dev/null; then
-                  echo "✅ File verified and processed"
-                  
-                  # Check if file was compressed
-                  FINAL_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
-                  FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
-                  
-                  if [ $FINAL_SIZE_MB -le 80 ]; then
-                    echo "✅ File size: ${FINAL_SIZE_MB}MB (within 80MB limit)"
-                  else
-                    echo "⚠️ File still exceeds 80MB (${FINAL_SIZE_MB}MB), but continuing..."
-                  fi
-                  
-                  EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
-                  
-                  ffmpeg -nostdin -i "$OUT_FILE" \
-                    -c copy \
-                    -metadata title="$EPISODE_TITLE" \
-                    -metadata episode_id="$EP_NUM" \
-                    -metadata series="$SERIES_TITLE" \
-                    -metadata label="$LABEL" \
-                    -metadata date="$(date +%Y-%m-%d)" \
-                    -metadata media_type="tv_episode" \
-                    -movflags +faststart \
-                    "temp_$OUT_FILE" < /dev/null 2>/dev/null
-                  
-                  if [ $? -eq 0 ] && [ -f "temp_$OUT_FILE" ]; then
-                    mv "temp_$OUT_FILE" "$OUT_FILE"
-                    echo "✅ Metadata added"
-                  else
-                    rm -f "temp_$OUT_FILE"
-                  fi
-                  
-                else
-                  echo "❌ File verification failed"
-                  rm -f "$OUT_FILE"
-                  FAILED_EPISODES="$FAILED_EPISODES $EP_NUM"
-                fi
+            if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+              # Process with NCA Toolkit API or local compression
+              echo "🔍 Processing file..."
+              if python3 nca_compress.py "$OUT_FILE" 80 < /dev/null; then
+                FINAL_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
+                echo "✅ Episode $EP_NUM processed: ${FINAL_SIZE_MB}MB"
               else
-                echo "❌ File too small: $OUT_FILE ($FILE_SIZE bytes)"
+                echo "❌ Failed to process episode $EP_NUM"
                 rm -f "$OUT_FILE"
                 FAILED_EPISODES="$FAILED_EPISODES $EP_NUM"
               fi
@@ -613,7 +513,7 @@ jobs:
           echo "📊 Expected: $TOTAL_EPISODES episodes"
           
           TOTAL_FILES=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
-          echo "✅ Downloaded: $TOTAL_FILES/$TOTAL_EPISODES episodes"
+          echo "✅ Processed: $TOTAL_FILES/$TOTAL_EPISODES episodes"
           
           # Show file sizes after compression
           echo ""
@@ -628,18 +528,18 @@ jobs:
           
           if [ -n "$FAILED_EPISODES" ]; then
             echo "❌ FAILED EPISODES: $FAILED_EPISODES"
-            echo "❌ Not all episodes downloaded successfully!"
+            echo "❌ Not all episodes processed successfully!"
             echo "   This is an all-or-nothing workflow. Exiting."
             exit 1
           fi
           
           if [ "$TOTAL_FILES" -ne "$TOTAL_EPISODES" ]; then
-            echo "❌ Expected $TOTAL_EPISODES episodes, but only $TOTAL_FILES downloaded!"
+            echo "❌ Expected $TOTAL_EPISODES episodes, but only $TOTAL_FILES processed!"
             echo "❌ Exiting - all episodes required."
             exit 1
           fi
           
-          echo "✅ All $TOTAL_EPISODES episodes downloaded and processed successfully!"
+          echo "✅ All $TOTAL_EPISODES episodes processed successfully!"
           echo "========================================="
 
       - name: Smart Merge Episodes
@@ -1191,10 +1091,6 @@ jobs:
             fi
           fi
 
-      # =============================================
-      # UPLOAD STEPS - WITH CUSTOM FAST UPLOAD
-      # =============================================
-      
       - name: Start Merged Upload (Background with Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
         env:
