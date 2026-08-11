@@ -128,7 +128,7 @@ jobs:
           
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
-      - name: Download & Fast Compress Episodes (Very Fast Preset)
+      - name: Download All Episodes First
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -137,10 +137,94 @@ jobs:
           cd downloads
           
           echo "========================================="
-          echo "📥 DOWNLOADING & COMPRESSING EPISODES"
+          echo "📥 DOWNLOADING ALL EPISODES"
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Total Episodes: $(cat urls.txt | wc -l)"
+          echo "========================================="
+          
+          TOTAL_EPISODES=$(cat urls.txt | wc -l)
+          EP_INDEX=1
+          FAILED_DOWNLOADS=""
+          
+          while IFS= read -u 3 -r URL || [ -n "$URL" ]; do
+            URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [ -z "$URL" ]; then continue; fi
+            
+            EP_NUM=$(printf "%02d" $EP_INDEX)
+            OUT_FILE="EP${EP_NUM}.mp4"
+            
+            echo "========================================="
+            echo "📥 Downloading Episode $EP_INDEX/$TOTAL_EPISODES"
+            echo "📎 URL: $URL"
+            echo "💾 Output: $OUT_FILE"
+            echo "========================================="
+            
+            # Download the episode
+            if [[ "$URL" == *".m3u8"* ]]; then
+              echo "📺 HLS stream - Using yt-dlp"
+              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts \
+                --no-progress --no-warnings \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
+            else
+              echo "🎬 Direct file - Using aria2c"
+              aria2c -x 16 -s 16 -k 1M --continue=true \
+                --console-log-level=error \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null || \
+              curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
+            fi
+            
+            if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+              FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+              FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+              echo "✅ Downloaded: $OUT_FILE (${FILE_SIZE_MB}MB)"
+            else
+              echo "❌ Download failed for Episode $EP_INDEX"
+              FAILED_DOWNLOADS="$FAILED_DOWNLOADS $EP_NUM"
+              rm -f "$OUT_FILE"
+            fi
+            
+            EP_INDEX=$((EP_INDEX + 1))
+            echo ""
+          done 3< urls.txt
+          
+          echo "========================================="
+          echo "📊 DOWNLOAD SUMMARY"
+          echo "========================================="
+          echo "📺 Series: $SERIES_TITLE"
+          echo "📊 Expected: $TOTAL_EPISODES episodes"
+          
+          TOTAL_FILES=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
+          echo "✅ Downloaded: $TOTAL_FILES/$TOTAL_EPISODES episodes"
+          
+          if [ -n "$FAILED_DOWNLOADS" ]; then
+            echo "❌ FAILED DOWNLOADS: $FAILED_DOWNLOADS"
+            echo "❌ Not all episodes downloaded successfully!"
+            echo "   This is an all-or-nothing workflow. Exiting."
+            exit 1
+          fi
+          
+          if [ "$TOTAL_FILES" -ne "$TOTAL_EPISODES" ]; then
+            echo "❌ Expected $TOTAL_EPISODES episodes, but only $TOTAL_FILES downloaded!"
+            echo "❌ Exiting - all episodes required."
+            exit 1
+          fi
+          
+          echo "✅ All $TOTAL_EPISODES episodes downloaded successfully!"
+          echo "========================================="
+
+      - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
+        env:
+          TITLE: ${{ steps.fname.outputs.formatted_title }}
+          SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
+          LABEL: ${{ github.event.client_payload.label || 'NONE' }}
+        run: |
+          cd downloads
+          
+          echo "========================================="
+          echo "🔧 COMPRESSING EPISODES > 80MB"
+          echo "========================================="
+          echo "📺 Series: $SERIES_TITLE"
           echo "⚡ Using VERY FAST compression preset"
           echo "========================================="
           
@@ -190,7 +274,7 @@ jobs:
               print(f"  📊 Original size: {file_size_mb:.1f}MB")
               
               if file_size_mb <= target_size_mb:
-                  print(f"  ✅ File already under {target_size_mb}MB")
+                  print(f"  ✅ File already under {target_size_mb}MB, skipping compression")
                   return True
               
               # Get video info
@@ -198,10 +282,8 @@ jobs:
               print(f"  📊 Duration: {duration:.1f}s, Resolution: {width}x{height}")
               
               # Calculate target bitrate for target size
-              # Target bitrate = (target_size_mb * 8 * 1024) / duration
               if duration > 0:
                   target_bitrate = (target_size_mb * 8 * 1024) / duration
-                  # Cap bitrate to reasonable range
                   target_bitrate = min(max(target_bitrate, 500), 2000)
               else:
                   target_bitrate = 1000
@@ -212,7 +294,6 @@ jobs:
               temp_file = f"{base_name}_fast.mp4"
               
               # Use VERY FAST preset for maximum speed
-              # Single-pass encoding with constant bitrate
               cmd = [
                   "ffmpeg", "-y",
                   "-i", file_path,
@@ -319,91 +400,64 @@ jobs:
               sys.exit(0 if success else 1)
           EOFCOMPRESS
           
-          TOTAL_EPISODES=$(cat urls.txt | wc -l)
-          EP_INDEX=1
-          FAILED_EPISODES=""
+          # Get list of all episodes
+          EPISODE_FILES=$(ls -1 EP*.mp4 2>/dev/null)
+          TOTAL_EPISODES=$(echo "$EPISODE_FILES" | wc -l)
+          COMPRESSED_COUNT=0
+          FAILED_COMPRESSIONS=""
           
-          while IFS= read -u 3 -r URL || [ -n "$URL" ]; do
-            URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-            if [ -z "$URL" ]; then continue; fi
+          echo "📊 Checking episode sizes..."
+          echo ""
+          
+          for f in $EPISODE_FILES; do
+            if [ ! -f "$f" ]; then continue; fi
             
-            EP_NUM=$(printf "%02d" $EP_INDEX)
-            OUT_FILE="EP${EP_NUM}.mp4"
+            FILE_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
+            FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
             
-            echo "========================================="
-            echo "📥 Processing Episode $EP_INDEX/$TOTAL_EPISODES"
-            echo "📎 URL: $URL"
-            echo "💾 Output: $OUT_FILE"
-            echo "========================================="
+            echo "📹 $f: ${FILE_SIZE_MB}MB"
             
-            # Download the episode
-            if [[ "$URL" == *".m3u8"* ]]; then
-              echo "📺 HLS stream - Using yt-dlp"
-              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts \
-                --no-progress --no-warnings \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
-            else
-              echo "🎬 Direct file - Using aria2c"
-              aria2c -x 16 -s 16 -k 1M --continue=true \
-                --console-log-level=error \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null || \
-              curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
-            fi
-            
-            if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
-              FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
-              FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-              echo "📊 Downloaded: ${FILE_SIZE_MB}MB"
+            if [ $FILE_SIZE_MB -gt 80 ]; then
+              echo "⚠️  $f exceeds 80MB, compressing..."
               
-              # Fast compress if needed
-              echo "🔍 Processing with VERY FAST compression..."
-              if python3 fast_compress.py "$OUT_FILE" 80 < /dev/null; then
-                FINAL_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
-                FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
-                echo "✅ Episode $EP_NUM processed: ${FINAL_SIZE_MB}MB"
-                
-                # Add metadata
-                EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
-                ffmpeg -nostdin -i "$OUT_FILE" \
-                  -c copy \
-                  -metadata title="$EPISODE_TITLE" \
-                  -metadata episode_id="$EP_NUM" \
-                  -metadata series="$SERIES_TITLE" \
-                  -metadata label="$LABEL" \
-                  -metadata date="$(date +%Y-%m-%d)" \
-                  -metadata media_type="tv_episode" \
-                  -movflags +faststart \
-                  "temp_$OUT_FILE" < /dev/null 2>/dev/null
-                
-                if [ $? -eq 0 ] && [ -f "temp_$OUT_FILE" ]; then
-                  mv "temp_$OUT_FILE" "$OUT_FILE"
-                else
-                  rm -f "temp_$OUT_FILE"
-                fi
+              # Add metadata before compression
+              EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
+              EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
+              
+              # Compress with very fast preset
+              if python3 fast_compress.py "$f" 80 < /dev/null; then
+                COMPRESSED_COUNT=$((COMPRESSED_COUNT + 1))
+                NEW_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
+                NEW_SIZE_MB=$((NEW_SIZE / 1024 / 1024))
+                echo "✅ $f compressed: ${NEW_SIZE_MB}MB"
               else
-                echo "❌ Failed to process episode $EP_NUM"
-                rm -f "$OUT_FILE"
-                FAILED_EPISODES="$FAILED_EPISODES $EP_NUM"
+                echo "❌ Failed to compress $f"
+                FAILED_COMPRESSIONS="$FAILED_COMPRESSIONS $f"
               fi
             else
-              echo "❌ Download failed for Episode $EP_INDEX"
-              FAILED_EPISODES="$FAILED_EPISODES $EP_NUM"
+              echo "✅ $f already under 80MB, skipping compression"
             fi
-            
-            EP_INDEX=$((EP_INDEX + 1))
             echo ""
-          done 3< urls.txt
+          done
           
           echo "========================================="
-          echo "📊 DOWNLOAD & COMPRESSION SUMMARY"
+          echo "📊 COMPRESSION SUMMARY"
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
-          echo "📊 Expected: $TOTAL_EPISODES episodes"
+          echo "📊 Total Episodes: $TOTAL_EPISODES"
+          echo "📊 Compressed: $COMPRESSED_COUNT episodes"
           
-          TOTAL_FILES=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
-          echo "✅ Processed: $TOTAL_FILES/$TOTAL_EPISODES episodes"
+          if [ -n "$FAILED_COMPRESSIONS" ]; then
+            echo "❌ FAILED COMPRESSIONS: $FAILED_COMPRESSIONS"
+            echo "❌ Not all episodes compressed successfully!"
+            echo "   This is an all-or-nothing workflow. Exiting."
+            exit 1
+          fi
           
-          # Show file sizes after compression
+          echo "✅ All episodes processed successfully!"
+          echo "========================================="
+          
+          # Show final file sizes
           echo ""
           echo "📊 Final episode sizes:"
           for f in EP*.mp4; do
@@ -413,22 +467,6 @@ jobs:
             fi
           done
           echo ""
-          
-          if [ -n "$FAILED_EPISODES" ]; then
-            echo "❌ FAILED EPISODES: $FAILED_EPISODES"
-            echo "❌ Not all episodes processed successfully!"
-            echo "   This is an all-or-nothing workflow. Exiting."
-            exit 1
-          fi
-          
-          if [ "$TOTAL_FILES" -ne "$TOTAL_EPISODES" ]; then
-            echo "❌ Expected $TOTAL_EPISODES episodes, but only $TOTAL_FILES processed!"
-            echo "❌ Exiting - all episodes required."
-            exit 1
-          fi
-          
-          echo "✅ All $TOTAL_EPISODES episodes processed successfully!"
-          echo "========================================="
 
       - name: Smart Merge Episodes
         id: merge
@@ -839,7 +877,6 @@ jobs:
             
             echo "🔧 Compressing with veryfast preset..."
             
-            # Use veryfast for speed, single-pass
             ffmpeg -y -i "output.mp4" \
               -c:v libx264 -preset veryfast -b:v ${TARGET_BITRATE}k -maxrate ${TARGET_BITRATE}k \
               -c:a aac -b:a 128k -ar 44100 \
