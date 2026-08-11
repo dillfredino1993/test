@@ -1839,9 +1839,25 @@ jobs:
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "========================================="
           
+          # Function to check if merged upload process is still running
+          is_merged_running() {
+            if [ -n "${{ env.merged_pid }}" ]; then
+              if kill -0 ${{ env.merged_pid }} 2>/dev/null; then
+                return 0  # Running
+              fi
+            fi
+            return 1  # Not running
+          }
+          
           # Function to parse progress from log files
           get_merged_progress() {
             if [ -f "merged_progress.log" ]; then
+              # Check if upload is complete first
+              if grep -q "UPLOAD_COMPLETE" merged_progress.log; then
+                echo "100|complete"
+                return
+              fi
+              
               # Look for progress lines
               local last_progress=$(grep -E "[0-9]+\.[0-9]+%.*[0-9]+\.[0-9]+/[0-9]+\.[0-9]+ MB" merged_progress.log | tail -1)
               if [ -n "$last_progress" ]; then
@@ -1851,12 +1867,7 @@ jobs:
                 local uploaded=$(echo "$last_progress" | grep -oE "[0-9.]+\/[0-9.]+ MB" | sed 's/ MB//')
                 echo "$percent|$uploaded"
               else
-                # Check if upload is complete
-                if grep -q "UPLOAD_COMPLETE" merged_progress.log; then
-                  echo "100|complete"
-                else
-                  echo "0|0.0/0.0"
-                fi
+                echo "0|0.0/0.0"
               fi
             else
               echo "0|0.0/0.0"
@@ -1953,6 +1964,8 @@ jobs:
           START_TIME=$(date +%s)
           MERGED_COMPLETE=false
           EPISODES_COMPLETE=false
+          NO_PROGRESS_COUNT=0
+          LAST_MERGED_PERCENT=-1
           
           echo ""
           echo "🔄 Monitoring upload progress..."
@@ -1960,7 +1973,32 @@ jobs:
           echo ""
           
           while true; do
-            clear 2>/dev/null || printf "\033c" 2>/dev/null || echo ""
+            # Check if both are complete first
+            if [ -f "single_episodes_complete.txt" ]; then
+              EPISODES_COMPLETE=true
+            fi
+            
+            # Check merged completion - either from log or process ended
+            if [ -f "merged_progress.log" ] && grep -q "UPLOAD_COMPLETE" merged_progress.log; then
+              MERGED_COMPLETE=true
+            elif ! is_merged_running && [ -f "merged_upload.log" ]; then
+              # Process ended, check if it was successful
+              if tail -20 merged_upload.log | grep -q "✅ Merged video uploaded!"; then
+                MERGED_COMPLETE=true
+                # Write completion marker if missing
+                if ! grep -q "UPLOAD_COMPLETE" merged_progress.log 2>/dev/null; then
+                  echo "$(date): UPLOAD_COMPLETE" >> merged_progress.log
+                fi
+              fi
+            fi
+            
+            # If both complete, break out of loop
+            if [ "$MERGED_COMPLETE" = true ] && [ "$EPISODES_COMPLETE" = true ]; then
+              echo ""
+              echo "✅ ALL UPLOADS COMPLETED!"
+              echo ""
+              break
+            fi
             
             CURRENT_TIME=$(date +%s)
             ELAPSED=$((CURRENT_TIME - START_TIME))
@@ -1974,6 +2012,8 @@ jobs:
               ELAPSED_STR="$((ELAPSED / 3600))h $(((ELAPSED % 3600) / 60))m"
             fi
             
+            clear 2>/dev/null || printf "\033c" 2>/dev/null || echo ""
+            
             echo "╔══════════════════════════════════════════════════════════════╗"
             echo "║           📤 UPLOAD PROGRESS MONITOR                        ║"
             echo "╠══════════════════════════════════════════════════════════════╣"
@@ -1986,7 +2026,7 @@ jobs:
             MERGED_PERCENT=$(echo "$MERGED_PROGRESS" | cut -d'|' -f1)
             MERGED_DATA=$(echo "$MERGED_PROGRESS" | cut -d'|' -f2)
             
-            if [ "$MERGED_DATA" = "complete" ]; then
+            if [ "$MERGED_COMPLETE" = true ] || [ "$MERGED_DATA" = "complete" ]; then
               MERGED_COMPLETE=true
               echo "║ 📹 Merged Video:                                        ║"
               echo "║    Status: ✅ COMPLETE                                   ║"
@@ -2023,6 +2063,10 @@ jobs:
                 fi
               fi
               echo "║                                                              ║"
+            elif is_merged_running; then
+              echo "║ 📹 Merged Video: Uploading...                           ║"
+              echo "║    Status: ⏳ In Progress                                 ║"
+              echo "║                                                              ║"
             else
               echo "║ 📹 Merged Video: Starting...                             ║"
               echo "║                                                              ║"
@@ -2035,7 +2079,7 @@ jobs:
             EP_PERCENT=$(echo "$EP_PROGRESS" | cut -d'|' -f1)
             EP_DATA=$(echo "$EP_PROGRESS" | cut -d'|' -f2)
             
-            if [ "$EP_DATA" = "complete" ]; then
+            if [ "$EPISODES_COMPLETE" = true ] || [ "$EP_DATA" = "complete" ]; then
               EPISODES_COMPLETE=true
               echo "║    Status: ✅ COMPLETE                                     ║"
               BAR_LENGTH=40
@@ -2084,21 +2128,34 @@ jobs:
             echo "║                                                              ║"
             echo "╚══════════════════════════════════════════════════════════════╝"
             
-            # Check if both uploads are complete
-            if [ "$MERGED_COMPLETE" = true ] && [ "$EPISODES_COMPLETE" = true ]; then
-              echo ""
-              echo "✅ ALL UPLOADS COMPLETED!"
-              echo ""
-              break
-            fi
-            
             # Check for errors (brief check)
             if [ -f "merged_upload.log" ]; then
-              if tail -20 merged_upload.log 2>/dev/null | grep -q "❌"; then
+              if tail -5 merged_upload.log 2>/dev/null | grep -q "❌"; then
                 echo ""
                 echo "⚠️  Warning: Possible errors detected in merged upload log"
                 echo "   Check merged_upload.log for details"
               fi
+            fi
+            
+            # If merged upload is at 100% but not marked complete for a while, force complete
+            if [ "$MERGED_PERCENT" = "100" ] && [ "$MERGED_COMPLETE" = false ]; then
+              NO_PROGRESS_COUNT=$((NO_PROGRESS_COUNT + 1))
+              if [ $NO_PROGRESS_COUNT -gt 6 ]; then  # After 30 seconds (6 * 5s)
+                echo ""
+                echo "⚠️  Merged upload at 100% but not marked complete..."
+                echo "   Checking if process is still running..."
+                
+                if ! is_merged_running; then
+                  echo "✅ Process ended, marking as complete..."
+                  echo "$(date): UPLOAD_COMPLETE" >> merged_progress.log
+                  MERGED_COMPLETE=true
+                else
+                  echo "⚠️  Process still running, waiting..."
+                  NO_PROGRESS_COUNT=0
+                fi
+              fi
+            else
+              NO_PROGRESS_COUNT=0
             fi
             
             sleep 5
