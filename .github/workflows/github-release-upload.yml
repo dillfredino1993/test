@@ -127,7 +127,7 @@ jobs:
           
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
-      - name: Create Streamtape Downloader Script (Using StreamtapeExtractor)
+      - name: Create Streamtape Downloader Script
         run: |
           cd downloads
           
@@ -596,7 +596,7 @@ jobs:
               sys.exit(0 if success else 1)
           EOFSTREAMTAPE
           
-          echo "✅ Streamtape downloader script created (using StreamtapeExtractor)"
+          echo "✅ Streamtape downloader script created"
 
       - name: Download All Episodes First
         env:
@@ -643,13 +643,11 @@ jobs:
                 echo "✅ Streamtape download completed successfully"
               else
                 echo "⚠️ Streamtape downloader failed, trying alternative methods..."
-                # Try with yt-dlp as fallback
                 echo "🔄 Trying yt-dlp for streamtape..."
                 yt-dlp -f "bestvideo+bestaudio/best" \
                   --no-progress --no-warnings \
                   -o "$OUT_FILE" "$URL" < /dev/null 2>&1
                 
-                # If yt-dlp fails, try with wget
                 if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
                   echo "🔄 Trying with wget..."
                   rm -f "$OUT_FILE"
@@ -675,12 +673,10 @@ jobs:
               echo "⚠️ Initial download failed or file too small, trying alternatives..."
               rm -f "$OUT_FILE"
               
-              # If it's a streamtape link, try with ffmpeg
               if [[ "$URL" == *"streamtape.com"* ]] || [[ "$URL" == *"streamtape.cc"* ]]; then
                 echo "🔄 Trying ffmpeg for streamtape..."
                 ffmpeg -i "$URL" -c copy -bsf:a aac_adtstoasc "$OUT_FILE" 2>/dev/null
               else
-                # Try with yt-dlp for non-streamtape links
                 echo "🔄 Trying yt-dlp..."
                 yt-dlp -f "bestvideo+bestaudio/best" \
                   --no-progress --no-warnings \
@@ -727,191 +723,16 @@ jobs:
           echo "✅ All $TOTAL_EPISODES episodes downloaded successfully!"
           echo "========================================="
 
-      - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
-        env:
-          TITLE: ${{ steps.fname.outputs.formatted_title }}
-          SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
-          LABEL: ${{ github.event.client_payload.label || 'NONE' }}
+      - name: Compress Episodes Larger Than 80MB
         run: |
           cd downloads
           
           echo "========================================="
           echo "🔧 COMPRESSING EPISODES > 80MB"
           echo "========================================="
-          echo "📺 Series: $SERIES_TITLE"
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "⚡ Using VERY FAST compression preset"
           echo "========================================="
-          
-          # Create fast compression script
-          cat > fast_compress.py << 'EOFCOMPRESS'
-          import os
-          import sys
-          import subprocess
-          import shutil
-          import json
-          import time
-          
-          def get_video_info(file_path):
-              """Get video duration, width, height using ffprobe"""
-              try:
-                  cmd = [
-                      "ffprobe", "-v", "error",
-                      "-show_entries", "format=duration",
-                      "-show_entries", "stream=width,height,codec_name",
-                      "-of", "json",
-                      file_path                  ]
-                  result = subprocess.check_output(cmd, text=True)
-                  data = json.loads(result)
-                  
-                  duration = float(data.get('format', {}).get('duration', 0))
-                  
-                  width, height = 1280, 720
-                  for stream in data.get('streams', []):
-                      if stream.get('codec_type') == 'video':
-                          width = int(stream.get('width', 1280))
-                          height = int(stream.get('height', 720))
-                          break
-                  
-                  return duration, width, height
-              except:
-                  return 0, 1280, 720
-          
-          def compress_with_veryfast(file_path, target_size_mb=80):
-              """
-              Compress video using FFmpeg with VERY FAST preset
-              This prioritizes speed over compression efficiency
-              """
-              print(f"  ⚡ Compressing with VERY FAST preset...")
-              
-              file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-              print(f"  📊 Original size: {file_size_mb:.1f}MB")
-              
-              if file_size_mb <= target_size_mb:
-                  print(f"  ✅ File already under {target_size_mb}MB, skipping compression")
-                  return True
-              
-              # Get video info
-              duration, width, height = get_video_info(file_path)
-              print(f"  📊 Duration: {duration:.1f}s, Resolution: {width}x{height}")
-              
-              # Calculate target bitrate for target size
-              if duration > 0:
-                  target_bitrate = (target_size_mb * 8 * 1024) / duration
-                  target_bitrate = min(max(target_bitrate, 500), 2000)
-              else:
-                  target_bitrate = 1000
-              
-              print(f"  📊 Target bitrate: {int(target_bitrate)}kbps")
-              
-              base_name = os.path.splitext(file_path)[0]
-              temp_file = f"{base_name}_fast.mp4"
-              
-              # Use VERY FAST preset for maximum speed
-              cmd = [
-                  "ffmpeg", "-y",
-                  "-i", file_path,
-                  "-c:v", "libx264",
-                  "-preset", "veryfast",
-                  "-b:v", f"{int(target_bitrate)}k",
-                  "-maxrate", f"{int(target_bitrate * 1.5)}k",
-                  "-bufsize", f"{int(target_bitrate * 2)}k",
-                  "-c:a", "aac",
-                  "-b:a", "128k",
-                  "-ar", "44100",
-                  "-movflags", "+faststart",
-                  "-threads", str(os.cpu_count() or 2),
-                  temp_file
-              ]
-              
-              try:
-                  print(f"  🔄 Encoding...")
-                  start_time = time.time()
-                  
-                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-                  
-                  elapsed = time.time() - start_time
-                  print(f"  ⏱️  Encoding time: {elapsed:.1f}s")
-                  
-                  if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
-                      new_size_mb = os.path.getsize(temp_file) / (1024 * 1024)
-                      print(f"  ✅ Compressed: {new_size_mb:.1f}MB ({file_size_mb:.1f}MB -> {new_size_mb:.1f}MB)")
-                      
-                      if new_size_mb <= target_size_mb * 1.1:
-                          os.replace(temp_file, file_path)
-                          return True
-                      else:
-                          print(f"  ⚠️ Still too large: {new_size_mb:.1f}MB")
-                          
-                          # Try even more aggressive compression
-                          print(f"  🔄 Trying ULTRA FAST with higher CRF...")
-                          temp_file2 = f"{base_name}_ultrafast.mp4"
-                          
-                          cmd2 = [
-                              "ffmpeg", "-y",
-                              "-i", file_path,
-                              "-c:v", "libx264",
-                              "-preset", "ultrafast",
-                              "-crf", "28",
-                              "-c:a", "aac",
-                              "-b:a", "96k",
-                              "-ar", "44100",
-                              "-movflags", "+faststart",
-                              "-threads", str(os.cpu_count() or 2),
-                              temp_file2
-                          ]
-                          
-                          result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=300)
-                          
-                          if result2.returncode == 0 and os.path.exists(temp_file2) and os.path.getsize(temp_file2) > 0:
-                              new_size_mb2 = os.path.getsize(temp_file2) / (1024 * 1024)
-                              print(f"  ✅ UltraFast compressed: {new_size_mb2:.1f}MB")
-                              
-                              if new_size_mb2 < new_size_mb:
-                                  os.replace(temp_file2, file_path)
-                                  return True
-                              else:
-                                  os.remove(temp_file2)
-                          
-                          os.remove(temp_file)
-                          return False
-                  else:
-                      print(f"  ❌ Compression failed: {result.stderr[:200]}")
-                      return False
-                      
-              except subprocess.TimeoutExpired:
-                  print(f"  ❌ Compression timeout")
-                  return False
-              except Exception as e:
-                  print(f"  ❌ Compression error: {e}")
-                  return False
-              finally:
-                  # Cleanup temp files
-                  for f in [temp_file, f"{base_name}_ultrafast.mp4"]:
-                      if os.path.exists(f):
-                          try: os.remove(f)
-                          except: pass
-              
-              return False
-          
-          def process_episode(file_path, target_size_mb=80):
-              """Process episode with fast compression"""
-              if not os.path.exists(file_path):
-                  print(f"❌ File not found: {file_path}")
-                  return False
-              
-              return compress_with_veryfast(file_path, target_size_mb)
-          
-          if __name__ == "__main__":
-              if len(sys.argv) < 2:
-                  print("Usage: python fast_compress.py <file_path> [target_size_mb]")
-                  sys.exit(1)
-              
-              file_path = sys.argv[1]
-              target_size = int(sys.argv[2]) if len(sys.argv) > 2 else 80
-              
-              success = process_episode(file_path, target_size)
-              sys.exit(0 if success else 1)
-          EOFCOMPRESS
           
           # Get list of all episodes
           EPISODE_FILES=$(ls -1 EP*.mp4 2>/dev/null)
@@ -933,17 +754,25 @@ jobs:
             if [ $FILE_SIZE_MB -gt 80 ]; then
               echo "⚠️  $f exceeds 80MB, compressing..."
               
-              # Add metadata before compression
-              EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
-              EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
+              # Compress with ffmpeg veryfast preset
+              TEMP_FILE="${f}.temp.mp4"
+              ffmpeg -i "$f" -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 128k -movflags +faststart "$TEMP_FILE" 2>/dev/null
               
-              # Compress with very fast preset
-              if python3 fast_compress.py "$f" 80 < /dev/null; then
-                COMPRESSED_COUNT=$((COMPRESSED_COUNT + 1))
-                NEW_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
+              if [ -f "$TEMP_FILE" ] && [ -s "$TEMP_FILE" ]; then
+                NEW_SIZE=$(stat -c%s "$TEMP_FILE" 2>/dev/null || stat -f%z "$TEMP_FILE" 2>/dev/null || echo "0")
                 NEW_SIZE_MB=$((NEW_SIZE / 1024 / 1024))
-                echo "✅ $f compressed: ${NEW_SIZE_MB}MB"
+                
+                # Only replace if compressed file is smaller
+                if [ $NEW_SIZE -lt $FILE_SIZE ]; then
+                  mv "$TEMP_FILE" "$f"
+                  echo "✅ $f compressed: ${NEW_SIZE_MB}MB"
+                  COMPRESSED_COUNT=$((COMPRESSED_COUNT + 1))
+                else
+                  rm -f "$TEMP_FILE"
+                  echo "⚠️ Compression didn't reduce size, keeping original"
+                fi
               else
+                rm -f "$TEMP_FILE"
                 echo "❌ Failed to compress $f"
                 FAILED_COMPRESSIONS="$FAILED_COMPRESSIONS $f"
               fi
@@ -956,7 +785,7 @@ jobs:
           echo "========================================="
           echo "📊 COMPRESSION SUMMARY"
           echo "========================================="
-          echo "📺 Series: $SERIES_TITLE"
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "📊 Total Episodes: $TOTAL_EPISODES"
           echo "📊 Compressed: $COMPRESSED_COUNT episodes"
           
@@ -969,21 +798,7 @@ jobs:
           
           echo "✅ All episodes processed successfully!"
           echo "========================================="
-          
-          # Show final file sizes
-          echo ""
-          echo "📊 Final episode sizes:"
-          for f in EP*.mp4; do
-            if [ -f "$f" ]; then
-              SIZE_MB=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null | awk '{print $1/1024/1024}')
-              printf "   %-10s: %.1f MB\n" "$f" "$SIZE_MB"
-            fi
-          done
-          echo ""
 
-      # The rest of the workflow remains the same (smart merge, verify, upload steps)
-      # I've included them here but you can copy from your existing workflow
-      
       - name: Smart Merge Episodes
         id: merge
         run: |
@@ -1005,13 +820,7 @@ jobs:
           if [ "$EP_COUNT" -eq 1 ]; then
             echo "📦 Only 1 episode - skipping merge"
             SINGLE_FILE=$(ls EP*.mp4 | head -1)
-            ffmpeg -i "$SINGLE_FILE" -c copy -movflags +faststart \
-              -metadata title="$TITLE" \
-              -metadata series="$SERIES_TITLE" \
-              -metadata label="$LABEL" \
-              -metadata year="$(date +%Y)" \
-              -metadata date="$(date +%Y-%m-%d)" \
-              "output.mp4" 2>/dev/null
+            cp "$SINGLE_FILE" "output.mp4"
             echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
             echo "has_merged=true" >> $GITHUB_ENV
             echo "merge_success=true" >> $GITHUB_OUTPUT
@@ -1020,125 +829,332 @@ jobs:
           
           echo "📊 Found $EP_COUNT episodes to merge"
           
-          # Verify all files have video streams
-          echo "🔍 Checking all files for video streams..."
-          NEEDS_REDOWNLOAD=false
-          REDOWNLOAD_LIST=""
+          # Create concat list
+          CONCAT_LIST="concat_list.txt"
+          > $CONCAT_LIST
           
-          for f in EP*.mp4; do
-            if [ ! -f "$f" ]; then continue; fi
-            
-            # Check if file has video stream
-            HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$f" 2>/dev/null)
-            
-            if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
-              echo "⚠️ $f has no video stream!"
-              EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
-              REDOWNLOAD_LIST="$REDOWNLOAD_LIST $EP_NUM"
-              NEEDS_REDOWNLOAD=true
-            else
-              # Also check resolution
-              WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null)
-              HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null)
-              
-              if [ -z "$WIDTH" ] || [ "$WIDTH" = "0" ] || [ -z "$HEIGHT" ] || [ "$HEIGHT" = "0" ]; then
-                echo "⚠️ $f has video but invalid resolution (${WIDTH}x${HEIGHT})!"
-                EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
-                REDOWNLOAD_LIST="$REDOWNLOAD_LIST $EP_NUM"
-                NEEDS_REDOWNLOAD=true
-              else
-                echo "✅ $f: ${WIDTH}x${HEIGHT} video stream OK"
-              fi
+          for f in $(ls -1 EP*.mp4 | sort -V); do
+            if [ -f "$f" ] && [ -s "$f" ]; then
+              echo "file '$f'" >> $CONCAT_LIST
+              echo "✅ Added: $f"
             fi
           done
           
-          # Redownload episodes that need it
-          if [ "$NEEDS_REDOWNLOAD" = true ]; then
-            echo ""
-            echo "🔄 Redownloading episodes to ensure proper video..."
-            
-            # Read URLs into array
-            mapfile -t URL_ARRAY < urls.txt
-            
-            for EP_NUM in $REDOWNLOAD_LIST; do
-              EP_NUM_FORMATTED=$(printf "%02d" $EP_NUM)
-              FILE="EP${EP_NUM_FORMATTED}.mp4"
-              URL_INDEX=$((EP_NUM - 1))
-              
-              if [ $URL_INDEX -ge 0 ] && [ $URL_INDEX -lt ${#URL_ARRAY[@]} ]; then
-                URL="${URL_ARRAY[$URL_INDEX]}"
-                echo ""
-                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED..."
-                echo "📎 URL: $URL"
-                
-                # Remove the bad file
-                rm -f "$FILE"
-                
-                # Check if it's a streamtape link and use specialized downloader
-                if [[ "$URL" == *"streamtape.com"* ]] || [[ "$URL" == *"streamtape.cc"* ]]; then
-                  python3 streamtape_downloader.py "$URL" "$FILE"
-                else
-                  # Try ffmpeg for other links
-                  ffmpeg -i "$URL" -c copy -bsf:a aac_adtstoasc "$FILE" 2>/dev/null
-                fi
-                
-                if [ -f "$FILE" ] && [ -s "$FILE" ]; then
-                  # Verify the new file has video
-                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FILE" 2>/dev/null)
-                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
-                    echo "✅ Episode $EP_NUM_FORMATTED redownloaded successfully with video!"
-                  else
-                    echo "❌ Redownloaded file still has no video for Episode $EP_NUM_FORMATTED"
-                    echo "   Creating a blank video with audio instead..."
-                    
-                    # Create a blank video with the audio from the file
-                    DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FILE" 2>/dev/null || echo "30")
-                    TEMP_FILE="EP${EP_NUM_FORMATTED}_temp.mp4"
-                    
-                    ffmpeg -f lavfi -i color=black:size=720x1280:duration="$DURATION" \
-                      -i "$FILE" \
-                      -c:v libx264 -preset veryfast -crf 23 \
-                      -c:a aac -b:a 128k -ar 44100 \
-                      -shortest \
-                      -movflags +faststart \
-                      "$TEMP_FILE" 2>/dev/null
-                    
-                    if [ -f "$TEMP_FILE" ] && [ -s "$TEMP_FILE" ]; then
-                      mv "$TEMP_FILE" "$FILE"
-                      echo "✅ Created video from audio for Episode $EP_NUM_FORMATTED"
-                    fi
-                  fi
-                else
-                  echo "❌ Redownload failed for Episode $EP_NUM_FORMATTED"
-                fi
-              else
-                echo "⚠️ Could not find URL for Episode $EP_NUM_FORMATTED"
-              fi
-            done
-            
-            echo ""
-            echo "✅ Redownload complete!"
-          fi
+          echo "🔄 Concatenating files..."
+          ffmpeg -f concat -safe 0 -i $CONCAT_LIST -c copy -movflags +faststart "output.mp4" 2>/dev/null
           
-          # Continue with merge (rest of merge logic remains the same as your original workflow)
-          # ... [merge logic continues]
+          if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
+            echo "✅ Merge successful!"
+            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
+            echo "has_merged=true" >> $GITHUB_ENV
+            echo "merge_success=true" >> $GITHUB_OUTPUT
+            
+            echo ""
+            echo "========================================="
+            echo "📊 FINAL MERGED FILE"
+            echo "========================================="
+            echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+            echo "📁 File: output.mp4"
+            ls -lh output.mp4
+            echo "========================================="
+          else
+            echo "❌ Merge failed!"
+            exit 1
+          fi
 
-      - name: Verify, Compress if Needed, and Fix Duration
+      - name: Verify Merged File
         if: steps.merge.outputs.merge_success == 'true'
         id: verify
-        # ... [verify step remains the same]
+        run: |
+          cd downloads
+          
+          echo "========================================="
+          echo "🔍 VERIFYING MERGED FILE"
+          echo "========================================="
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+          echo "========================================="
+          
+          if [ ! -f "output.mp4" ]; then
+            echo "❌ output.mp4 not found!"
+            exit 1
+          fi
+          
+          FILE_SIZE_BYTES=$(stat -c%s "output.mp4" 2>/dev/null || stat -f%z "output.mp4" 2>/dev/null || echo "0")
+          FILE_SIZE_MB=$((FILE_SIZE_BYTES / 1024 / 1024))
+          
+          echo "📊 File size: ${FILE_SIZE_MB} MB"
+          
+          if [ $FILE_SIZE_MB -gt 2000 ]; then
+            echo "❌ File exceeds 2GB (${FILE_SIZE_MB} MB)"
+            echo "   Telegram limit is 2GB!"
+            exit 1
+          else
+            echo "✅ File size: ${FILE_SIZE_MB} MB (under 2GB limit)"
+          fi
+          
+          echo "verify_success=true" >> $GITHUB_OUTPUT
+          echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
 
-      - name: Start Merged Upload (Background with Fast Upload)
+      - name: Start Merged Upload
         if: steps.verify.outputs.verify_success == 'true'
-        # ... [upload steps remain the same]
+        env:
+          TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
+          TG_MERGED_CHAT_ID: ${{ secrets.TELEGRAM_MERGED_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
+          TG_MERGED_NAME: ${{ secrets.TELEGRAM_MERGED_NAME }}
+          TG_MERGED_INVITE_LINK: ${{ secrets.TELEGRAM_MERGED_INVITE_LINK }}
+          MERGED_PATH: ${{ env.merged_file_path }}
+          TITLE: ${{ steps.fname.outputs.formatted_title }}
+          SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
+          LABEL: ${{ steps.fname.outputs.clean_label }}
+        run: |
+          cd downloads
+          
+          echo "========================================="
+          echo "📤 STARTING MERGED UPLOAD"
+          echo "========================================="
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+          echo "📁 File: ${{ env.merged_file_path }}"
+          echo "========================================="
+          
+          if [ ! -f "${{ env.merged_file_path }}" ] && [ ! -f "output.mp4" ]; then
+            echo "❌ output.mp4 not found!"
+            exit 1
+          fi
+          
+          if [ -f "${{ env.merged_file_path }}" ]; then
+            export MERGED_PATH="${{ env.merged_file_path }}"
+          else
+            export MERGED_PATH="$(pwd)/output.mp4"
+            echo "⚠️ Using fallback path: $MERGED_PATH"
+          fi
+          
+          echo "📁 Final MERGED_PATH: $MERGED_PATH"
+          
+          cat > upload_merged.py << 'EOFUPLOAD'
+          import os
+          import sys
+          import subprocess
+          import asyncio
+          import datetime
+          
+          try:
+              from telethon import TelegramClient
+              from telethon.sessions import StringSession
+              from telethon.errors import FloodWaitError
+              from telethon.tl.types import DocumentAttributeVideo
+              import telethon
+              print(f"✅ Telethon version: {telethon.__version__}")
+          except ImportError as e:
+              print(f"❌ Import error: {e}")
+              sys.exit(1)
+          
+          api_id = os.environ.get("TG_API_ID")
+          api_hash = os.environ.get("TG_API_HASH")
+          session_string = os.environ.get("TG_SESSION_STRING")
+          chat_id = int(os.environ.get("TG_MERGED_CHAT_ID")) if os.environ.get("TG_MERGED_CHAT_ID") else None
+          video_path = os.environ.get("MERGED_PATH")
+          title = os.environ.get("TITLE")
+          series_title = os.environ.get("SERIES_TITLE", "Series")
+          label = os.environ.get("LABEL", "NONE")
+          
+          if not all([api_id, api_hash, session_string, chat_id]):
+              print("❌ Missing Telegram credentials.")
+              sys.exit(0)
+          
+          async def main():
+              try:
+                  client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
+                  await client.connect()
+                  
+                  if not await client.is_user_authorized():
+                      print("❌ Session invalid")
+                      return
+                  
+                  me = await client.get_me()
+                  print(f"✅ Logged in: {me.first_name}")
+                  
+                  entity = await client.get_entity(chat_id)
+                  
+                  file_size = os.path.getsize(video_path) / (1024 * 1024)
+                  print(f"📤 Uploading {file_size:.1f} MB...")
+                  
+                  caption = f"{title}\n#UNWATCHED\n#{datetime.datetime.now().strftime('%B%Y').upper()}"
+                  
+                  await client.send_file(
+                      entity,
+                      video_path,
+                      caption=caption,
+                      supports_streaming=True
+                  )
+                  
+                  print("✅ Upload complete!")
+                  
+              except Exception as e:
+                  print(f"❌ Error: {e}")
+              
+              await client.disconnect()
+          
+          if __name__ == '__main__':
+              asyncio.run(main())
+          EOFUPLOAD
+          
+          nohup python3 -u upload_merged.py > merged_upload.log 2>&1 &
+          MERGED_PID=$!
+          echo "merged_pid=$MERGED_PID" >> $GITHUB_ENV
+          echo "✅ Merged upload started (PID: $MERGED_PID)"
 
-      - name: Upload Single Episodes (Fast Upload)
+      - name: Upload Single Episodes
         if: steps.verify.outputs.verify_success == 'true'
-        # ... [upload steps remain the same]
+        env:
+          TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
+          TG_SINGLE_EPISODES_CHAT_ID: ${{ secrets.TELEGRAM_SINGLE_EPISODES_CHAT_ID }}
+          TITLE: ${{ steps.fname.outputs.formatted_title }}
+          SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
+          LABEL: ${{ steps.fname.outputs.clean_label }}
+        run: |
+          cd downloads
+          
+          echo "========================================="
+          echo "📤 UPLOADING SINGLE EPISODES"
+          echo "========================================="
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+          echo "📊 Episodes: $(ls -1 EP*.mp4 2>/dev/null | wc -l)"
+          echo "========================================="
+          
+          cat > upload_single.py << 'EOFUPLOAD'
+          import os
+          import sys
+          import glob
+          import re
+          import subprocess
+          import asyncio
+          import datetime
+          
+          try:
+              from telethon import TelegramClient
+              from telethon.sessions import StringSession
+              from telethon.errors import FloodWaitError
+              from telethon.tl.types import DocumentAttributeVideo
+              import telethon
+              print(f"✅ Telethon version: {telethon.__version__}")
+          except ImportError as e:
+              print(f"❌ Import error: {e}")
+              sys.exit(1)
+          
+          api_id = os.environ.get("TG_API_ID")
+          api_hash = os.environ.get("TG_API_HASH")
+          session_string = os.environ.get("TG_SESSION_STRING")
+          chat_id = int(os.environ.get("TG_SINGLE_EPISODES_CHAT_ID")) if os.environ.get("TG_SINGLE_EPISODES_CHAT_ID") else None
+          series_title = os.environ.get("SERIES_TITLE", "Series")
+          
+          if not all([api_id, api_hash, session_string, chat_id]):
+              print("❌ Missing Telegram credentials.")
+              sys.exit(0)
+          
+          async def main():
+              try:
+                  client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
+                  await client.connect()
+                  
+                  if not await client.is_user_authorized():
+                      print("❌ Session invalid")
+                      return
+                  
+                  me = await client.get_me()
+                  print(f"✅ Logged in: {me.first_name}")
+                  
+                  entity = await client.get_entity(chat_id)
+                  
+                  ep_files = sorted(glob.glob("EP*.mp4"), 
+                      key=lambda f: int(re.search(r'EP(\d+)\.mp4', f).group(1)) if re.search(r'EP(\d+)\.mp4', f) else 0)
+                  
+                  if not ep_files:
+                      print("❌ No episode files found!")
+                      return
+                  
+                  print(f"📊 Found {len(ep_files)} episodes to upload")
+                  
+                  for ep_file in ep_files:
+                      ep_match = re.search(r'EP(\d+)\.mp4', ep_file)
+                      if not ep_match:
+                          continue
+                      ep_num = int(ep_match.group(1))
+                      
+                      file_size = os.path.getsize(ep_file) / (1024 * 1024)
+                      print(f"📤 Uploading Episode {ep_num} ({file_size:.1f} MB)...")
+                      
+                      caption = f"📺 Episode {ep_num} - {series_title}"
+                      
+                      try:
+                          await client.send_file(
+                              entity,
+                              ep_file,
+                              caption=caption,
+                              supports_streaming=True
+                          )
+                          print(f"✅ Episode {ep_num} uploaded")
+                      except FloodWaitError as e:
+                          print(f"⏳ Rate limited: waiting {e.seconds}s")
+                          await asyncio.sleep(e.seconds)
+                          await client.send_file(
+                              entity,
+                              ep_file,
+                              caption=caption,
+                              supports_streaming=True
+                          )
+                          print(f"✅ Episode {ep_num} uploaded")
+                      except Exception as e:
+                          print(f"❌ Episode {ep_num} error: {e}")
+                      
+                      await asyncio.sleep(1)
+                  
+                  print("✅ All episodes uploaded!")
+                  
+              except Exception as e:
+                  print(f"❌ Error: {e}")
+              
+              await client.disconnect()
+          
+          if __name__ == '__main__':
+              asyncio.run(main())
+          EOFUPLOAD
+          
+          python3 -u upload_single.py
+          echo "done" > single_episodes_complete.txt
 
-      - name: Wait for All Uploads with Enhanced Progress Monitoring
+      - name: Wait for Uploads
         if: steps.verify.outputs.verify_success == 'true'
-        # ... [monitoring step remains the same]
+        run: |
+          cd downloads
+          
+          echo "========================================="
+          echo "⏳ WAITING FOR UPLOADS TO COMPLETE"
+          echo "========================================="
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+          echo "========================================="
+          
+          # Wait for merged upload
+          if [ -n "${{ env.merged_pid }}" ]; then
+            echo "⏳ Waiting for merged upload (PID: ${{ env.merged_pid }})..."
+            tail -f merged_upload.log &
+            wait ${{ env.merged_pid }} 2>/dev/null || true
+            echo "✅ Merged upload complete!"
+          fi
+          
+          # Wait for single episodes
+          echo "⏳ Waiting for single episodes..."
+          while [ ! -f "single_episodes_complete.txt" ]; do
+            sleep 2
+          done
+          echo "✅ Single episodes complete!"
+          
+          echo "========================================="
+          echo "✅ ALL UPLOADS COMPLETED!"
+          echo "========================================="
 
       - name: Cleanup - Delete Workflow Run if Successful
         if: success()
