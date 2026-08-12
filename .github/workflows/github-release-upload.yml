@@ -533,7 +533,9 @@ jobs:
             if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
               echo "⚠️ $f has no video stream!"
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
-              REDOWNLOAD_LIST="$REDOWNLOAD_LIST $EP_NUM"
+              # Remove leading zeros for the list
+              EP_NUM_CLEAN=$(echo "$EP_NUM" | sed 's/^0*//')
+              REDOWNLOAD_LIST="$REDOWNLOAD_LIST $EP_NUM_CLEAN"
               NEEDS_REDOWNLOAD=true
             else
               # Also check resolution
@@ -543,7 +545,8 @@ jobs:
               if [ -z "$WIDTH" ] || [ "$WIDTH" = "0" ] || [ -z "$HEIGHT" ] || [ "$HEIGHT" = "0" ]; then
                 echo "⚠️ $f has video but invalid resolution (${WIDTH}x${HEIGHT})!"
                 EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
-                REDOWNLOAD_LIST="$REDOWNLOAD_LIST $EP_NUM"
+                EP_NUM_CLEAN=$(echo "$EP_NUM" | sed 's/^0*//')
+                REDOWNLOAD_LIST="$REDOWNLOAD_LIST $EP_NUM_CLEAN"
                 NEEDS_REDOWNLOAD=true
               else
                 echo "✅ $f: ${WIDTH}x${HEIGHT} video stream OK"
@@ -559,10 +562,10 @@ jobs:
             # Read URLs into array
             mapfile -t URL_ARRAY < urls.txt
             
-            for EP_NUM in $REDOWNLOAD_LIST; do
-              EP_NUM_FORMATTED=$(printf "%02d" $EP_NUM)
+            for EP_NUM_CLEAN in $REDOWNLOAD_LIST; do
+              EP_NUM_FORMATTED=$(printf "%02d" "$EP_NUM_CLEAN" 2>/dev/null || echo "$EP_NUM_CLEAN")
               FILE="EP${EP_NUM_FORMATTED}.mp4"
-              URL_INDEX=$((EP_NUM - 1))
+              URL_INDEX=$((EP_NUM_CLEAN - 1))
               
               if [ $URL_INDEX -ge 0 ] && [ $URL_INDEX -lt ${#URL_ARRAY[@]} ]; then
                 URL="${URL_ARRAY[$URL_INDEX]}"
@@ -740,7 +743,8 @@ jobs:
           TARGET_AUDIO_CODEC=$(printf '%s\n' "${audio_codecs[@]}" | grep -v "^$" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           if [ -z "$TARGET_AUDIO_CODEC" ]; then
             TARGET_AUDIO_CODEC="AAC"
-          fi          
+          fi
+          
           TARGET_W=$(echo "$TARGET_RES" | cut -d'x' -f1)
           TARGET_H=$(echo "$TARGET_RES" | cut -d'x' -f2)
           
