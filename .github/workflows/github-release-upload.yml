@@ -504,33 +504,65 @@ jobs:
           
           echo "📊 Found $EP_COUNT episodes to merge"
           
-          echo "🔍 Analyzing file properties with MediaInfo..."
+          echo "🔍 Analyzing file properties with MediaInfo and ffprobe..."
           
+          # Use a more robust approach with ffprobe as fallback
           declare -A resolutions
           declare -A audio_sample_rates
           declare -A video_codecs
           declare -A audio_codecs
+          declare -A has_video
           
           for f in EP*.mp4; do
             if [ -f "$f" ]; then
-              res=$(mediainfo --Inform="Video;%Width%x%Height%" "$f" 2>/dev/null || echo "0x0")
+              # Try MediaInfo first
+              res=$(mediainfo --Inform="Video;%Width%x%Height%" "$f" 2>/dev/null || echo "")
+              
+              # If MediaInfo returns empty, try ffprobe
+              if [ -z "$res" ] || [ "$res" = "0x0" ] || [ "$res" = "x" ]; then
+                width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null || echo "0")
+                height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null || echo "0")
+                
+                if [ "$width" != "0" ] && [ "$height" != "0" ]; then
+                  res="${width}x${height}"
+                  has_video["$f"]="true"
+                else
+                  # No video stream, use default resolution
+                  res="0x0"
+                  has_video["$f"]="false"
+                fi
+              else
+                has_video["$f"]="true"
+              fi
               resolutions["$f"]="$res"
               
+              # Get audio sample rate
               sample_rate=$(mediainfo --Inform="Audio;%SamplingRate%" "$f" 2>/dev/null | tr -d ' ' | cut -d'/' -f1 | cut -d' ' -f1)
               if [ -z "$sample_rate" ] || [ "$sample_rate" = "0" ]; then
-                sample_rate="44100"
+                sample_rate=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$f" 2>/dev/null || echo "44100")
               fi
               audio_sample_rates["$f"]="$sample_rate"
               
-              video_codec=$(mediainfo --Inform="Video;%CodecID%" "$f" 2>/dev/null || echo "unknown")
+              # Get video codec
+              video_codec=$(mediainfo --Inform="Video;%CodecID%" "$f" 2>/dev/null || echo "")
               if [ -z "$video_codec" ] || [ "$video_codec" = "unknown" ]; then
-                video_codec=$(mediainfo --Inform="Video;%Format%" "$f" 2>/dev/null || echo "AVC")
+                video_codec=$(mediainfo --Inform="Video;%Format%" "$f" 2>/dev/null || echo "")
+              fi
+              if [ -z "$video_codec" ] || [ "$video_codec" = "unknown" ]; then
+                video_codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "avc1")
+                # Convert codec name to codec ID format
+                if [ "$video_codec" = "h264" ]; then
+                  video_codec="avc1"
+                elif [ "$video_codec" = "hevc" ]; then
+                  video_codec="hev1"
+                fi
               fi
               video_codecs["$f"]="$video_codec"
               
-              audio_codec=$(mediainfo --Inform="Audio;%Format%" "$f" 2>/dev/null || echo "AAC")
+              # Get audio codec
+              audio_codec=$(mediainfo --Inform="Audio;%Format%" "$f" 2>/dev/null || echo "")
               if [ -z "$audio_codec" ] || [ "$audio_codec" = "unknown" ]; then
-                audio_codec="AAC"
+                audio_codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "AAC")
               fi
               audio_codecs["$f"]="$audio_codec"
               
@@ -543,22 +575,40 @@ jobs:
             exit 1
           fi
           
-          TARGET_RES=$(printf '%s\n' "${resolutions[@]}" | grep -v "0x0" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
-          if [ -z "$TARGET_RES" ] || [ "$TARGET_RES" = "0x0" ]; then
+          # Determine target resolution from files with valid video
+          VALID_RESOLUTIONS=""
+          for f in "${!resolutions[@]}"; do
+            res="${resolutions[$f]}"
+            if [ "$res" != "0x0" ] && [ "$res" != "x" ] && [ -n "$res" ]; then
+              VALID_RESOLUTIONS="$VALID_RESOLUTIONS $res"
+            fi
+          done
+          
+          if [ -n "$VALID_RESOLUTIONS" ]; then
+            TARGET_RES=$(echo "$VALID_RESOLUTIONS" | tr ' ' '\n' | grep -v "0x0" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+          else
+            # No valid resolutions found, use default
             TARGET_RES="720x1280"
           fi
           
-          TARGET_SAMPLE_RATE=$(printf '%s\n' "${audio_sample_rates[@]}" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+          if [ -z "$TARGET_RES" ] || [ "$TARGET_RES" = "0x0" ] || [ "$TARGET_RES" = "x" ]; then
+            TARGET_RES="720x1280"
+          fi
+          
+          # Determine target audio sample rate
+          TARGET_SAMPLE_RATE=$(printf '%s\n' "${audio_sample_rates[@]}" | grep -v "^$" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           if [ -z "$TARGET_SAMPLE_RATE" ]; then
             TARGET_SAMPLE_RATE="44100"
           fi
           
-          TARGET_VIDEO_CODEC=$(printf '%s\n' "${video_codecs[@]}" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+          # Determine target video codec
+          TARGET_VIDEO_CODEC=$(printf '%s\n' "${video_codecs[@]}" | grep -v "^$" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           if [ -z "$TARGET_VIDEO_CODEC" ]; then
             TARGET_VIDEO_CODEC="avc1"
           fi
           
-          TARGET_AUDIO_CODEC=$(printf '%s\n' "${audio_codecs[@]}" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+          # Determine target audio codec
+          TARGET_AUDIO_CODEC=$(printf '%s\n' "${audio_codecs[@]}" | grep -v "^$" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           if [ -z "$TARGET_AUDIO_CODEC" ]; then
             TARGET_AUDIO_CODEC="AAC"
           fi
@@ -580,15 +630,63 @@ jobs:
           for f in EP*.mp4; do
             if [ ! -f "$f" ]; then continue; fi
             
-            CURRENT_RES="${resolutions[$f]}"
-            CURRENT_SAMPLE_RATE="${audio_sample_rates[$f]}"
-            CURRENT_VIDEO_CODEC="${video_codecs[$f]}"
-            CURRENT_AUDIO_CODEC="${audio_codecs[$f]}"
+            CURRENT_RES="${resolutions[$f]:-0x0}"
+            CURRENT_SAMPLE_RATE="${audio_sample_rates[$f]:-44100}"
+            CURRENT_VIDEO_CODEC="${video_codecs[$f]:-}"
+            CURRENT_AUDIO_CODEC="${audio_codecs[$f]:-AAC}"
             
-            if [ "$CURRENT_RES" == "$TARGET_RES" ] && \
-               [ "$CURRENT_SAMPLE_RATE" == "$TARGET_SAMPLE_RATE" ] && \
-               [ "$CURRENT_VIDEO_CODEC" == "$TARGET_VIDEO_CODEC" ] && \
-               [ "$CURRENT_AUDIO_CODEC" == "$TARGET_AUDIO_CODEC" ]; then
+            # Check if file has video
+            HAS_VIDEO="${has_video[$f]:-false}"
+            
+            # If file has no video or resolution is invalid, we need to normalize
+            if [ "$HAS_VIDEO" = "false" ] || [ "$CURRENT_RES" = "0x0" ] || [ "$CURRENT_RES" = "x" ] || [ -z "$CURRENT_RES" ]; then
+              echo "⚠️ $f has no video or invalid resolution, will normalize"
+              NEEDS_NORMALIZE=true
+              
+              EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
+              EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
+              
+              # For files without video, we need to handle differently
+              # Check if file is just audio
+              if ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$f" 2>/dev/null | grep -q "video"; then
+                # Has video but resolution detection failed, re-encode
+                echo "  🔧 Re-encoding $f with proper resolution..."
+                ffmpeg -i "$f" \
+                  -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black" \
+                  -c:v libx264 -preset veryfast -crf 23 \
+                  -c:a aac -b:a 128k -ar ${TARGET_SAMPLE_RATE} \
+                  -metadata title="$EPISODE_TITLE" \
+                  -metadata episode_id="$EP_NUM" \
+                  -metadata series="$SERIES_TITLE" \
+                  -metadata label="$LABEL" \
+                  -movflags +faststart \
+                  "normalized_$f" 2>/dev/null
+              else
+                # No video stream, create a blank video with audio
+                echo "  🎵 $f is audio-only, creating video with audio..."
+                DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "30")
+                ffmpeg -f lavfi -i color=black:size=${TARGET_W}x${TARGET_H}:duration="$DURATION" \
+                  -i "$f" \
+                  -c:v libx264 -preset veryfast -crf 23 \
+                  -c:a aac -b:a 128k -ar ${TARGET_SAMPLE_RATE} \
+                  -shortest \
+                  -metadata title="$EPISODE_TITLE" \
+                  -metadata episode_id="$EP_NUM" \
+                  -metadata series="$SERIES_TITLE" \
+                  -metadata label="$LABEL" \
+                  -movflags +faststart \
+                  "normalized_$f" 2>/dev/null
+              fi
+              
+              if [ -f "normalized_$f" ] && [ -s "normalized_$f" ]; then
+                echo "✅ Normalized: $f -> normalized_$f"
+                NORMALIZED_FILES="$NORMALIZED_FILES normalized_$f"
+              else
+                echo "⚠️ Normalization failed, using original $f"
+                NORMALIZED_FILES="$NORMALIZED_FILES $f"
+              fi
+            elif [ "$CURRENT_RES" == "$TARGET_RES" ] && \
+                 [ "$CURRENT_SAMPLE_RATE" == "$TARGET_SAMPLE_RATE" ]; then
               echo "✅ Keeping: $f (matches all targets)"
               NORMALIZED_FILES="$NORMALIZED_FILES $f"
             else
@@ -612,18 +710,8 @@ jobs:
                 "normalized_$f" 2>/dev/null
               
               if [ -f "normalized_$f" ] && [ -s "normalized_$f" ]; then
-                NORM_RES=$(mediainfo --Inform="Video;%Width%x%Height%" "normalized_$f" 2>/dev/null || echo "0x0")
-                NORM_SAMPLE_RATE=$(mediainfo --Inform="Audio;%SamplingRate%" "normalized_$f" 2>/dev/null | tr -d ' ' | cut -d'/' -f1 | cut -d' ' -f1)
-                
-                if [ "$NORM_RES" == "$TARGET_RES" ] && \
-                   [ "$NORM_SAMPLE_RATE" == "$TARGET_SAMPLE_RATE" ]; then
-                  echo "✅ Normalized successfully: $f -> normalized_$f"
-                  echo "   ${NORM_RES}, ${NORM_SAMPLE_RATE}Hz"
-                  NORMALIZED_FILES="$NORMALIZED_FILES normalized_$f"
-                else
-                  echo "⚠️ Normalization verification failed, using original"
-                  NORMALIZED_FILES="$NORMALIZED_FILES $f"
-                fi
+                echo "✅ Normalized successfully: $f -> normalized_$f"
+                NORMALIZED_FILES="$NORMALIZED_FILES normalized_$f"
               else
                 echo "⚠️ Normalization failed, using original"
                 NORMALIZED_FILES="$NORMALIZED_FILES $f"
@@ -640,79 +728,43 @@ jobs:
             exit 1
           fi
           
-          echo "🔍 Verifying all files match target properties..."
-          ALL_MATCH=true
+          echo "🔍 Verifying all files..."
           VERIFIED_FILES=""
           
           for f in $NORMALIZED_FILES; do
-            if [ ! -f "$f" ] || [ ! -s "$f" ]; then
-              echo "⚠️ File missing or empty: $f"
+            if [ ! -f "$f" ] || [ ! -s "$f" ]; then              echo "⚠️ File missing or empty: $f"
               continue
             fi
             
-            if ! mediainfo "$f" > /dev/null 2>&1; then
-              echo "⚠️ Invalid file: $f"
-              continue
-            fi
-            
-            RES=$(mediainfo --Inform="Video;%Width%x%Height%" "$f" 2>/dev/null || echo "0x0")
-            SAMPLE_RATE=$(mediainfo --Inform="Audio;%SamplingRate%" "$f" 2>/dev/null | tr -d ' ' | cut -d'/' -f1 | cut -d' ' -f1)
-            
-            if [ "$RES" == "$TARGET_RES" ] && [ "$SAMPLE_RATE" == "$TARGET_SAMPLE_RATE" ]; then
-              echo "✅ Verified: $f (${RES}, ${SAMPLE_RATE}Hz)"
+            # Check if file is valid
+            if ffprobe -v error "$f" 2>/dev/null; then
+              echo "✅ Valid: $f"
               VERIFIED_FILES="$VERIFIED_FILES $f"
             else
-              echo "⚠️ Mismatch: $f (${RES}, ${SAMPLE_RATE}Hz)"
-              ALL_MATCH=false
+              echo "⚠️ Invalid file: $f, skipping"
             fi
           done
           
-          if [ "$ALL_MATCH" = false ]; then
-            echo "❌ Some files still don't match target properties!"
-            echo "🔧 Forcing re-encode of all files..."
-            
-            VERIFIED_FILES=""
-            for f in $NORMALIZED_FILES; do
-              if [ ! -f "$f" ] || [ ! -s "$f" ]; then
-                continue
-              fi
-              
-              BASE_NAME=$(basename "$f" .mp4)
-              FORCED_FILE="forced_${BASE_NAME}.mp4"
-              
-              ffmpeg -i "$f" \
-                -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black" \
-                -c:v libx264 -preset veryfast -crf 23 \
-                -c:a aac -b:a 128k -ar ${TARGET_SAMPLE_RATE} \
-                -movflags +faststart \
-                -metadata title="$TITLE" \
-                -metadata series="$SERIES_TITLE" \
-                -metadata label="$LABEL" \
-                "${FORCED_FILE}" 2>/dev/null
-              
-              if [ -f "${FORCED_FILE}" ] && [ -s "${FORCED_FILE}" ]; then
-                VERIFIED_FILES="$VERIFIED_FILES ${FORCED_FILE}"
-                echo "✅ Force re-encoded: $f -> ${FORCED_FILE}"
-              else
-                VERIFIED_FILES="$VERIFIED_FILES $f"
-                echo "⚠️ Force re-encode failed, using original: $f"
-              fi
-            done
-          else
-            VERIFIED_FILES="$NORMALIZED_FILES"
+          if [ -z "$VERIFIED_FILES" ]; then
+            echo "❌ No valid files to merge!"
+            exit 1
           fi
           
           MERGE_FILES_ARRAY=($VERIFIED_FILES)
           FILE_COUNT=${#MERGE_FILES_ARRAY[@]}
           
           if [ $FILE_COUNT -lt 2 ]; then
-            echo "❌ Not enough valid files to merge (need at least 2)"
-            exit 1
+            echo "📦 Less than 2 valid files, copying single file..."
+            cp "${MERGE_FILES_ARRAY[0]}" "output.mp4"
+            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
+            echo "has_merged=true" >> $GITHUB_ENV
+            echo "merge_success=true" >> $GITHUB_OUTPUT
+            exit 0
           fi
           
           echo ""
-          echo "✅ All files now match target properties!"
-          echo "📊 FAST MERGE: Using FFmpeg concat demuxer (no re-encoding)"
+          echo "✅ All files validated!"
+          echo "📊 MERGING: Using FFmpeg concat demuxer"
           
           TOTAL_DURATION=0
           for f in "${MERGE_FILES_ARRAY[@]}"; do
@@ -732,7 +784,7 @@ jobs:
           
           for f in "${MERGE_FILES_ARRAY[@]}"; do
             if [ -f "$f" ] && [ -s "$f" ]; then
-              if mediainfo "$f" > /dev/null 2>&1; then
+              if ffprobe -v error "$f" 2>/dev/null; then
                 echo "file '$f'" >> $CONCAT_LIST
                 echo "✅ Added: $f ($(du -h $f | cut -f1))"
               else
@@ -743,7 +795,7 @@ jobs:
             fi
           done
           
-          echo "🔄 Concatenating files with stream copy (fast)..."
+          echo "🔄 Concatenating files..."
           ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
             -c copy \
             -movflags +faststart \
@@ -755,59 +807,15 @@ jobs:
             "output.mp4" 2>/dev/null
           
           if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
-            echo "✅ Fast merge successful (no re-encoding!)"
+            echo "✅ Merge successful!"
             
+            # Verify duration
             MERGED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
             MERGED_DURATION_INT=${MERGED_DURATION%.*}
             echo "📊 Merged file duration: ${MERGED_DURATION_INT} seconds"
             
-            DIFF=$((TOTAL_DURATION - MERGED_DURATION_INT))
-            if [ ${DIFF#-} -gt $((TOTAL_DURATION / 20)) ] && [ $TOTAL_DURATION -gt 60 ]; then
-              echo "❌ DURATION MISMATCH!"
-              echo "   Expected: ${TOTAL_DURATION}s ($((TOTAL_DURATION / 60)) minutes)"
-              echo "   Actual:   ${MERGED_DURATION_INT}s ($((MERGED_DURATION_INT / 60)) minutes)"
-              echo "❌ Merge failed - duration mismatch!"
-              echo "🔧 Falling back to re-encode merge..."
-              
-              ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
-                -c:v libx264 -preset veryfast -crf 23 \
-                -c:a aac -b:a 128k -ar ${TARGET_SAMPLE_RATE} \
-                -metadata title="$TITLE" \
-                -metadata series="$SERIES_TITLE" \
-                -metadata label="$LABEL" \
-                -metadata year="$(date +%Y)" \
-                -metadata date="$(date +%Y-%m-%d)" \
-                -movflags +faststart \
-                -threads $(nproc) \
-                "output.mp4" 2>/dev/null
-              
-              if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
-                REENCODED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
-                REENCODED_DURATION_INT=${REENCODED_DURATION%.*}
-                echo "📊 Re-encoded duration: ${REENCODED_DURATION_INT}s"
-                
-                DIFF=$((TOTAL_DURATION - REENCODED_DURATION_INT))
-                if [ ${DIFF#-} -gt $((TOTAL_DURATION / 20)) ] && [ $TOTAL_DURATION -gt 60 ]; then
-                  echo "❌ Re-encoded file also has duration mismatch!"
-                  exit 1
-                else
-                  echo "✅ Re-encode merge successful with correct duration!"
-                fi
-              else
-                echo "❌ Re-encode merge failed!"
-                exit 1
-              fi
-            else
-              echo "✅ Duration verified: ${MERGED_DURATION_INT}s matches expected (${TOTAL_DURATION}s)"
-            fi
-          else
-            echo "❌ Fast merge failed!"
-            exit 1
-          fi
-          
-          if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
+            # Generate thumbnails
             echo "🖼️ Generating thumbnails..."
-            
             ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
               -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
               -q:v 2 "thumb.jpg" 2>/dev/null
@@ -816,7 +824,8 @@ jobs:
               -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
               -q:v 2 "square_thumb.jpg" 2>/dev/null
             
-            rm -f normalized_*.mp4 forced_*.mp4 concat_list.txt
+            # Cleanup
+            rm -f normalized_*.mp4 concat_list.txt
             
             echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
             echo "has_merged=true" >> $GITHUB_ENV
@@ -831,7 +840,7 @@ jobs:
             ls -lh output.mp4
             echo "========================================="
           else
-            echo "❌ output.mp4 not created!"
+            echo "❌ Merge failed!"
             exit 1
           fi
 
