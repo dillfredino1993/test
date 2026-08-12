@@ -54,8 +54,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool
           pip3 install --upgrade pip
-          pip3 install telethon qrcode yt-dlp requests
-          pip3 install aiohttp python-socks[asyncio]
+          pip3 install telethon qrcode requests aiohttp python-socks[asyncio] cloudscraper beautifulsoup4 lxml
           python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')"
           
           echo "========================================="
@@ -128,6 +127,303 @@ jobs:
           
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
+      - name: Create Dood Downloader Script
+        run: |
+          cd downloads
+          
+          cat > dood_downloader.py << 'EOFDOOD'
+          import os
+          import sys
+          import re
+          import json
+          import time
+          import subprocess
+          from urllib.parse import urlparse, parse_qs, unquote
+          
+          try:
+              import cloudscraper
+              print("✅ cloudscraper loaded")
+          except ImportError:
+              print("❌ cloudscraper not available")
+              sys.exit(1)
+          
+          try:
+              from bs4 import BeautifulSoup
+              print("✅ BeautifulSoup loaded")
+          except ImportError:
+              print("⚠️ BeautifulSoup not available, using regex fallback")
+              BeautifulSoup = None
+          
+          def extract_dood_video_url(url):
+              """
+              Extract the actual video URL from dood.to/doodstream
+              Using cloudscraper to bypass Cloudflare
+              """
+              print(f"🔍 Extracting video URL from: {url}")
+              
+              # Create a cloudscraper session with browser headers
+              scraper = cloudscraper.create_scraper(
+                  browser={
+                      'browser': 'chrome',
+                      'platform': 'windows',
+                      'mobile': False
+                  },
+                  interpreter='nodejs'  # Use nodejs for better JS execution
+              )
+              
+              # Set headers to look like a real browser
+              headers = {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                  'Accept-Language': 'en-US,en;q=0.5',
+                  'Accept-Encoding': 'gzip, deflate, br',
+                  'Connection': 'keep-alive',
+                  'Upgrade-Insecure-Requests': '1',
+                  'Sec-Fetch-Dest': 'document',
+                  'Sec-Fetch-Mode': 'navigate',
+                  'Sec-Fetch-Site': 'none',
+                  'Sec-Fetch-User': '?1',
+                  'Cache-Control': 'max-age=0',
+              }
+              
+              try:
+                  print("📡 Fetching page...")
+                  response = scraper.get(url, headers=headers, timeout=30)
+                  response.raise_for_status()
+                  
+                  html = response.text
+                  
+                  # Try multiple extraction methods
+                  video_url = None
+                  
+                  # Method 1: Look for embedded video URL in JavaScript
+                  print("🔍 Method 1: Searching JavaScript for video URL...")
+                  js_patterns = [
+                      r'(?:file|video|src|url)\s*:\s*["\']([^"\']+\.(?:mp4|m3u8)[^"\']*)["\']',
+                      r'(?:file|video|src|url)\s*:\s*["\']([^"\']+cdn\d+[^"\']+)["\']',
+                      r'(?:file|video|src|url)\s*:\s*["\'](https?://[^"\']+\.(?:mp4|m3u8)[^"\']*)["\']',
+                      r'player\.setup\s*\(\s*\{[^}]*src\s*:\s*["\']([^"\']+)["\']',
+                      r'jwplayer\.[^;]+file\s*:\s*["\']([^"\']+)["\']',
+                      r'videojs\.[^;]+src\s*:\s*["\']([^"\']+)["\']',
+                      r'data-video\s*=\s*["\']([^"\']+)["\']',
+                      r'data-url\s*=\s*["\']([^"\']+)["\']',
+                      r'<source[^>]+src=["\']([^"\']+)["\']',
+                      r'<video[^>]+src=["\']([^"\']+)["\']',
+                  ]
+                  
+                  for pattern in js_patterns:
+                      matches = re.findall(pattern, html, re.IGNORECASE)
+                      for match in matches:
+                          if match and match.startswith('http') and ('.mp4' in match or '.m3u8' in match):
+                              # Clean up the URL
+                              if '\\' in match:
+                                  match = match.replace('\\', '')
+                              video_url = match
+                              print(f"✅ Found video URL in JavaScript: {video_url[:100]}...")
+                              return video_url
+                  
+                  # Method 2: Use BeautifulSoup to parse the page
+                  if BeautifulSoup:
+                      print("🔍 Method 2: Using BeautifulSoup to parse HTML...")
+                      soup = BeautifulSoup(html, 'html.parser')
+                      
+                      # Look for video elements
+                      for video_tag in soup.find_all(['video', 'source']):
+                          src = video_tag.get('src')
+                          if src and src.startswith('http') and ('.mp4' in src or '.m3u8' in src):
+                              video_url = src
+                              print(f"✅ Found video URL from video tag: {video_url[:100]}...")
+                              return video_url
+                      
+                      # Look for div elements with data attributes
+                      for div in soup.find_all('div'):
+                          for attr in ['data-video', 'data-url', 'data-src']:
+                              src = div.get(attr)
+                              if src and src.startswith('http') and ('.mp4' in src or '.m3u8' in src):
+                                  video_url = src
+                                  print(f"✅ Found video URL from data attribute: {video_url[:100]}...")
+                                  return video_url
+                      
+                      # Look for iframes that might contain the video
+                      for iframe in soup.find_all('iframe'):
+                          src = iframe.get('src')
+                          if src and 'dood' in src:
+                              print(f"🔄 Found dood iframe: {src}")
+                              # Try to extract from iframe
+                              try:
+                                  iframe_response = scraper.get(src, headers=headers, timeout=30)
+                                  iframe_html = iframe_response.text
+                                  # Search for video URL in iframe
+                                  iframe_patterns = [
+                                      r'(?:file|video|src|url)\s*:\s*["\']([^"\']+\.(?:mp4|m3u8)[^"\']*)["\']',
+                                      r'<source[^>]+src=["\']([^"\']+)["\']',
+                                  ]
+                                  for pattern in iframe_patterns:
+                                      iframe_matches = re.findall(pattern, iframe_html, re.IGNORECASE)
+                                      for match in iframe_matches:
+                                          if match and match.startswith('http'):
+                                              video_url = match
+                                              print(f"✅ Found video URL in iframe: {video_url[:100]}...")
+                                              return video_url
+                              except Exception as e:
+                                  print(f"⚠️ Could not process iframe: {e}")
+                  
+                  # Method 3: Look for encoded video URL
+                  print("🔍 Method 3: Looking for encoded URLs...")
+                  encoded_patterns = [
+                      r'decodeURIComponent\s*\(\s*["\']([^"\']+)["\']\s*\)',
+                      r'atob\s*\(\s*["\']([^"\']+)["\']\s*\)',
+                      r'%[0-9A-F]{2}',
+                  ]
+                  
+                  for pattern in encoded_patterns:
+                      matches = re.findall(pattern, html)
+                      for match in matches:
+                          if 'http' in match or ('.mp4' in match or '.m3u8' in match):
+                              # Try to decode
+                              try:
+                                  decoded = unquote(match)
+                                  if decoded.startswith('http'):
+                                      video_url = decoded
+                                      print(f"✅ Found decoded video URL: {video_url[:100]}...")
+                                      return video_url
+                              except:
+                                  pass
+                  
+                  # Method 4: Search for CDN links
+                  print("🔍 Method 4: Searching for CDN links...")
+                  cdn_patterns = [
+                      r'https?://[^"\']+cdn[^"\']+\.(?:mp4|m3u8)[^"\']*',
+                      r'https?://[^"\']+cloudfront[^"\']+\.(?:mp4|m3u8)[^"\']*',
+                      r'https?://[^"\']+doodcdn[^"\']+\.(?:mp4|m3u8)[^"\']*',
+                  ]
+                  
+                  for pattern in cdn_patterns:
+                      matches = re.findall(pattern, html, re.IGNORECASE)
+                      for match in matches:
+                          if match.startswith('http'):
+                              video_url = match
+                              print(f"✅ Found CDN video URL: {video_url[:100]}...")
+                              return video_url
+                  
+                  # Method 5: Check if there's a redirect to the video
+                  print("🔍 Method 5: Checking for redirects...")
+                  if 'redirect' in html.lower() or 'window.location' in html:
+                      redirect_patterns = [
+                          r'window\.location\s*=\s*["\']([^"\']+)["\']',
+                          r'window\.location\.href\s*=\s*["\']([^"\']+)["\']',
+                          r'location\.href\s*=\s*["\']([^"\']+)["\']',
+                          r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^"\']+url=([^"\']+)["\']',
+                      ]
+                      for pattern in redirect_patterns:
+                          matches = re.findall(pattern, html, re.IGNORECASE)
+                          for match in matches:
+                              if match and ('.mp4' in match or '.m3u8' in match or 'dood' in match):
+                                  if match.startswith('http'):
+                                      video_url = match
+                                      print(f"✅ Found redirect URL: {video_url[:100]}...")
+                                      return video_url
+                                  elif match.startswith('/'):
+                                      # Relative URL
+                                      parsed = urlparse(url)
+                                      base_url = f"{parsed.scheme}://{parsed.netloc}"
+                                      video_url = base_url + match
+                                      print(f"✅ Found redirect URL: {video_url[:100]}...")
+                                      return video_url
+                  
+                  print("❌ Could not extract video URL from page")
+                  return None
+                  
+              except Exception as e:
+                  print(f"❌ Error extracting video URL: {e}")
+                  import traceback
+                  traceback.print_exc()
+                  return None
+          
+          def download_dood_video(url, output_path):
+              """
+              Download video from dood.to
+              """
+              print(f"📥 Downloading from dood.to: {url}")
+              print(f"💾 Output: {output_path}")
+              
+              # Get the actual video URL
+              video_url = extract_dood_video_url(url)
+              
+              if not video_url:
+                  print("❌ Could not extract video URL")
+                  return False
+              
+              print(f"✅ Extracted video URL: {video_url[:100]}...")
+              
+              # Download with aria2
+              cmd = [
+                  "aria2c",
+                  "-x", "16",
+                  "-s", "16",
+                  "-k", "1M",
+                  "--continue=true",
+                  "--console-log-level=error",
+                  "--referer", url,
+                  "--header", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                  "-o", output_path,
+                  video_url
+              ]
+              
+              try:
+                  print("⏬ Starting download with aria2...")
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                  
+                  if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                      file_size = os.path.getsize(output_path) / (1024 * 1024)
+                      print(f"✅ Download successful! Size: {file_size:.1f} MB")
+                      return True
+                  else:
+                      print(f"❌ aria2 download failed: {result.stderr[:200]}")
+                      
+                      # Try with curl as fallback
+                      print("🔄 Trying curl as fallback...")
+                      curl_cmd = [
+                          "curl",
+                          "-L",
+                          "-o", output_path,
+                          "--referer", url,
+                          "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                          video_url
+                      ]
+                      
+                      try:
+                          result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=600)
+                          if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                              file_size = os.path.getsize(output_path) / (1024 * 1024)
+                              print(f"✅ Download successful with curl! Size: {file_size:.1f} MB")
+                              return True
+                      except Exception as e:
+                          print(f"❌ curl failed: {e}")
+                      
+                      return False
+                      
+              except subprocess.TimeoutExpired:
+                  print("❌ Download timeout (10 minutes)")
+                  return False
+              except Exception as e:
+                  print(f"❌ Download error: {e}")
+                  return False
+          
+          if __name__ == "__main__":
+              if len(sys.argv) < 3:
+                  print("Usage: python dood_downloader.py <url> <output_path>")
+                  sys.exit(1)
+              
+              url = sys.argv[1]
+              output_path = sys.argv[2]
+              
+              success = download_dood_video(url, output_path)
+              sys.exit(0 if success else 1)
+          EOFDOOD
+          
+          echo "✅ Dood downloader script created"
+
       - name: Download All Episodes First
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
@@ -166,12 +462,13 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # Download the episode - try both methods
-            if [[ "$URL" == *".m3u8"* ]]; then
-              echo "📺 HLS stream - Using yt-dlp"
-              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts \
-                --no-progress --no-warnings \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
+            # Check if it's a dood.to link
+            if [[ "$URL" == *"dood.to"* ]] || [[ "$URL" == *"doodstream.com"* ]] || [[ "$URL" == *"dooood.com"* ]] || [[ "$URL" == *"dood.ws"* ]] || [[ "$URL" == *"dood.la"* ]]; then
+              echo "🎬 Dood stream detected - Using specialized downloader"
+              python3 dood_downloader.py "$URL" "$OUT_FILE"
+            elif [[ "$URL" == *".m3u8"* ]]; then
+              echo "📺 HLS stream - Using ffmpeg"
+              ffmpeg -i "$URL" -c copy -bsf:a aac_adtstoasc "$OUT_FILE" 2>/dev/null
             else
               echo "🎬 Direct file - Using aria2c"
               aria2c -x 16 -s 16 -k 1M --continue=true \
@@ -180,13 +477,20 @@ jobs:
               curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
             fi
             
-            # If download failed or file is too small, try yt-dlp as fallback
+            # If download failed or file is too small, try alternative methods
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
-              echo "⚠️ Initial download failed or file too small, trying yt-dlp..."
+              echo "⚠️ Initial download failed or file too small, trying alternatives..."
               rm -f "$OUT_FILE"
-              yt-dlp -f "bestvideo+bestaudio/best" \
-                --no-progress --no-warnings \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
+              
+              # If it's a dood link, try the downloader again with a different approach
+              if [[ "$URL" == *"dood.to"* ]] || [[ "$URL" == *"doodstream.com"* ]]; then
+                echo "🔄 Retrying dood download with different method..."
+                python3 dood_downloader.py "$URL" "$OUT_FILE"
+              else
+                # Try with yt-dlp as last resort (for non-dood links)
+                echo "🔄 Trying ffmpeg as last resort..."
+                ffmpeg -i "$URL" -c copy -bsf:a aac_adtstoasc "$OUT_FILE" 2>/dev/null
+              fi
             fi
             
             if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
@@ -554,7 +858,7 @@ jobs:
           # Redownload episodes that need it
           if [ "$NEEDS_REDOWNLOAD" = true ]; then
             echo ""
-            echo "🔄 Redownloading episodes with yt-dlp to ensure proper video..."
+            echo "🔄 Redownloading episodes to ensure proper video..."
             
             # Read URLs into array
             mapfile -t URL_ARRAY < urls.txt
@@ -567,16 +871,19 @@ jobs:
               if [ $URL_INDEX -ge 0 ] && [ $URL_INDEX -lt ${#URL_ARRAY[@]} ]; then
                 URL="${URL_ARRAY[$URL_INDEX]}"
                 echo ""
-                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp..."
+                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED..."
                 echo "📎 URL: $URL"
                 
                 # Remove the bad file
                 rm -f "$FILE"
                 
-                # Redownload with yt-dlp specifically to ensure video+audio
-                yt-dlp -f "bestvideo+bestaudio/best" \
-                  --no-progress --no-warnings \
-                  -o "$FILE" "$URL" < /dev/null 2>&1
+                # Check if it's a dood link and use specialized downloader
+                if [[ "$URL" == *"dood.to"* ]] || [[ "$URL" == *"doodstream.com"* ]] || [[ "$URL" == *"dooood.com"* ]]; then
+                  python3 dood_downloader.py "$URL" "$FILE"
+                else
+                  # Try ffmpeg for other links
+                  ffmpeg -i "$URL" -c copy -bsf:a aac_adtstoasc "$FILE" 2>/dev/null
+                fi
                 
                 if [ -f "$FILE" ] && [ -s "$FILE" ]; then
                   # Verify the new file has video
