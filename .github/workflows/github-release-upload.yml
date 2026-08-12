@@ -147,6 +147,12 @@ jobs:
           EP_INDEX=1
           FAILED_DOWNLOADS=""
           
+          # Store URLs in array for redownload if needed
+          declare -a URL_ARRAY
+          while IFS= read -r line; do
+            URL_ARRAY+=("$line")
+          done < urls.txt
+          
           while IFS= read -u 3 -r URL || [ -n "$URL" ]; do
             URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [ -z "$URL" ]; then continue; fi
@@ -160,7 +166,7 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # Download the episode
+            # Download the episode - try both methods
             if [[ "$URL" == *".m3u8"* ]]; then
               echo "📺 HLS stream - Using yt-dlp"
               yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts \
@@ -172,6 +178,15 @@ jobs:
                 --console-log-level=error \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null || \
               curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
+            fi
+            
+            # If download failed or file is too small, try yt-dlp as fallback
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ Initial download failed or file too small, trying yt-dlp..."
+              rm -f "$OUT_FILE"
+              yt-dlp -f "bestvideo+bestaudio/best" \
+                --no-progress --no-warnings \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
             fi
             
             if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
@@ -504,6 +519,120 @@ jobs:
           
           echo "📊 Found $EP_COUNT episodes to merge"
           
+          # First, verify all files have video streams and redownload if needed
+          echo "🔍 Checking all files for video streams..."
+          NEEDS_REDOWNLOAD=false
+          REDOWNLOAD_LIST=""
+          
+          for f in EP*.mp4; do
+            if [ ! -f "$f" ]; then continue; fi
+            
+            # Check if file has video stream
+            HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$f" 2>/dev/null)
+            
+            if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
+              echo "⚠️ $f has no video stream!"
+              EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
+              REDOWNLOAD_LIST="$REDOWNLOAD_LIST $EP_NUM"
+              NEEDS_REDOWNLOAD=true
+            else
+              # Also check resolution
+              WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null)
+              HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null)
+              
+              if [ -z "$WIDTH" ] || [ "$WIDTH" = "0" ] || [ -z "$HEIGHT" ] || [ "$HEIGHT" = "0" ]; then
+                echo "⚠️ $f has video but invalid resolution (${WIDTH}x${HEIGHT})!"
+                EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
+                REDOWNLOAD_LIST="$REDOWNLOAD_LIST $EP_NUM"
+                NEEDS_REDOWNLOAD=true
+              else
+                echo "✅ $f: ${WIDTH}x${HEIGHT} video stream OK"
+              fi
+            fi
+          done
+          
+          # Redownload episodes that need it
+          if [ "$NEEDS_REDOWNLOAD" = true ]; then
+            echo ""
+            echo "🔄 Redownloading episodes with yt-dlp to ensure proper video..."
+            
+            # Read URLs into array
+            mapfile -t URL_ARRAY < urls.txt
+            
+            for EP_NUM in $REDOWNLOAD_LIST; do
+              EP_NUM_FORMATTED=$(printf "%02d" $EP_NUM)
+              FILE="EP${EP_NUM_FORMATTED}.mp4"
+              URL_INDEX=$((EP_NUM - 1))
+              
+              if [ $URL_INDEX -ge 0 ] && [ $URL_INDEX -lt ${#URL_ARRAY[@]} ]; then
+                URL="${URL_ARRAY[$URL_INDEX]}"
+                echo ""
+                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp..."
+                echo "📎 URL: $URL"
+                
+                # Remove the bad file
+                rm -f "$FILE"
+                
+                # Redownload with yt-dlp specifically to ensure video+audio
+                yt-dlp -f "bestvideo+bestaudio/best" \
+                  --no-progress --no-warnings \
+                  -o "$FILE" "$URL" < /dev/null 2>&1
+                
+                if [ -f "$FILE" ] && [ -s "$FILE" ]; then
+                  # Verify the new file has video
+                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FILE" 2>/dev/null)
+                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                    echo "✅ Episode $EP_NUM_FORMATTED redownloaded successfully with video!"
+                  else
+                    echo "❌ Redownloaded file still has no video for Episode $EP_NUM_FORMATTED"
+                    echo "   Creating a blank video with audio instead..."
+                    
+                    # Create a blank video with the audio from the file
+                    DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FILE" 2>/dev/null || echo "30")
+                    TEMP_FILE="EP${EP_NUM_FORMATTED}_temp.mp4"
+                    
+                    ffmpeg -f lavfi -i color=black:size=720x1280:duration="$DURATION" \
+                      -i "$FILE" \
+                      -c:v libx264 -preset veryfast -crf 23 \
+                      -c:a aac -b:a 128k -ar 44100 \
+                      -shortest \
+                      -movflags +faststart \
+                      "$TEMP_FILE" 2>/dev/null
+                    
+                    if [ -f "$TEMP_FILE" ] && [ -s "$TEMP_FILE" ]; then
+                      mv "$TEMP_FILE" "$FILE"
+                      echo "✅ Created video from audio for Episode $EP_NUM_FORMATTED"
+                    fi
+                  fi
+                else
+                  echo "❌ Redownload failed for Episode $EP_NUM_FORMATTED"
+                  # Try to create a video from what we have
+                  DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FILE" 2>/dev/null || echo "30")
+                  TEMP_FILE="EP${EP_NUM_FORMATTED}_temp.mp4"
+                  
+                  ffmpeg -f lavfi -i color=black:size=720x1280:duration="$DURATION" \
+                    -i "$FILE" \
+                    -c:v libx264 -preset veryfast -crf 23 \
+                    -c:a aac -b:a 128k -ar 44100 \
+                    -shortest \
+                    -movflags +faststart \
+                    "$TEMP_FILE" 2>/dev/null
+                  
+                  if [ -f "$TEMP_FILE" ] && [ -s "$TEMP_FILE" ]; then
+                    mv "$TEMP_FILE" "$FILE"
+                    echo "✅ Created video from audio for Episode $EP_NUM_FORMATTED"
+                  fi
+                fi
+              else
+                echo "⚠️ Could not find URL for Episode $EP_NUM_FORMATTED"
+              fi
+            done
+            
+            echo ""
+            echo "✅ Redownload complete!"
+          fi
+          
+          echo ""
           echo "🔍 Analyzing file properties with MediaInfo and ffprobe..."
           
           # Use a more robust approach with ffprobe as fallback
@@ -611,8 +740,7 @@ jobs:
           TARGET_AUDIO_CODEC=$(printf '%s\n' "${audio_codecs[@]}" | grep -v "^$" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           if [ -z "$TARGET_AUDIO_CODEC" ]; then
             TARGET_AUDIO_CODEC="AAC"
-          fi
-          
+          fi          
           TARGET_W=$(echo "$TARGET_RES" | cut -d'x' -f1)
           TARGET_H=$(echo "$TARGET_RES" | cut -d'x' -f2)
           
@@ -646,37 +774,20 @@ jobs:
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
               EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
               
-              # For files without video, we need to handle differently
-              # Check if file is just audio
-              if ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$f" 2>/dev/null | grep -q "video"; then
-                # Has video but resolution detection failed, re-encode
-                echo "  🔧 Re-encoding $f with proper resolution..."
-                ffmpeg -i "$f" \
-                  -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black" \
-                  -c:v libx264 -preset veryfast -crf 23 \
-                  -c:a aac -b:a 128k -ar ${TARGET_SAMPLE_RATE} \
-                  -metadata title="$EPISODE_TITLE" \
-                  -metadata episode_id="$EP_NUM" \
-                  -metadata series="$SERIES_TITLE" \
-                  -metadata label="$LABEL" \
-                  -movflags +faststart \
-                  "normalized_$f" 2>/dev/null
-              else
-                # No video stream, create a blank video with audio
-                echo "  🎵 $f is audio-only, creating video with audio..."
-                DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "30")
-                ffmpeg -f lavfi -i color=black:size=${TARGET_W}x${TARGET_H}:duration="$DURATION" \
-                  -i "$f" \
-                  -c:v libx264 -preset veryfast -crf 23 \
-                  -c:a aac -b:a 128k -ar ${TARGET_SAMPLE_RATE} \
-                  -shortest \
-                  -metadata title="$EPISODE_TITLE" \
-                  -metadata episode_id="$EP_NUM" \
-                  -metadata series="$SERIES_TITLE" \
-                  -metadata label="$LABEL" \
-                  -movflags +faststart \
-                  "normalized_$f" 2>/dev/null
-              fi
+              # For files without video, create a blank video with audio
+              echo "  🎵 $f is audio-only, creating video with audio..."
+              DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "30")
+              ffmpeg -f lavfi -i color=black:size=${TARGET_W}x${TARGET_H}:duration="$DURATION" \
+                -i "$f" \
+                -c:v libx264 -preset veryfast -crf 23 \
+                -c:a aac -b:a 128k -ar ${TARGET_SAMPLE_RATE} \
+                -shortest \
+                -metadata title="$EPISODE_TITLE" \
+                -metadata episode_id="$EP_NUM" \
+                -metadata series="$SERIES_TITLE" \
+                -metadata label="$LABEL" \
+                -movflags +faststart \
+                "normalized_$f" 2>/dev/null
               
               if [ -f "normalized_$f" ] && [ -s "normalized_$f" ]; then
                 echo "✅ Normalized: $f -> normalized_$f"
@@ -732,7 +843,8 @@ jobs:
           VERIFIED_FILES=""
           
           for f in $NORMALIZED_FILES; do
-            if [ ! -f "$f" ] || [ ! -s "$f" ]; then              echo "⚠️ File missing or empty: $f"
+            if [ ! -f "$f" ] || [ ! -s "$f" ]; then
+              echo "⚠️ File missing or empty: $f"
               continue
             fi
             
