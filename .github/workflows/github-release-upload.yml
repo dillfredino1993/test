@@ -43,48 +43,34 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg & Tools with curl_cffi Support
+      - name: Install FFmpeg & Tools
         run: |
           echo "========================================="
-          echo "🔧 INSTALLING TOOLS WITH CURL_CFFI SUPPORT"
+          echo "🔧 INSTALLING TOOLS"
           echo "========================================="
           echo "📺 Series: ${{ env.series_title }}"
           echo "========================================="
           
           sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool build-essential libssl-dev libffi-dev python3-dev
+          sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool
           
-          # Upgrade pip
-          pip3 install --upgrade pip setuptools wheel
-          
-          # Install base requirements
+          pip3 install --upgrade pip
           pip3 install telethon qrcode requests aiohttp python-socks[asyncio]
           
-          # Install curl_cffi for Cloudflare impersonation
-          echo "📥 Installing curl_cffi for Cloudflare bypass..."
-          pip3 install curl-cffi
+          # Install yt-dlp with curl_cffi support
+          echo "📦 Installing yt-dlp with curl_cffi support..."
+          pip3 install curl_cffi
+          pip3 install yt-dlp[curl_cffi]
           
-          # Install yt-dlp (without impersonation)
-          echo "📥 Installing yt-dlp..."
-          pip3 uninstall -y yt-dlp 2>/dev/null || true
-          pip3 install yt-dlp
-          
-          # Install additional dependencies
-          pip3 install brotli websockets pycryptodome certifi
-          
-          # Verify installation
-          echo "✅ yt-dlp version:"
-          yt-dlp --version
-          
-          echo ""
-          echo "✅ Testing curl_cffi installation:"
-          python3 -c "from curl_cffi import requests; print('curl_cffi installed successfully')"
-          python3 -c "from curl_cffi.requests import Session; s = Session(impersonate='chrome120'); print('curl_cffi Session with impersonation works')"
+          # Also install the standalone version for comparison
+          pip3 install yt-dlp --upgrade
           
           python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')"
+          python3 -c "import yt_dlp; print(f'✅ yt-dlp version: {yt_dlp.version.__version__}')"
+          python3 -c "from curl_cffi import requests; print('✅ curl_cffi installed successfully')"
           
           echo "========================================="
-          echo "✅ INSTALLATION COMPLETE WITH CURL_CFFI"
+          echo "✅ INSTALLATION COMPLETE"
           echo "========================================="
 
       - name: Compute Dynamic Formatted Output Filename & Label
@@ -153,7 +139,7 @@ jobs:
           
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
-      - name: Download All Episodes First with curl_cffi
+      - name: Download All Episodes First (with yt-dlp + curl_cffi)
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -162,11 +148,43 @@ jobs:
           cd downloads
           
           echo "========================================="
-          echo "📥 DOWNLOADING ALL EPISODES WITH CURL_CFFI"
+          echo "📥 DOWNLOADING ALL EPISODES"
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Total Episodes: $(cat urls.txt | wc -l)"
+          echo "🔧 Using yt-dlp with curl_cffi for better scraping"
           echo "========================================="
+          
+          # Create custom yt-dlp config with curl_cffi
+          cat > yt-dlp-config.txt << 'EOFYTDLP'
+          # Use curl_cffi for better TLS fingerprinting
+          --impersonate chrome
+          --add-header "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          --add-header "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+          --add-header "Accept-Language: en-US,en;q=0.9"
+          --add-header "Accept-Encoding: gzip, deflate, br"
+          --add-header "Cache-Control: no-cache"
+          --add-header "Pragma: no-cache"
+          --add-header "Sec-Ch-Ua: \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\""
+          --add-header "Sec-Ch-Ua-Mobile: ?0"
+          --add-header "Sec-Ch-Ua-Platform: \"Windows\""
+          --add-header "Sec-Fetch-Dest: document"
+          --add-header "Sec-Fetch-Mode: navigate"
+          --add-header "Sec-Fetch-Site: none"
+          --add-header "Sec-Fetch-User: ?1"
+          --add-header "Upgrade-Insecure-Requests: 1"
+          --add-header "Referer: https://www.google.com/"
+          --no-warnings
+          --no-progress
+          --hls-use-mpegts
+          --downloader aria2c
+          --downloader-args "aria2c:-x 16 -s 16 -k 1M --continue=true"
+          --retries 10
+          --fragment-retries 10
+          --socket-timeout 30
+          --extractor-retries 10
+          --file-access-retries 10
+          EOFYTDLP
           
           TOTAL_EPISODES=$(cat urls.txt | wc -l)
           EP_INDEX=1
@@ -191,122 +209,50 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # Try curl_cffi Python script for Cloudflare bypass
-            echo "🌐 Using curl_cffi for Cloudflare bypass..."
+            # Try yt-dlp with curl_cffi first
+            echo "📥 Using yt-dlp with curl_cffi and Chrome impersonation..."
             
-            printf '%s\n' \
-            'import sys' \
-            'import os' \
-            'from curl_cffi import requests' \
-            'from curl_cffi.requests import Session' \
-            'import time' \
-            '' \
-            'url = sys.argv[1]' \
-            'output = sys.argv[2]' \
-            '' \
-            '# Try different impersonation targets' \
-            "targets = ['chrome120', 'chrome119', 'chrome118', 'chrome117', 'chrome116', 'chrome115', 'chrome114', 'chrome113', 'chrome112', 'chrome111', 'chrome110', 'edge', 'firefox']" \
-            '' \
-            'for target in targets:' \
-            '    try:' \
-            '        print(f"🔄 Trying curl_cffi impersonation: {target}")' \
-            '' \
-            '        # Create session with impersonation' \
-            '        session = Session(impersonate=target)' \
-            '' \
-            '        # Set headers' \
-            "        session.headers.update({" \
-            "            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'," \
-            "            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'," \
-            "            'Accept-Language': 'en-US,en;q=0.9'," \
-            "            'Accept-Encoding': 'gzip, deflate, br'," \
-            "            'Connection': 'keep-alive'," \
-            "            'Upgrade-Insecure-Requests': '1'," \
-            "            'Sec-Fetch-Dest': 'document'," \
-            "            'Sec-Fetch-Mode': 'navigate'," \
-            "            'Sec-Fetch-Site': 'none'," \
-            "            'Sec-Fetch-User': '?1'" \
-            "        })" \
-            '' \
-            '        # Make request with timeout' \
-            '        response = session.get(url, timeout=60, allow_redirects=True, verify=False)' \
-            '' \
-            '        # Check if we got a valid response' \
-            '        if response.status_code == 200 and len(response.content) > 100000:' \
-            '            # Save the file' \
-            "            with open(output, 'wb') as f:" \
-            '                f.write(response.content)' \
-            '            print(f"✅ Downloaded with curl_cffi using {target}")' \
-            '            sys.exit(0)' \
-            '        else:' \
-            '            print(f"⚠️ Response too small or status {response.status_code}")' \
-            '            continue' \
-            '            ' \
-            '    except Exception as e:' \
-            '        print(f"⚠️ Failed with {target}: {e}")' \
-            '        continue' \
-            '' \
-            '# If all targets fail, try a simple request' \
-            'try:' \
-            '    print("🔄 Trying simple request without impersonation...")' \
-            '    response = requests.get(url, timeout=60, allow_redirects=True, verify=False)' \
-            '    if response.status_code == 200 and len(response.content) > 100000:' \
-            "        with open(output, 'wb') as f:" \
-            '            f.write(response.content)' \
-            '        print(f"✅ Downloaded with simple request")' \
-            '        sys.exit(0)' \
-            'except Exception as e:' \
-            '    print(f"⚠️ Simple request failed: {e}")' \
-            '' \
-            '# If everything fails, exit with error' \
-            'print("❌ All download methods with curl_cffi failed")' \
-            'sys.exit(1)' > download_with_curl_cffi.py
+            yt-dlp \
+              --config-location yt-dlp-config.txt \
+              --impersonate chrome \
+              -f "bestvideo[height<=1080]+bestaudio/best[height<=1080]" \
+              -o "$OUT_FILE" \
+              "$URL" < /dev/null 2>&1 || \
             
-            # Run the curl_cffi download script
-            python3 download_with_curl_cffi.py "$URL" "$OUT_FILE" < /dev/null 2>&1
+            # Fallback: use yt-dlp with standard approach
+            echo "⚠️ curl_cffi approach failed, trying standard yt-dlp..."
+            yt-dlp \
+              -f "bestvideo+bestaudio/best" \
+              --hls-use-mpegts \
+              --no-progress --no-warnings \
+              --downloader aria2c \
+              --downloader-args "aria2c:-x 16 -s 16 -k 1M --continue=true" \
+              -o "$OUT_FILE" \
+              "$URL" < /dev/null 2>&1 || \
             
-            # Check if curl_cffi succeeded
-            if [ -f "$OUT_FILE" ] && [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -gt 100000 ]; then
-              echo "✅ curl_cffi download successful"
-            else
+            # Final fallback: use aria2c directly
+            echo "⚠️ yt-dlp failed, trying aria2c directly..."
+            aria2c -x 16 -s 16 -k 1M --continue=true \
+              --console-log-level=error \
+              --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --header="Referer: https://www.google.com/" \
+              -o "$OUT_FILE" \
+              "$URL" < /dev/null 2>/dev/null || \
+            curl -sSL --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
+            
+            # If download failed or file is too small, try yt-dlp with different settings
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ Download failed or file too small, trying yt-dlp with best quality..."
               rm -f "$OUT_FILE"
-              echo "⚠️ curl_cffi failed, trying yt-dlp..."
-              
-              # Try yt-dlp without impersonation
-              yt-dlp -f "bestvideo+bestaudio/best" \
-                --extractor-args "hls:prefer_native" \
-                --no-check-certificate \
+              yt-dlp \
+                -f "bestvideo+bestaudio/best" \
                 --no-progress --no-warnings \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
+                --impersonate chrome \
+                -o "$OUT_FILE" \
+                "$URL" < /dev/null 2>&1
             fi
             
-            # If yt-dlp failed, try aria2c
-            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
-              echo "⚠️ yt-dlp failed, trying aria2c..."
-              rm -f "$OUT_FILE"
-              
-              aria2c -x 16 -s 16 -k 1M --continue=true \
-                --console-log-level=error \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
-            fi
-            
-            # If aria2c failed, try curl
-            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
-              echo "⚠️ aria2c failed, trying curl..."
-              rm -f "$OUT_FILE"
-              
-              curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
-            fi
-            
-            # Final fallback: wget
-            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
-              echo "⚠️ curl failed, trying wget..."
-              rm -f "$OUT_FILE"
-              
-              wget -q -O "$OUT_FILE" "$URL" < /dev/null 2>&1
-            fi
-            
-            # Verify download
             if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
               FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
@@ -362,106 +308,176 @@ jobs:
           echo "========================================="
           
           # Create fast compression script
-          printf '%s\n' \
-          'import os' \
-          'import sys' \
-          'import subprocess' \
-          'import shutil' \
-          'import json' \
-          'import time' \
-          '' \
-          'def get_video_info(file_path):' \
-          '    try:' \
-          '        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-show_entries", "stream=width,height,codec_name", "-of", "json", file_path]' \
-          '        result = subprocess.check_output(cmd, text=True)' \
-          '        data = json.loads(result)' \
-          '        duration = float(data.get("format", {}).get("duration", 0))' \
-          '        width, height = 1280, 720' \
-          '        for stream in data.get("streams", []):' \
-          '            if stream.get("codec_type") == "video":' \
-          '                width = int(stream.get("width", 1280))' \
-          '                height = int(stream.get("height", 720))' \
-          '                break' \
-          '        return duration, width, height' \
-          '    except:' \
-          '        return 0, 1280, 720' \
-          '' \
-          'def compress_with_veryfast(file_path, target_size_mb=80):' \
-          '    print(f"  ⚡ Compressing with VERY FAST preset...")' \
-          '    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)' \
-          '    print(f"  📊 Original size: {file_size_mb:.1f}MB")' \
-          '    if file_size_mb <= target_size_mb:' \
-          '        print(f"  ✅ File already under {target_size_mb}MB, skipping compression")' \
-          '        return True' \
-          '    duration, width, height = get_video_info(file_path)' \
-          '    print(f"  📊 Duration: {duration:.1f}s, Resolution: {width}x{height}")' \
-          '    if duration > 0:' \
-          '        target_bitrate = (target_size_mb * 8 * 1024) / duration' \
-          '        target_bitrate = min(max(target_bitrate, 500), 2000)' \
-          '    else:' \
-          '        target_bitrate = 1000' \
-          '    print(f"  📊 Target bitrate: {int(target_bitrate)}kbps")' \
-          '    base_name = os.path.splitext(file_path)[0]' \
-          '    temp_file = f"{base_name}_fast.mp4"' \
-          '    cmd = ["ffmpeg", "-y", "-i", file_path, "-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{int(target_bitrate)}k", "-maxrate", f"{int(target_bitrate * 1.5)}k", "-bufsize", f"{int(target_bitrate * 2)}k", "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-movflags", "+faststart", "-threads", str(os.cpu_count() or 2), temp_file]' \
-          '    try:' \
-          '        print(f"  🔄 Encoding...")' \
-          '        start_time = time.time()' \
-          '        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)' \
-          '        elapsed = time.time() - start_time' \
-          '        print(f"  ⏱️  Encoding time: {elapsed:.1f}s")' \
-          '        if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:' \
-          '            new_size_mb = os.path.getsize(temp_file) / (1024 * 1024)' \
-          '            print(f"  ✅ Compressed: {new_size_mb:.1f}MB ({file_size_mb:.1f}MB -> {new_size_mb:.1f}MB)")' \
-          '            if new_size_mb <= target_size_mb * 1.1:' \
-          '                os.replace(temp_file, file_path)' \
-          '                return True' \
-          '            else:' \
-          '                print(f"  ⚠️ Still too large: {new_size_mb:.1f}MB")' \
-          '                print(f"  🔄 Trying ULTRA FAST with higher CRF...")' \
-          '                temp_file2 = f"{base_name}_ultrafast.mp4"' \
-          '                cmd2 = ["ffmpeg", "-y", "-i", file_path, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-movflags", "+faststart", "-threads", str(os.cpu_count() or 2), temp_file2]' \
-          '                result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=300)' \
-          '                if result2.returncode == 0 and os.path.exists(temp_file2) and os.path.getsize(temp_file2) > 0:' \
-          '                    new_size_mb2 = os.path.getsize(temp_file2) / (1024 * 1024)' \
-          '                    print(f"  ✅ UltraFast compressed: {new_size_mb2:.1f}MB")' \
-          '                    if new_size_mb2 < new_size_mb:' \
-          '                        os.replace(temp_file2, file_path)' \
-          '                        return True' \
-          '                    else:' \
-          '                        os.remove(temp_file2)' \
-          '                os.remove(temp_file)' \
-          '                return False' \
-          '        else:' \
-          '            print(f"  ❌ Compression failed: {result.stderr[:200]}")' \
-          '            return False' \
-          '    except subprocess.TimeoutExpired:' \
-          '        print(f"  ❌ Compression timeout")' \
-          '        return False' \
-          '    except Exception as e:' \
-          '        print(f"  ❌ Compression error: {e}")' \
-          '        return False' \
-          '    finally:' \
-          '        for f in [temp_file, f"{base_name}_ultrafast.mp4"]:' \
-          '            if os.path.exists(f):' \
-          '                try: os.remove(f)' \
-          '                except: pass' \
-          '    return False' \
-          '' \
-          'def process_episode(file_path, target_size_mb=80):' \
-          '    if not os.path.exists(file_path):' \
-          '        print(f"❌ File not found: {file_path}")' \
-          '        return False' \
-          '    return compress_with_veryfast(file_path, target_size_mb)' \
-          '' \
-          'if __name__ == "__main__":' \
-          '    if len(sys.argv) < 2:' \
-          '        print("Usage: python fast_compress.py <file_path> [target_size_mb]")' \
-          '        sys.exit(1)' \
-          '    file_path = sys.argv[1]' \
-          '    target_size = int(sys.argv[2]) if len(sys.argv) > 2 else 80' \
-          '    success = process_episode(file_path, target_size)' \
-          '    sys.exit(0 if success else 1)' > fast_compress.py
+          cat > fast_compress.py << 'EOFCOMPRESS'
+          import os
+          import sys
+          import subprocess
+          import shutil
+          import json
+          import time
+          
+          def get_video_info(file_path):
+              """Get video duration, width, height using ffprobe"""
+              try:
+                  cmd = [
+                      "ffprobe", "-v", "error",
+                      "-show_entries", "format=duration",
+                      "-show_entries", "stream=width,height,codec_name",
+                      "-of", "json",
+                      file_path
+                  ]
+                  result = subprocess.check_output(cmd, text=True)
+                  data = json.loads(result)
+                  
+                  duration = float(data.get('format', {}).get('duration', 0))
+                  
+                  width, height = 1280, 720
+                  for stream in data.get('streams', []):
+                      if stream.get('codec_type') == 'video':
+                          width = int(stream.get('width', 1280))
+                          height = int(stream.get('height', 720))
+                          break
+                  
+                  return duration, width, height
+              except:
+                  return 0, 1280, 720
+          
+          def compress_with_veryfast(file_path, target_size_mb=80):
+              """
+              Compress video using FFmpeg with VERY FAST preset
+              This prioritizes speed over compression efficiency
+              """
+              print(f"  ⚡ Compressing with VERY FAST preset...")
+              
+              file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+              print(f"  📊 Original size: {file_size_mb:.1f}MB")
+              
+              if file_size_mb <= target_size_mb:
+                  print(f"  ✅ File already under {target_size_mb}MB, skipping compression")
+                  return True
+              
+              # Get video info
+              duration, width, height = get_video_info(file_path)
+              print(f"  📊 Duration: {duration:.1f}s, Resolution: {width}x{height}")
+              
+              # Calculate target bitrate for target size
+              if duration > 0:
+                  target_bitrate = (target_size_mb * 8 * 1024) / duration
+                  target_bitrate = min(max(target_bitrate, 500), 2000)
+              else:
+                  target_bitrate = 1000
+              
+              print(f"  📊 Target bitrate: {int(target_bitrate)}kbps")
+              
+              base_name = os.path.splitext(file_path)[0]
+              temp_file = f"{base_name}_fast.mp4"
+              
+              # Use VERY FAST preset for maximum speed
+              cmd = [
+                  "ffmpeg", "-y",
+                  "-i", file_path,
+                  "-c:v", "libx264",
+                  "-preset", "veryfast",
+                  "-b:v", f"{int(target_bitrate)}k",
+                  "-maxrate", f"{int(target_bitrate * 1.5)}k",
+                  "-bufsize", f"{int(target_bitrate * 2)}k",
+                  "-c:a", "aac",
+                  "-b:a", "128k",
+                  "-ar", "44100",
+                  "-movflags", "+faststart",
+                  "-threads", str(os.cpu_count() or 2),
+                  temp_file
+              ]
+              
+              try:
+                  print(f"  🔄 Encoding...")
+                  start_time = time.time()
+                  
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                  
+                  elapsed = time.time() - start_time
+                  print(f"  ⏱️  Encoding time: {elapsed:.1f}s")
+                  
+                  if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                      new_size_mb = os.path.getsize(temp_file) / (1024 * 1024)
+                      print(f"  ✅ Compressed: {new_size_mb:.1f}MB ({file_size_mb:.1f}MB -> {new_size_mb:.1f}MB)")
+                      
+                      if new_size_mb <= target_size_mb * 1.1:
+                          os.replace(temp_file, file_path)
+                          return True
+                      else:
+                          print(f"  ⚠️ Still too large: {new_size_mb:.1f}MB")
+                          
+                          # Try even more aggressive compression
+                          print(f"  🔄 Trying ULTRA FAST with higher CRF...")
+                          temp_file2 = f"{base_name}_ultrafast.mp4"
+                          
+                          cmd2 = [
+                              "ffmpeg", "-y",
+                              "-i", file_path,
+                              "-c:v", "libx264",
+                              "-preset", "ultrafast",
+                              "-crf", "28",
+                              "-c:a", "aac",
+                              "-b:a", "96k",
+                              "-ar", "44100",
+                              "-movflags", "+faststart",
+                              "-threads", str(os.cpu_count() or 2),
+                              temp_file2
+                          ]
+                          
+                          result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=300)
+                          
+                          if result2.returncode == 0 and os.path.exists(temp_file2) and os.path.getsize(temp_file2) > 0:
+                              new_size_mb2 = os.path.getsize(temp_file2) / (1024 * 1024)
+                              print(f"  ✅ UltraFast compressed: {new_size_mb2:.1f}MB")
+                              
+                              if new_size_mb2 < new_size_mb:
+                                  os.replace(temp_file2, file_path)
+                                  return True
+                              else:
+                                  os.remove(temp_file2)
+                          
+                          os.remove(temp_file)
+                          return False
+                  else:
+                      print(f"  ❌ Compression failed: {result.stderr[:200]}")
+                      return False
+                      
+              except subprocess.TimeoutExpired:
+                  print(f"  ❌ Compression timeout")
+                  return False
+              except Exception as e:
+                  print(f"  ❌ Compression error: {e}")
+                  return False
+              finally:
+                  # Cleanup temp files
+                  for f in [temp_file, f"{base_name}_ultrafast.mp4"]:
+                      if os.path.exists(f):
+                          try: os.remove(f)
+                          except: pass
+              
+              return False
+          
+          def process_episode(file_path, target_size_mb=80):
+              """Process episode with fast compression"""
+              if not os.path.exists(file_path):
+                  print(f"❌ File not found: {file_path}")
+                  return False
+              
+              return compress_with_veryfast(file_path, target_size_mb)
+          
+          if __name__ == "__main__":
+              if len(sys.argv) < 2:
+                  print("Usage: python fast_compress.py <file_path> [target_size_mb]")
+                  sys.exit(1)
+              
+              file_path = sys.argv[1]
+              target_size = int(sys.argv[2]) if len(sys.argv) > 2 else 80
+              
+              success = process_episode(file_path, target_size)
+              sys.exit(0 if success else 1)
+          EOFCOMPRESS
           
           # Get list of all episodes
           EPISODE_FILES=$(ls -1 EP*.mp4 2>/dev/null)
@@ -605,7 +621,7 @@ jobs:
           # Redownload episodes that need it
           if [ "$NEEDS_REDOWNLOAD" = true ]; then
             echo ""
-            echo "🔄 Redownloading episodes with curl_cffi..."
+            echo "🔄 Redownloading episodes with yt-dlp to ensure proper video..."
             
             # Read URLs into array
             mapfile -t URL_ARRAY < urls.txt
@@ -618,100 +634,19 @@ jobs:
               if [ $URL_INDEX -ge 0 ] && [ $URL_INDEX -lt ${#URL_ARRAY[@]} ]; then
                 URL="${URL_ARRAY[$URL_INDEX]}"
                 echo ""
-                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with curl_cffi..."
+                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp..."
                 echo "📎 URL: $URL"
                 
                 # Remove the bad file
                 rm -f "$FILE"
                 
-                # Try curl_cffi Python script
-                printf '%s\n' \
-                'import sys' \
-                'import os' \
-                'from curl_cffi import requests' \
-                'from curl_cffi.requests import Session' \
-                'import time' \
-                '' \
-                'url = sys.argv[1]' \
-                'output = sys.argv[2]' \
-                '' \
-                "# Try different impersonation targets" \
-                "targets = ['chrome120', 'chrome119', 'chrome118', 'chrome117', 'chrome116', 'chrome115', 'chrome114', 'chrome113', 'chrome112', 'chrome111', 'chrome110', 'edge', 'firefox']" \
-                '' \
-                'for target in targets:' \
-                '    try:' \
-                '        print(f"🔄 Trying curl_cffi impersonation: {target}")' \
-                '' \
-                '        # Create session with impersonation' \
-                '        session = Session(impersonate=target)' \
-                '' \
-                '        # Set headers' \
-                "        session.headers.update({" \
-                "            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'," \
-                "            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'," \
-                "            'Accept-Language': 'en-US,en;q=0.9'," \
-                "            'Accept-Encoding': 'gzip, deflate, br'," \
-                "            'Connection': 'keep-alive'," \
-                "            'Upgrade-Insecure-Requests': '1'," \
-                "            'Sec-Fetch-Dest': 'document'," \
-                "            'Sec-Fetch-Mode': 'navigate'," \
-                "            'Sec-Fetch-Site': 'none'," \
-                "            'Sec-Fetch-User': '?1'" \
-                "        })" \
-                '' \
-                '        # Make request with timeout' \
-                '        response = session.get(url, timeout=60, allow_redirects=True, verify=False)' \
-                '' \
-                '        # Check if we got a valid response' \
-                '        if response.status_code == 200 and len(response.content) > 100000:' \
-                '            # Save the file' \
-                "            with open(output, 'wb') as f:" \
-                '                f.write(response.content)' \
-                '            print(f"✅ Downloaded with curl_cffi using {target}")' \
-                '            sys.exit(0)' \
-                '        else:' \
-                '            print(f"⚠️ Response too small or status {response.status_code}")' \
-                '            continue' \
-                '            ' \
-                '    except Exception as e:' \
-                '        print(f"⚠️ Failed with {target}: {e}")' \
-                '        continue' \
-                '' \
-                '# If all targets fail, try a simple request' \
-                'try:' \
-                '    print("🔄 Trying simple request without impersonation...")' \
-                '    response = requests.get(url, timeout=60, allow_redirects=True, verify=False)' \
-                '    if response.status_code == 200 and len(response.content) > 100000:' \
-                "        with open(output, 'wb') as f:" \
-                '            f.write(response.content)' \
-                '        print(f"✅ Downloaded with simple request")' \
-                '        sys.exit(0)' \
-                'except Exception as e:' \
-                '    print(f"⚠️ Simple request failed: {e}")' \
-                '' \
-                '# If everything fails, exit with error' \
-                'print("❌ All download methods with curl_cffi failed")' \
-                'sys.exit(1)' > redownload_with_curl_cffi.py
-                
-                # Run the curl_cffi download script
-                python3 redownload_with_curl_cffi.py "$URL" "$FILE" < /dev/null 2>&1
-                
-                # If curl_cffi failed, try yt-dlp
-                if [ ! -f "$FILE" ] || [ ! -s "$FILE" ]; then
-                  echo "⚠️ curl_cffi failed, trying yt-dlp..."
-                  yt-dlp -f "bestvideo+bestaudio/best" \
-                    --extractor-args "hls:prefer_native" \
-                    --no-check-certificate \
-                    --no-progress --no-warnings \
-                    -o "$FILE" "$URL" < /dev/null 2>&1
-                fi
-                
-                # If yt-dlp fails, try wget
-                if [ ! -f "$FILE" ] || [ ! -s "$FILE" ]; then
-                  echo "⚠️ yt-dlp failed, trying wget..."
-                  rm -f "$FILE"
-                  wget -q -O "$FILE" "$URL" < /dev/null 2>&1
-                fi
+                # Redownload with yt-dlp with curl_cffi
+                yt-dlp \
+                  -f "bestvideo+bestaudio/best" \
+                  --no-progress --no-warnings \
+                  --impersonate chrome \
+                  -o "$FILE" \
+                  "$URL" < /dev/null 2>&1
                 
                 if [ -f "$FILE" ] && [ -s "$FILE" ]; then
                   # Verify the new file has video
@@ -741,6 +676,22 @@ jobs:
                   fi
                 else
                   echo "❌ Redownload failed for Episode $EP_NUM_FORMATTED"
+                  # Try to create a video from what we have
+                  DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FILE" 2>/dev/null || echo "30")
+                  TEMP_FILE="EP${EP_NUM_FORMATTED}_temp.mp4"
+                  
+                  ffmpeg -f lavfi -i color=black:size=720x1280:duration="$DURATION" \
+                    -i "$FILE" \
+                    -c:v libx264 -preset veryfast -crf 23 \
+                    -c:a aac -b:a 128k -ar 44100 \
+                    -shortest \
+                    -movflags +faststart \
+                    "$TEMP_FILE" 2>/dev/null
+                  
+                  if [ -f "$TEMP_FILE" ] && [ -s "$TEMP_FILE" ]; then
+                    mv "$TEMP_FILE" "$FILE"
+                    echo "✅ Created video from audio for Episode $EP_NUM_FORMATTED"
+                  fi
                 fi
               else
                 echo "⚠️ Could not find URL for Episode $EP_NUM_FORMATTED"
@@ -1296,392 +1247,392 @@ jobs:
           echo "📁 Final MERGED_PATH: $MERGED_PATH"
           
           cat > upload_merged.py << 'EOFUPLOAD'
-import os
-import sys
-import glob
-import re
-import subprocess
-import asyncio
-import datetime
-import traceback
-import json
-import math
+          import os
+          import sys
+          import glob
+          import re
+          import subprocess
+          import asyncio
+          import datetime
+          import traceback
+          import json
+          import math
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
+          if hasattr(sys.stdout, "reconfigure"):
+              sys.stdout.reconfigure(line_buffering=True)
+              sys.stderr.reconfigure(line_buffering=True)
 
-try:
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-    from telethon.errors import FloodWaitError
-    from telethon.tl.functions.channels import JoinChannelRequest
-    from telethon.tl.functions.messages import ImportChatInviteRequest
-    from telethon.tl.types import DocumentAttributeVideo, InputFile
-    import telethon
-    print(f"✅ Telethon version: {telethon.__version__}")
-except ImportError as e:
-    print(f"❌ Import error: {e}")
-    sys.exit(1)
+          try:
+              from telethon import TelegramClient
+              from telethon.sessions import StringSession
+              from telethon.errors import FloodWaitError
+              from telethon.tl.functions.channels import JoinChannelRequest
+              from telethon.tl.functions.messages import ImportChatInviteRequest
+              from telethon.tl.types import DocumentAttributeVideo, InputFile
+              import telethon
+              print(f"✅ Telethon version: {telethon.__version__}")
+          except ImportError as e:
+              print(f"❌ Import error: {e}")
+              sys.exit(1)
 
-api_id = os.environ.get("TG_API_ID")
-api_hash = os.environ.get("TG_API_HASH")
-session_string = os.environ.get("TG_SESSION_STRING")
+          api_id = os.environ.get("TG_API_ID")
+          api_hash = os.environ.get("TG_API_HASH")
+          session_string = os.environ.get("TG_SESSION_STRING")
+          
+          chat_id_raw = os.environ.get("TG_MERGED_CHAT_ID")
+          chat_name = os.environ.get("TG_MERGED_NAME")
+          invite_link = os.environ.get("TG_MERGED_INVITE_LINK")
+          
+          video_path = os.environ.get("MERGED_PATH")
+          title = os.environ.get("TITLE")
+          series_title = os.environ.get("SERIES_TITLE", "Series")
+          label = os.environ.get("LABEL", "NONE")
 
-chat_id_raw = os.environ.get("TG_MERGED_CHAT_ID")
-chat_name = os.environ.get("TG_MERGED_NAME")
-invite_link = os.environ.get("TG_MERGED_INVITE_LINK")
+          if not all([api_id, api_hash]):
+              print("❌ Missing Telegram API credentials.")
+              sys.exit(0)
 
-video_path = os.environ.get("MERGED_PATH")
-title = os.environ.get("TITLE")
-series_title = os.environ.get("SERIES_TITLE", "Series")
-label = os.environ.get("LABEL", "NONE")
+          if not session_string:
+              print("❌ Missing session string!")
+              sys.exit(0)
 
-if not all([api_id, api_hash]):
-    print("❌ Missing Telegram API credentials.")
-    sys.exit(0)
+          def parse_chat_id(val):
+              if not val:
+                  return None
+              val = str(val).strip().strip('"').strip("'")
+              try:
+                  return int(val)
+              except ValueError:
+                  return val
 
-if not session_string:
-    print("❌ Missing session string!")
-    sys.exit(0)
+          def get_video_metadata(file_path):
+              try:
+                  cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  if result and result.replace('.', '', 1).isdigit():
+                      duration = float(result)
+                  else:
+                      cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      duration = float(result) if result.replace('.', '', 1).isdigit() else 0.0
+                  
+                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  parts = result.split('|')
+                  
+                  if len(parts) >= 2:
+                      w = int(parts[0]) if parts[0].isdigit() else 1280
+                      h = int(parts[1]) if parts[1].isdigit() else 720
+                  else:
+                      w, h = 1280, 720
+                  
+                  return int(duration), w, h
+              except:
+                  pass
+              return 0, 1280, 720
 
-def parse_chat_id(val):
-    if not val:
-        return None
-    val = str(val).strip().strip('"').strip("'")
-    try:
-        return int(val)
-    except ValueError:
-        return val
+          def generate_thumbnail(file_path):
+              try:
+                  thumb_path = f"{file_path}_thumb.jpg"
+                  
+                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  parts = result.split('|')
+                  
+                  if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                      w = int(parts[0])
+                      h = int(parts[1])
+                      
+                      ffmpeg_cmd = [
+                          "ffmpeg", "-y", "-ss", "00:00:01",
+                          "-i", file_path,
+                          "-vf", f"crop=min({w},{h}):min({w},{h}),scale=512:512:flags=lanczos",
+                          "-vframes", "1",
+                          "-q:v", "2",
+                          thumb_path
+                      ]
+                      
+                      subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                      return thumb_path if os.path.exists(thumb_path) else None
+              except:
+                  pass
+              return None
 
-def get_video_metadata(file_path):
-    try:
-        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
-        result = subprocess.check_output(cmd, text=True).strip()
-        if result and result.replace('.', '', 1).isdigit():
-            duration = float(result)
-        else:
-            cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
-            result = subprocess.check_output(cmd, text=True).strip()
-            duration = float(result) if result.replace('.', '', 1).isdigit() else 0.0
-        
-        cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
-        result = subprocess.check_output(cmd, text=True).strip()
-        parts = result.split('|')
-        
-        if len(parts) >= 2:
-            w = int(parts[0]) if parts[0].isdigit() else 1280
-            h = int(parts[1]) if parts[1].isdigit() else 720
-        else:
-            w, h = 1280, 720
-        
-        return int(duration), w, h
-    except:
-        pass
-    return 0, 1280, 720
+          def progress_callback(current, total):
+              """Progress callback for upload"""
+              percent = (current / total) * 100
+              mb_uploaded = current / (1024 * 1024)
+              mb_total = total / (1024 * 1024)
+              if int(percent) % 5 == 0 or int(percent) == 100:
+                  print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)\n")
 
-def generate_thumbnail(file_path):
-    try:
-        thumb_path = f"{file_path}_thumb.jpg"
-        
-        cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
-        result = subprocess.check_output(cmd, text=True).strip()
-        parts = result.split('|')
-        
-        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-            w = int(parts[0])
-            h = int(parts[1])
-            
-            ffmpeg_cmd = [
-                "ffmpeg", "-y", "-ss", "00:00:01",
-                "-i", file_path,
-                "-vf", f"crop=min({w},{h}):min({w},{h}),scale=512:512:flags=lanczos",
-                "-vframes", "1",
-                "-q:v", "2",
-                thumb_path
-            ]
-            
-            subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            return thumb_path if os.path.exists(thumb_path) else None
-    except:
-        pass
-    return None
+          chat_id = parse_chat_id(chat_id_raw)
 
-def progress_callback(current, total):
-    """Progress callback for upload"""
-    percent = (current / total) * 100
-    mb_uploaded = current / (1024 * 1024)
-    mb_total = total / (1024 * 1024)
-    if int(percent) % 5 == 0 or int(percent) == 100:
-        print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
-        with open("merged_progress.log", "a") as f:
-            f.write(f"{datetime.datetime.now()}: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)\n")
+          print("=" * 60)
+          print("📤 Uploading Merged Video (FAST UPLOAD ENABLED)")
+          print("=" * 60)
+          print(f"📺 Series: {series_title}")
+          print(f"📁 File: {video_path}")
+          print("=" * 60)
 
-chat_id = parse_chat_id(chat_id_raw)
+          with open("merged_progress.log", "w") as f:
+              f.write(f"{datetime.datetime.now()}: Starting merged upload\n")
 
-print("=" * 60)
-print("📤 Uploading Merged Video (FAST UPLOAD ENABLED)")
-print("=" * 60)
-print(f"📺 Series: {series_title}")
-print(f"📁 File: {video_path}")
-print("=" * 60)
+          async def join_chat(client, invite_link):
+              if not invite_link:
+                  return None
+              try:
+                  entity = await client.get_entity(invite_link)
+                  return entity
+              except:
+                  pass
+              return None
 
-with open("merged_progress.log", "w") as f:
-    f.write(f"{datetime.datetime.now()}: Starting merged upload\n")
+          async def resolve_chat(client, chat_id, invite_link, search_name):
+              if invite_link:
+                  entity = await join_chat(client, invite_link)
+                  if entity:
+                      return entity
+              if chat_id:
+                  try:
+                      return await client.get_entity(chat_id)
+                  except:
+                      pass
+              if search_name:
+                  async for dialog in client.iter_dialogs(limit=50):
+                      if search_name.lower() in str(dialog.name).lower():
+                          return dialog.entity
+              return None
 
-async def join_chat(client, invite_link):
-    if not invite_link:
-        return None
-    try:
-        entity = await client.get_entity(invite_link)
-        return entity
-    except:
-        pass
-    return None
+          async def fast_upload_file(client, file_path, progress_callback=None):
+              """
+              Custom fast upload implementation using parallel chunk uploading
+              """
+              if not os.path.exists(file_path):
+                  print(f"❌ File not found: {file_path}")
+                  return None
+              
+              file_size = os.path.getsize(file_path)
+              CHUNK_SIZE = 512 * 1024  # 512KB chunks
+              NUM_CHUNKS = math.ceil(file_size / CHUNK_SIZE)
+              
+              print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
+              print(f"📊 Chunks: {NUM_CHUNKS} (512KB each)")
+              print(f"📁 File: {file_path}")
+              
+              # For large files, use parallel uploads
+              if file_size > 100 * 1024 * 1024:  # > 100MB
+                  print("⚡ Using parallel upload for large file...")
+              else:
+                  print("📤 Using standard upload for small file...")
+              
+              try:
+                  result = await client.upload_file(
+                      file_path,
+                      part_size_kb=512,
+                      file_name=os.path.basename(file_path),
+                      progress_callback=progress_callback
+                  )
+                  return result
+              except Exception as e:
+                  print(f"❌ Upload failed: {e}")
+                  raise
 
-async def resolve_chat(client, chat_id, invite_link, search_name):
-    if invite_link:
-        entity = await join_chat(client, invite_link)
-        if entity:
-            return entity
-    if chat_id:
-        try:
-            return await client.get_entity(chat_id)
-        except:
-            pass
-    if search_name:
-        async for dialog in client.iter_dialogs(limit=50):
-            if search_name.lower() in str(dialog.name).lower():
-                return dialog.entity
-    return None
+          async def send_file_with_thumb(client, entity, file_path, caption):
+              # Check if file exists
+              if not os.path.exists(file_path):
+                  print(f"❌ File not found: {file_path}")
+                  return False, None
+              
+              duration, w, h = get_video_metadata(file_path)
+              print(f"📊 Video duration: {duration} seconds, {w}x{h}")
+              
+              thumb = generate_thumbnail(file_path)
+              
+              print(f"⏫ Uploading merged file with parallel chunks...")
+              print(f"📁 File path: {file_path}")
+              
+              try:
+                  uploaded_file = await fast_upload_file(
+                      client=client,
+                      file_path=file_path,
+                      progress_callback=progress_callback
+                  )
+                  
+                  if uploaded_file is None:
+                      print("❌ Upload returned None")
+                      return False, None
+                      
+                  print("✅ Upload complete!")
+                  
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: UPLOAD_COMPLETE\n")
+                  
+              except Exception as e:
+                  print(f"❌ Upload failed: {e}")
+                  traceback.print_exc()
+                  return False, None
+              
+              video_attr = DocumentAttributeVideo(
+                  duration=duration,
+                  w=w,
+                  h=h,
+                  supports_streaming=True
+              )
+              
+              kwargs = {
+                  "entity": entity,
+                  "file": uploaded_file,
+                  "caption": caption,
+                  "attributes": [video_attr],
+                  "supports_streaming": True,
+                  "force_document": False,
+                  "allow_cache": True
+              }
+              
+              if thumb and os.path.exists(thumb):
+                  kwargs["thumb"] = thumb
+                  print(f"📸 Using thumbnail: {thumb}")
+              
+              try:
+                  result = await client.send_file(**kwargs)
+                  print("✅ File sent to Telegram!")
+                  return True, result
+              except Exception as e:
+                  print(f"❌ Send failed: {e}")
+                  if "thumb" in kwargs:
+                      del kwargs["thumb"]
+                      try:
+                          result = await client.send_file(**kwargs)
+                          return True, result
+                      except Exception as e2:
+                          print(f"❌ Send failed without thumb: {e2}")
+                          return False, None
+                  return False, None
+              finally:
+                  if thumb and os.path.exists(thumb):
+                      try: os.remove(thumb)
+                      except: pass
 
-async def fast_upload_file(client, file_path, progress_callback=None):
-    """
-    Custom fast upload implementation using parallel chunk uploading
-    """
-    if not os.path.exists(file_path):
-        print(f"❌ File not found: {file_path}")
-        return None
-    
-    file_size = os.path.getsize(file_path)
-    CHUNK_SIZE = 512 * 1024  # 512KB chunks
-    NUM_CHUNKS = math.ceil(file_size / CHUNK_SIZE)
-    
-    print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
-    print(f"📊 Chunks: {NUM_CHUNKS} (512KB each)")
-    print(f"📁 File: {file_path}")
-    
-    # For large files, use parallel uploads
-    if file_size > 100 * 1024 * 1024:  # > 100MB
-        print("⚡ Using parallel upload for large file...")
-    else:
-        print("📤 Using standard upload for small file...")
-    
-    try:
-        result = await client.upload_file(
-            file_path,
-            part_size_kb=512,
-            file_name=os.path.basename(file_path),
-            progress_callback=progress_callback
-        )
-        return result
-    except Exception as e:
-        print(f"❌ Upload failed: {e}")
-        raise
+          async def upload_merged_video(client, entity):
+              video_path = os.environ.get("MERGED_PATH")
+              
+              # Debug: print current directory and files
+              print(f"📁 Current directory: {os.getcwd()}")
+              print(f"📁 Files in directory: {os.listdir('.')}")
+              print(f"📁 MERGED_PATH: {video_path}")
+              
+              # Try to find the file if path is not set or doesn't exist
+              if not video_path or not os.path.isfile(video_path):
+                  # Try to find output.mp4 in current directory
+                  if os.path.exists("output.mp4"):
+                      video_path = os.path.abspath("output.mp4")
+                      print(f"🔍 Found output.mp4 in current directory: {video_path}")
+                  elif os.path.exists("../output.mp4"):
+                      video_path = os.path.abspath("../output.mp4")
+                      print(f"🔍 Found output.mp4 in parent directory: {video_path}")
+                  else:
+                      print(f"❌ Video not found: {video_path}")
+                      print("🔍 Looking for video files...")
+                      import glob
+                      video_files = glob.glob("*.mp4")
+                      if video_files:
+                          print(f"📁 Found MP4 files: {video_files}")
+                          # Use the largest MP4 file
+                          largest_file = max(video_files, key=lambda f: os.path.getsize(f))
+                          video_path = os.path.abspath(largest_file)
+                          print(f"📁 Using largest file: {video_path}")
+                      else:
+                          return False
+              
+              if not os.path.isfile(video_path):
+                  print(f"❌ Video still not found: {video_path}")
+                  return False
+              
+              file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+              print(f"💾 File size: {file_size_mb:.1f} MB")
+              
+              if file_size_mb > 2000:
+                  print(f"❌ File exceeds 2GB ({file_size_mb:.1f} MB)")
+                  print("⚠️ Telegram limit is 2GB.")
+                  return False
+              
+              if file_size_mb > 1800:
+                  print(f"⚠️ File is large ({file_size_mb:.1f} MB)")
+                  print("   Using parallel upload for speed...")
+              
+              duration, w, h = get_video_metadata(video_path)
+              print(f"📊 Duration: {duration} seconds")
+              
+              now = datetime.datetime.now()
+              month_year = now.strftime("%B%Y").upper()
+              
+              clean_label = str(label).upper().replace("-", "").replace(" ", "").replace("_", "")
+              if clean_label == "NONE" or clean_label == "":
+                  clean_label = "NONE"
+              
+              caption = f"{title}\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}"
+              
+              print(f"📤 Uploading merged video...")
+              print(f"📝 Caption: {caption[:50]}...")
+              
+              try:
+                  success, result = await send_file_with_thumb(client, entity, video_path, caption)
+                  if success:
+                      print("✅ Merged video uploaded!")
+                      return True
+                  return False
+              except FloodWaitError as e:
+                  print(f"⏳ Rate limited: waiting {e.seconds}s")
+                  await asyncio.sleep(e.seconds)
+                  success, result = await send_file_with_thumb(client, entity, video_path, caption)
+                  return success
+              except Exception as e:
+                  print(f"❌ Merged upload failed: {e}")
+                  traceback.print_exc()
+                  return False
 
-async def send_file_with_thumb(client, entity, file_path, caption):
-    # Check if file exists
-    if not os.path.exists(file_path):
-        print(f"❌ File not found: {file_path}")
-        return False, None
-    
-    duration, w, h = get_video_metadata(file_path)
-    print(f"📊 Video duration: {duration} seconds, {w}x{h}")
-    
-    thumb = generate_thumbnail(file_path)
-    
-    print(f"⏫ Uploading merged file with parallel chunks...")
-    print(f"📁 File path: {file_path}")
-    
-    try:
-        uploaded_file = await fast_upload_file(
-            client=client,
-            file_path=file_path,
-            progress_callback=progress_callback
-        )
-        
-        if uploaded_file is None:
-            print("❌ Upload returned None")
-            return False, None
-            
-        print("✅ Upload complete!")
-        
-        with open("merged_progress.log", "a") as f:
-            f.write(f"{datetime.datetime.now()}: UPLOAD_COMPLETE\n")
-        
-    except Exception as e:
-        print(f"❌ Upload failed: {e}")
-        traceback.print_exc()
-        return False, None
-    
-    video_attr = DocumentAttributeVideo(
-        duration=duration,
-        w=w,
-        h=h,
-        supports_streaming=True
-    )
-    
-    kwargs = {
-        "entity": entity,
-        "file": uploaded_file,
-        "caption": caption,
-        "attributes": [video_attr],
-        "supports_streaming": True,
-        "force_document": False,
-        "allow_cache": True
-    }
-    
-    if thumb and os.path.exists(thumb):
-        kwargs["thumb"] = thumb
-        print(f"📸 Using thumbnail: {thumb}")
-    
-    try:
-        result = await client.send_file(**kwargs)
-        print("✅ File sent to Telegram!")
-        return True, result
-    except Exception as e:
-        print(f"❌ Send failed: {e}")
-        if "thumb" in kwargs:
-            del kwargs["thumb"]
-            try:
-                result = await client.send_file(**kwargs)
-                return True, result
-            except Exception as e2:
-                print(f"❌ Send failed without thumb: {e2}")
-                return False, None
-        return False, None
-    finally:
-        if thumb and os.path.exists(thumb):
-            try: os.remove(thumb)
-            except: pass
+          async def main():
+              try:
+                  print("🔌 Connecting to Telegram...")
+                  
+                  client = TelegramClient(
+                      StringSession(session_string), 
+                      int(api_id), 
+                      api_hash,
+                      connection_retries=5,
+                      flood_sleep_threshold=180
+                  )
+                  await client.connect()
+                  
+                  if not await client.is_user_authorized():
+                      print("❌ Session invalid")
+                      return
+                  
+                  me = await client.get_me()
+                  print(f"✅ Logged in: {me.first_name}")
+                  
+                  entity = await resolve_chat(client, chat_id, invite_link, chat_name)
+                  
+                  if not entity:
+                      print("❌ Could not resolve chat for merged video!")
+                      return
+                  
+                  print(f"\n📤 Uploading merged to: {entity.title if hasattr(entity, 'title') else entity.id}")
+                  await upload_merged_video(client, entity)
+                  
+                  await client.disconnect()
+                  print("\n✅ Merged upload complete!")
+                          
+              except Exception as e:
+                  print(f"❌ Error: {e}")
+                  traceback.print_exc()
 
-async def upload_merged_video(client, entity):
-    video_path = os.environ.get("MERGED_PATH")
-    
-    # Debug: print current directory and files
-    print(f"📁 Current directory: {os.getcwd()}")
-    print(f"📁 Files in directory: {os.listdir('.')}")
-    print(f"📁 MERGED_PATH: {video_path}")
-    
-    # Try to find the file if path is not set or doesn't exist
-    if not video_path or not os.path.isfile(video_path):
-        # Try to find output.mp4 in current directory
-        if os.path.exists("output.mp4"):
-            video_path = os.path.abspath("output.mp4")
-            print(f"🔍 Found output.mp4 in current directory: {video_path}")
-        elif os.path.exists("../output.mp4"):
-            video_path = os.path.abspath("../output.mp4")
-            print(f"🔍 Found output.mp4 in parent directory: {video_path}")
-        else:
-            print(f"❌ Video not found: {video_path}")
-            print("🔍 Looking for video files...")
-            import glob
-            video_files = glob.glob("*.mp4")
-            if video_files:
-                print(f"📁 Found MP4 files: {video_files}")
-                # Use the largest MP4 file
-                largest_file = max(video_files, key=lambda f: os.path.getsize(f))
-                video_path = os.path.abspath(largest_file)
-                print(f"📁 Using largest file: {video_path}")
-            else:
-                return False
-    
-    if not os.path.isfile(video_path):
-        print(f"❌ Video still not found: {video_path}")
-        return False
-    
-    file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-    print(f"💾 File size: {file_size_mb:.1f} MB")
-    
-    if file_size_mb > 2000:
-        print(f"❌ File exceeds 2GB ({file_size_mb:.1f} MB)")
-        print("⚠️ Telegram limit is 2GB.")
-        return False
-    
-    if file_size_mb > 1800:
-        print(f"⚠️ File is large ({file_size_mb:.1f} MB)")
-        print("   Using parallel upload for speed...")
-    
-    duration, w, h = get_video_metadata(video_path)
-    print(f"📊 Duration: {duration} seconds")
-    
-    now = datetime.datetime.now()
-    month_year = now.strftime("%B%Y").upper()
-    
-    clean_label = str(label).upper().replace("-", "").replace(" ", "").replace("_", "")
-    if clean_label == "NONE" or clean_label == "":
-        clean_label = "NONE"
-    
-    caption = f"{title}\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}"
-    
-    print(f"📤 Uploading merged video...")
-    print(f"📝 Caption: {caption[:50]}...")
-    
-    try:
-        success, result = await send_file_with_thumb(client, entity, video_path, caption)
-        if success:
-            print("✅ Merged video uploaded!")
-            return True
-        return False
-    except FloodWaitError as e:
-        print(f"⏳ Rate limited: waiting {e.seconds}s")
-        await asyncio.sleep(e.seconds)
-        success, result = await send_file_with_thumb(client, entity, video_path, caption)
-        return success
-    except Exception as e:
-        print(f"❌ Merged upload failed: {e}")
-        traceback.print_exc()
-        return False
-
-async def main():
-    try:
-        print("🔌 Connecting to Telegram...")
-        
-        client = TelegramClient(
-            StringSession(session_string), 
-            int(api_id), 
-            api_hash,
-            connection_retries=5,
-            flood_sleep_threshold=180
-        )
-        await client.connect()
-        
-        if not await client.is_user_authorized():
-            print("❌ Session invalid")
-            return
-        
-        me = await client.get_me()
-        print(f"✅ Logged in: {me.first_name}")
-        
-        entity = await resolve_chat(client, chat_id, invite_link, chat_name)
-        
-        if not entity:
-            print("❌ Could not resolve chat for merged video!")
-            return
-        
-        print(f"\n📤 Uploading merged to: {entity.title if hasattr(entity, 'title') else entity.id}")
-        await upload_merged_video(client, entity)
-        
-        await client.disconnect()
-        print("\n✅ Merged upload complete!")
-                
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        traceback.print_exc()
-
-if __name__ == '__main__':
-    asyncio.run(main())
-EOFUPLOAD
+          if __name__ == '__main__':
+              asyncio.run(main())
+          EOFUPLOAD
           
           echo "🚀 Starting merged video upload with parallel upload..."
           nohup python3 -u upload_merged.py > merged_upload.log 2>&1 &
@@ -1719,422 +1670,422 @@ EOFUPLOAD
           echo "========================================="
           
           cat > upload_single.py << 'EOFUPLOAD'
-import os
-import sys
-import glob
-import re
-import subprocess
-import asyncio
-import datetime
-import traceback
-import json
-import math
+          import os
+          import sys
+          import glob
+          import re
+          import subprocess
+          import asyncio
+          import datetime
+          import traceback
+          import json
+          import math
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
+          if hasattr(sys.stdout, "reconfigure"):
+              sys.stdout.reconfigure(line_buffering=True)
+              sys.stderr.reconfigure(line_buffering=True)
 
-try:
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-    from telethon.errors import FloodWaitError
-    from telethon.tl.functions.channels import JoinChannelRequest
-    from telethon.tl.functions.messages import ImportChatInviteRequest, CreateForumTopicRequest
-    from telethon.tl.types import DocumentAttributeVideo
-    import telethon
-    print(f"✅ Telethon version: {telethon.__version__}")
-except ImportError as e:
-    print(f"❌ Import error: {e}")
-    sys.exit(1)
+          try:
+              from telethon import TelegramClient
+              from telethon.sessions import StringSession
+              from telethon.errors import FloodWaitError
+              from telethon.tl.functions.channels import JoinChannelRequest
+              from telethon.tl.functions.messages import ImportChatInviteRequest, CreateForumTopicRequest
+              from telethon.tl.types import DocumentAttributeVideo
+              import telethon
+              print(f"✅ Telethon version: {telethon.__version__}")
+          except ImportError as e:
+              print(f"❌ Import error: {e}")
+              sys.exit(1)
 
-api_id = os.environ.get("TG_API_ID")
-api_hash = os.environ.get("TG_API_HASH")
-session_string = os.environ.get("TG_SESSION_STRING")
+          api_id = os.environ.get("TG_API_ID")
+          api_hash = os.environ.get("TG_API_HASH")
+          session_string = os.environ.get("TG_SESSION_STRING")
+          
+          chat_id_raw = os.environ.get("TG_SINGLE_EPISODES_CHAT_ID")
+          chat_name = os.environ.get("TG_SINGLE_EPISODES_NAME")
+          invite_link = os.environ.get("TG_SINGLE_EPISODES_INVITE_LINK")
+          
+          title = os.environ.get("TITLE")
+          series_title = os.environ.get("SERIES_TITLE", "Series")
+          label = os.environ.get("LABEL", "NONE")
 
-chat_id_raw = os.environ.get("TG_SINGLE_EPISODES_CHAT_ID")
-chat_name = os.environ.get("TG_SINGLE_EPISODES_NAME")
-invite_link = os.environ.get("TG_SINGLE_EPISODES_INVITE_LINK")
+          if not all([api_id, api_hash]):
+              print("❌ Missing Telegram API credentials.")
+              sys.exit(0)
 
-title = os.environ.get("TITLE")
-series_title = os.environ.get("SERIES_TITLE", "Series")
-label = os.environ.get("LABEL", "NONE")
+          if not session_string:
+              print("❌ Missing session string!")
+              sys.exit(0)
 
-if not all([api_id, api_hash]):
-    print("❌ Missing Telegram API credentials.")
-    sys.exit(0)
+          def parse_chat_id(val):
+              if not val:
+                  return None
+              val = str(val).strip().strip('"').strip("'")
+              try:
+                  return int(val)
+              except ValueError:
+                  return val
 
-if not session_string:
-    print("❌ Missing session string!")
-    sys.exit(0)
+          def fix_video_duration(file_path):
+              try:
+                  temp_file = f"{file_path}.fixed.mp4"
+                  cmd = [
+                      "ffmpeg", "-y",
+                      "-i", file_path,
+                      "-c", "copy",
+                      "-map_metadata", "0",
+                      "-movflags", "+faststart",
+                      temp_file
+                  ]
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                  
+                  if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                      cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", temp_file]
+                      duration_check = subprocess.check_output(cmd, text=True).strip()
+                      if duration_check and duration_check.replace('.', '', 1).isdigit():
+                          os.replace(temp_file, file_path)
+                          return True
+                  return False
+              except Exception as e:
+                  print(f"⚠️ Could not fix duration: {e}")
+                  return False
 
-def parse_chat_id(val):
-    if not val:
-        return None
-    val = str(val).strip().strip('"').strip("'")
-    try:
-        return int(val)
-    except ValueError:
-        return val
+          def get_video_metadata(file_path):
+              try:
+                  cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  if result and result.replace('.', '', 1).isdigit():
+                      duration = float(result)
+                  else:
+                      cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      duration = float(result) if result.replace('.', '', 1).isdigit() else 0.0
+                  
+                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  parts = result.split('|')
+                  
+                  if len(parts) >= 2:
+                      w = int(parts[0]) if parts[0].isdigit() else 1280
+                      h = int(parts[1]) if parts[1].isdigit() else 720
+                  else:
+                      cmd = ["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "default=noprint_wrappers=1", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      w = 1280
+                      h = 720
+                      for line in result.split('\n'):
+                          if 'width=' in line:
+                              w = int(line.split('=')[1])
+                          elif 'height=' in line:
+                              h = int(line.split('=')[1])
+                  
+                  return int(duration), w, h
+              except Exception as e:
+                  print(f"⚠️ Error getting metadata: {e}")
+              return 0, 1280, 720
 
-def fix_video_duration(file_path):
-    try:
-        temp_file = f"{file_path}.fixed.mp4"
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", file_path,
-            "-c", "copy",
-            "-map_metadata", "0",
-            "-movflags", "+faststart",
-            temp_file
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        
-        if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
-            cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", temp_file]
-            duration_check = subprocess.check_output(cmd, text=True).strip()
-            if duration_check and duration_check.replace('.', '', 1).isdigit():
-                os.replace(temp_file, file_path)
-                return True
-        return False
-    except Exception as e:
-        print(f"⚠️ Could not fix duration: {e}")
-        return False
+          def generate_thumbnail(file_path):
+              try:
+                  thumb_path = f"{file_path}_thumb.jpg"
+                  
+                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  parts = result.split('|')
+                  
+                  if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                      w = int(parts[0])
+                      h = int(parts[1])
+                      
+                      ffmpeg_cmd = [
+                          "ffmpeg", "-y", "-ss", "00:00:01",
+                          "-i", file_path,
+                          "-vf", f"crop=min({w},{h}):min({w},{h}),scale=512:512:flags=lanczos",
+                          "-vframes", "1",
+                          "-q:v", "2",
+                          thumb_path
+                      ]
+                      
+                      subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                      return thumb_path if os.path.exists(thumb_path) else None
+              except:
+                  pass
+              return None
 
-def get_video_metadata(file_path):
-    try:
-        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
-        result = subprocess.check_output(cmd, text=True).strip()
-        if result and result.replace('.', '', 1).isdigit():
-            duration = float(result)
-        else:
-            cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
-            result = subprocess.check_output(cmd, text=True).strip()
-            duration = float(result) if result.replace('.', '', 1).isdigit() else 0.0
-        
-        cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
-        result = subprocess.check_output(cmd, text=True).strip()
-        parts = result.split('|')
-        
-        if len(parts) >= 2:
-            w = int(parts[0]) if parts[0].isdigit() else 1280
-            h = int(parts[1]) if parts[1].isdigit() else 720
-        else:
-            cmd = ["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "default=noprint_wrappers=1", file_path]
-            result = subprocess.check_output(cmd, text=True).strip()
-            w = 1280
-            h = 720
-            for line in result.split('\n'):
-                if 'width=' in line:
-                    w = int(line.split('=')[1])
-                elif 'height=' in line:
-                    h = int(line.split('=')[1])
-        
-        return int(duration), w, h
-    except Exception as e:
-        print(f"⚠️ Error getting metadata: {e}")
-    return 0, 1280, 720
+          chat_id = parse_chat_id(chat_id_raw)
 
-def generate_thumbnail(file_path):
-    try:
-        thumb_path = f"{file_path}_thumb.jpg"
-        
-        cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
-        result = subprocess.check_output(cmd, text=True).strip()
-        parts = result.split('|')
-        
-        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-            w = int(parts[0])
-            h = int(parts[1])
-            
-            ffmpeg_cmd = [
-                "ffmpeg", "-y", "-ss", "00:00:01",
-                "-i", file_path,
-                "-vf", f"crop=min({w},{h}):min({w},{h}),scale=512:512:flags=lanczos",
-                "-vframes", "1",
-                "-q:v", "2",
-                thumb_path
-            ]
-            
-            subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            return thumb_path if os.path.exists(thumb_path) else None
-    except:
-        pass
-    return None
+          print("=" * 60)
+          print("📤 Uploading Single Episodes (FAST UPLOAD ENABLED)")
+          print("=" * 60)
+          print(f"📺 Series: {series_title}")
+          print("=" * 60)
 
-chat_id = parse_chat_id(chat_id_raw)
+          with open("episode_upload.log", "w") as f:
+              f.write(f"{datetime.datetime.now()}: Starting episode uploads\n")
 
-print("=" * 60)
-print("📤 Uploading Single Episodes (FAST UPLOAD ENABLED)")
-print("=" * 60)
-print(f"📺 Series: {series_title}")
-print("=" * 60)
+          def progress_callback(current, total):
+              """Progress callback for upload"""
+              percent = (current / total) * 100
+              mb_uploaded = current / (1024 * 1024)
+              mb_total = total / (1024 * 1024)
+              if int(percent) % 5 == 0 or int(percent) == 100:
+                  print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
 
-with open("episode_upload.log", "w") as f:
-    f.write(f"{datetime.datetime.now()}: Starting episode uploads\n")
+          async def join_chat(client, invite_link):
+              if not invite_link:
+                  return None
+              try:
+                  entity = await client.get_entity(invite_link)
+                  return entity
+              except:
+                  pass
+              return None
 
-def progress_callback(current, total):
-    """Progress callback for upload"""
-    percent = (current / total) * 100
-    mb_uploaded = current / (1024 * 1024)
-    mb_total = total / (1024 * 1024)
-    if int(percent) % 5 == 0 or int(percent) == 100:
-        print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
+          async def resolve_chat(client, chat_id, invite_link, search_name):
+              if invite_link:
+                  entity = await join_chat(client, invite_link)
+                  if entity:
+                      return entity
+              if chat_id:
+                  try:
+                      return await client.get_entity(chat_id)
+                  except:
+                      pass
+              if search_name:
+                  async for dialog in client.iter_dialogs(limit=50):
+                      if search_name.lower() in str(dialog.name).lower():
+                          return dialog.entity
+              return None
 
-async def join_chat(client, invite_link):
-    if not invite_link:
-        return None
-    try:
-        entity = await client.get_entity(invite_link)
-        return entity
-    except:
-        pass
-    return None
+          async def fast_upload_file(client, file_path, progress_callback=None):
+              """Custom fast upload implementation"""
+              if not os.path.exists(file_path):
+                  print(f"❌ File not found: {file_path}")
+                  return None
+              
+              file_size = os.path.getsize(file_path)
+              print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
+              print(f"⚡ Uploading with parallel chunks...")
+              
+              try:
+                  result = await client.upload_file(
+                      file_path,
+                      part_size_kb=512,
+                      file_name=os.path.basename(file_path),
+                      progress_callback=progress_callback
+                  )
+                  return result
+              except Exception as e:
+                  print(f"❌ Upload failed: {e}")
+                  raise
 
-async def resolve_chat(client, chat_id, invite_link, search_name):
-    if invite_link:
-        entity = await join_chat(client, invite_link)
-        if entity:
-            return entity
-    if chat_id:
-        try:
-            return await client.get_entity(chat_id)
-        except:
-            pass
-    if search_name:
-        async for dialog in client.iter_dialogs(limit=50):
-            if search_name.lower() in str(dialog.name).lower():
-                return dialog.entity
-    return None
+          async def send_file_with_thumb(client, entity, file_path, caption, reply_to=None):
+              # Check if file exists
+              if not os.path.exists(file_path):
+                  print(f"❌ File not found: {file_path}")
+                  return False, None
+              
+              duration, w, h = get_video_metadata(file_path)
+              print(f"📊 Video duration: {duration} seconds, {w}x{h}")
+              
+              if duration == 0:
+                  try:
+                      cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      if result and result.replace('.', '', 1).isdigit():
+                          duration = int(float(result))
+                          print(f"📊 Retrieved duration from ffprobe: {duration} seconds")
+                  except:
+                      pass
+              
+              thumb = generate_thumbnail(file_path)
+              
+              print(f"⏫ Uploading {os.path.basename(file_path)}...")
+              try:
+                  uploaded_file = await fast_upload_file(
+                      client=client,
+                      file_path=file_path,
+                      progress_callback=progress_callback
+                  )
+                  
+                  if uploaded_file is None:
+                      print(f"❌ Upload returned None for {os.path.basename(file_path)}")
+                      return False, None
+                      
+                  print(f"✅ Upload complete for {os.path.basename(file_path)}!")
+              except Exception as e:
+                  print(f"❌ Upload failed: {e}")
+                  return False, None
+              
+              video_attr = DocumentAttributeVideo(
+                  duration=duration,
+                  w=w if w > 0 else 1280,
+                  h=h if h > 0 else 720,
+                  supports_streaming=True
+              )
+              
+              kwargs = {
+                  "entity": entity,
+                  "file": uploaded_file,
+                  "caption": caption,
+                  "attributes": [video_attr],
+                  "supports_streaming": True,
+                  "force_document": False,
+                  "allow_cache": True
+              }
+              
+              if thumb and os.path.exists(thumb):
+                  kwargs["thumb"] = thumb
+              
+              if reply_to:
+                  kwargs["reply_to"] = reply_to
+              
+              try:
+                  result = await client.send_file(**kwargs)
+                  return True, result
+              except Exception as e:
+                  print(f"❌ Send failed: {e}")
+                  if "thumb" in kwargs:
+                      del kwargs["thumb"]
+                      try:
+                          result = await client.send_file(**kwargs)
+                          return True, result
+                      except Exception as e2:
+                          print(f"❌ Send failed without thumb: {e2}")
+                          return False, None
+                  return False, None
+              finally:
+                  if thumb and os.path.exists(thumb):
+                      try: os.remove(thumb)
+                      except: pass
 
-async def fast_upload_file(client, file_path, progress_callback=None):
-    """Custom fast upload implementation"""
-    if not os.path.exists(file_path):
-        print(f"❌ File not found: {file_path}")
-        return None
-    
-    file_size = os.path.getsize(file_path)
-    print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
-    print(f"⚡ Uploading with parallel chunks...")
-    
-    try:
-        result = await client.upload_file(
-            file_path,
-            part_size_kb=512,
-            file_name=os.path.basename(file_path),
-            progress_callback=progress_callback
-        )
-        return result
-    except Exception as e:
-        print(f"❌ Upload failed: {e}")
-        raise
+          async def upload_episodes(client, entity, topic_id):
+              ep_files = sorted(glob.glob("EP*.mp4"), 
+                  key=lambda f: int(re.search(r'EP(\d+)\.mp4', f).group(1)) if re.search(r'EP(\d+)\.mp4', f) else 0)
+              
+              if not ep_files:
+                  print("❌ No episode files found!")
+                  return False
+              
+              print(f"📊 Found {len(ep_files)} episodes to upload")
+              print("⚡ Each episode will use parallel upload!")
+              count = 0
+              
+              for ep_file in ep_files:
+                  ep_match = re.search(r'EP(\d+)\.mp4', ep_file)
+                  if not ep_match:
+                      continue
+                  ep_num = int(ep_match.group(1))
+                  
+                  print(f"🔧 Fixing duration for Episode {ep_num}...")
+                  if fix_video_duration(ep_file):
+                      print(f"✅ Duration fixed for Episode {ep_num}")
+                  else:
+                      print(f"⚠️ Could not fix duration for Episode {ep_num}")
+                  
+                  file_size = os.path.getsize(ep_file) / (1024 * 1024)
+                  if file_size > 2000:
+                      print(f"⚠️ Episode {ep_num} exceeds 2GB! Skipping.")
+                      continue
+                  
+                  caption = f"📺 Episode {ep_num}"
+                  
+                  print(f"📤 Uploading Episode {ep_num} ({file_size:.1f} MB)...")
+                  
+                  with open("episode_upload.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: STARTING_EP_{ep_num}\n")
+                  
+                  try:
+                      success, result = await send_file_with_thumb(client, entity, ep_file, caption, topic_id)
+                      if success:
+                          count += 1
+                          print(f"✅ Episode {ep_num} uploaded")
+                          with open("episode_upload.log", "a") as f:
+                              f.write(f"{datetime.datetime.now()}: COMPLETE_EP_{ep_num}\n")
+                      else:
+                          print(f"❌ Episode {ep_num} failed")
+                  except FloodWaitError as e:
+                      print(f"⏳ Rate limited: waiting {e.seconds}s")
+                      await asyncio.sleep(e.seconds)
+                      success, result = await send_file_with_thumb(client, entity, ep_file, caption, topic_id)
+                      if success:
+                          count += 1
+                          print(f"✅ Episode {ep_num} uploaded")
+                          with open("episode_upload.log", "a") as f:
+                              f.write(f"{datetime.datetime.now()}: COMPLETE_EP_{ep_num}\n")
+                  except Exception as e:
+                      print(f"❌ Episode {ep_num} error: {e}")
+                  
+                  await asyncio.sleep(1)
+              
+              print(f"✅ Uploaded {count}/{len(ep_files)} episodes")
+              return count > 0
 
-async def send_file_with_thumb(client, entity, file_path, caption, reply_to=None):
-    # Check if file exists
-    if not os.path.exists(file_path):
-        print(f"❌ File not found: {file_path}")
-        return False, None
-    
-    duration, w, h = get_video_metadata(file_path)
-    print(f"📊 Video duration: {duration} seconds, {w}x{h}")
-    
-    if duration == 0:
-        try:
-            cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
-            result = subprocess.check_output(cmd, text=True).strip()
-            if result and result.replace('.', '', 1).isdigit():
-                duration = int(float(result))
-                print(f"📊 Retrieved duration from ffprobe: {duration} seconds")
-        except:
-            pass
-    
-    thumb = generate_thumbnail(file_path)
-    
-    print(f"⏫ Uploading {os.path.basename(file_path)}...")
-    try:
-        uploaded_file = await fast_upload_file(
-            client=client,
-            file_path=file_path,
-            progress_callback=progress_callback
-        )
-        
-        if uploaded_file is None:
-            print(f"❌ Upload returned None for {os.path.basename(file_path)}")
-            return False, None
-            
-        print(f"✅ Upload complete for {os.path.basename(file_path)}!")
-    except Exception as e:
-        print(f"❌ Upload failed: {e}")
-        return False, None
-    
-    video_attr = DocumentAttributeVideo(
-        duration=duration,
-        w=w if w > 0 else 1280,
-        h=h if h > 0 else 720,
-        supports_streaming=True
-    )
-    
-    kwargs = {
-        "entity": entity,
-        "file": uploaded_file,
-        "caption": caption,
-        "attributes": [video_attr],
-        "supports_streaming": True,
-        "force_document": False,
-        "allow_cache": True
-    }
-    
-    if thumb and os.path.exists(thumb):
-        kwargs["thumb"] = thumb
-    
-    if reply_to:
-        kwargs["reply_to"] = reply_to
-    
-    try:
-        result = await client.send_file(**kwargs)
-        return True, result
-    except Exception as e:
-        print(f"❌ Send failed: {e}")
-        if "thumb" in kwargs:
-            del kwargs["thumb"]
-            try:
-                result = await client.send_file(**kwargs)
-                return True, result
-            except Exception as e2:
-                print(f"❌ Send failed without thumb: {e2}")
-                return False, None
-        return False, None
-    finally:
-        if thumb and os.path.exists(thumb):
-            try: os.remove(thumb)
-            except: pass
+          async def main():
+              try:
+                  print("🔌 Connecting to Telegram...")
+                  
+                  client = TelegramClient(
+                      StringSession(session_string), 
+                      int(api_id), 
+                      api_hash,
+                      connection_retries=5,
+                      flood_sleep_threshold=180
+                  )
+                  await client.connect()
+                  
+                  if not await client.is_user_authorized():
+                      print("❌ Session invalid")
+                      return
+                  
+                  me = await client.get_me()
+                  print(f"✅ Logged in: {me.first_name}")
+                  
+                  entity = await resolve_chat(client, chat_id, invite_link, chat_name)
+                  
+                  if not entity:
+                      print("❌ Could not resolve chat for episodes!")
+                      return
+                  
+                  print(f"\n📤 Uploading episodes to: {entity.title if hasattr(entity, 'title') else entity.id}")
+                  
+                  topic_id = None
+                  if hasattr(entity, 'forum') and entity.forum:
+                      try:
+                          topic_name = f"[{label}]-{series_title}"
+                          print(f"📝 Creating forum topic: {topic_name[:50]}")
+                          result = await client(CreateForumTopicRequest(
+                              peer=entity,
+                              title=topic_name[:50]
+                          ))
+                          
+                          if hasattr(result, 'updates'):
+                              for update in result.updates:
+                                  if hasattr(update, 'id'):
+                                      topic_id = update.id
+                                      break
+                          if not topic_id and hasattr(result, 'id'):
+                              topic_id = result.id
+                          
+                          if topic_id:
+                              print(f"✅ Topic created: {topic_name[:50]} (ID: {topic_id})")
+                          else:
+                              print(f"⚠️ Topic created but couldn't get ID")
+                      except Exception as e:
+                          print(f"⚠️ Could not create topic: {e}")
+                  
+                  await upload_episodes(client, entity, topic_id)
+                  
+                  await client.disconnect()
+                  print("\n✅ Episode upload complete!")
+                          
+              except Exception as e:
+                  print(f"❌ Error: {e}")
+                  traceback.print_exc()
 
-async def upload_episodes(client, entity, topic_id):
-    ep_files = sorted(glob.glob("EP*.mp4"), 
-        key=lambda f: int(re.search(r'EP(\d+)\.mp4', f).group(1)) if re.search(r'EP(\d+)\.mp4', f) else 0)
-    
-    if not ep_files:
-        print("❌ No episode files found!")
-        return False
-    
-    print(f"📊 Found {len(ep_files)} episodes to upload")
-    print("⚡ Each episode will use parallel upload!")
-    count = 0
-    
-    for ep_file in ep_files:
-        ep_match = re.search(r'EP(\d+)\.mp4', ep_file)
-        if not ep_match:
-            continue
-        ep_num = int(ep_match.group(1))
-        
-        print(f"🔧 Fixing duration for Episode {ep_num}...")
-        if fix_video_duration(ep_file):
-            print(f"✅ Duration fixed for Episode {ep_num}")
-        else:
-            print(f"⚠️ Could not fix duration for Episode {ep_num}")
-        
-        file_size = os.path.getsize(ep_file) / (1024 * 1024)
-        if file_size > 2000:
-            print(f"⚠️ Episode {ep_num} exceeds 2GB! Skipping.")
-            continue
-        
-        caption = f"📺 Episode {ep_num}"
-        
-        print(f"📤 Uploading Episode {ep_num} ({file_size:.1f} MB)...")
-        
-        with open("episode_upload.log", "a") as f:
-            f.write(f"{datetime.datetime.now()}: STARTING_EP_{ep_num}\n")
-        
-        try:
-            success, result = await send_file_with_thumb(client, entity, ep_file, caption, topic_id)
-            if success:
-                count += 1
-                print(f"✅ Episode {ep_num} uploaded")
-                with open("episode_upload.log", "a") as f:
-                    f.write(f"{datetime.datetime.now()}: COMPLETE_EP_{ep_num}\n")
-            else:
-                print(f"❌ Episode {ep_num} failed")
-        except FloodWaitError as e:
-            print(f"⏳ Rate limited: waiting {e.seconds}s")
-            await asyncio.sleep(e.seconds)
-            success, result = await send_file_with_thumb(client, entity, ep_file, caption, topic_id)
-            if success:
-                count += 1
-                print(f"✅ Episode {ep_num} uploaded")
-                with open("episode_upload.log", "a") as f:
-                    f.write(f"{datetime.datetime.now()}: COMPLETE_EP_{ep_num}\n")
-        except Exception as e:
-            print(f"❌ Episode {ep_num} error: {e}")
-        
-        await asyncio.sleep(1)
-    
-    print(f"✅ Uploaded {count}/{len(ep_files)} episodes")
-    return count > 0
-
-async def main():
-    try:
-        print("🔌 Connecting to Telegram...")
-        
-        client = TelegramClient(
-            StringSession(session_string), 
-            int(api_id), 
-            api_hash,
-            connection_retries=5,
-            flood_sleep_threshold=180
-        )
-        await client.connect()
-        
-        if not await client.is_user_authorized():
-            print("❌ Session invalid")
-            return
-        
-        me = await client.get_me()
-        print(f"✅ Logged in: {me.first_name}")
-        
-        entity = await resolve_chat(client, chat_id, invite_link, chat_name)
-        
-        if not entity:
-            print("❌ Could not resolve chat for episodes!")
-            return
-        
-        print(f"\n📤 Uploading episodes to: {entity.title if hasattr(entity, 'title') else entity.id}")
-        
-        topic_id = None
-        if hasattr(entity, 'forum') and entity.forum:
-            try:
-                topic_name = f"[{label}]-{series_title}"
-                print(f"📝 Creating forum topic: {topic_name[:50]}")
-                result = await client(CreateForumTopicRequest(
-                    peer=entity,
-                    title=topic_name[:50]
-                ))
-                
-                if hasattr(result, 'updates'):
-                    for update in result.updates:
-                        if hasattr(update, 'id'):
-                            topic_id = update.id
-                            break
-                if not topic_id and hasattr(result, 'id'):
-                    topic_id = result.id
-                
-                if topic_id:
-                    print(f"✅ Topic created: {topic_name[:50]} (ID: {topic_id})")
-                else:
-                    print(f"⚠️ Topic created but couldn't get ID")
-            except Exception as e:
-                print(f"⚠️ Could not create topic: {e}")
-        
-        await upload_episodes(client, entity, topic_id)
-        
-        await client.disconnect()
-        print("\n✅ Episode upload complete!")
-                
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        traceback.print_exc()
-
-if __name__ == '__main__':
-    asyncio.run(main())
-EOFUPLOAD
+          if __name__ == '__main__':
+              asyncio.run(main())
+          EOFUPLOAD
           
           echo "🚀 Uploading episodes with parallel upload..."
           python3 -u upload_single.py
