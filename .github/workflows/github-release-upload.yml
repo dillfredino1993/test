@@ -53,21 +53,10 @@ jobs:
           
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool
-          
           pip3 install --upgrade pip
-          pip3 install telethon qrcode requests aiohttp python-socks[asyncio]
-          
-          # Install yt-dlp with curl_cffi support
-          echo "📦 Installing yt-dlp with curl_cffi support..."
-          pip3 install curl_cffi
-          pip3 install yt-dlp[curl_cffi]
-          
-          # Also install the standalone version for comparison
-          pip3 install yt-dlp --upgrade
-          
+          pip3 install telethon qrcode yt-dlp requests
+          pip3 install aiohttp python-socks[asyncio]
           python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')"
-          python3 -c "import yt_dlp; print(f'✅ yt-dlp version: {yt_dlp.version.__version__}')"
-          python3 -c "from curl_cffi import requests; print('✅ curl_cffi installed successfully')"
           
           echo "========================================="
           echo "✅ INSTALLATION COMPLETE"
@@ -139,7 +128,7 @@ jobs:
           
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
-      - name: Download All Episodes First (with yt-dlp + curl_cffi)
+      - name: Download All Episodes First
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -152,39 +141,7 @@ jobs:
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Total Episodes: $(cat urls.txt | wc -l)"
-          echo "🔧 Using yt-dlp with curl_cffi for better scraping"
           echo "========================================="
-          
-          # Create custom yt-dlp config with curl_cffi
-          cat > yt-dlp-config.txt << 'EOFYTDLP'
-          # Use curl_cffi for better TLS fingerprinting
-          --impersonate chrome
-          --add-header "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-          --add-header "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
-          --add-header "Accept-Language: en-US,en;q=0.9"
-          --add-header "Accept-Encoding: gzip, deflate, br"
-          --add-header "Cache-Control: no-cache"
-          --add-header "Pragma: no-cache"
-          --add-header "Sec-Ch-Ua: \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\""
-          --add-header "Sec-Ch-Ua-Mobile: ?0"
-          --add-header "Sec-Ch-Ua-Platform: \"Windows\""
-          --add-header "Sec-Fetch-Dest: document"
-          --add-header "Sec-Fetch-Mode: navigate"
-          --add-header "Sec-Fetch-Site: none"
-          --add-header "Sec-Fetch-User: ?1"
-          --add-header "Upgrade-Insecure-Requests: 1"
-          --add-header "Referer: https://www.google.com/"
-          --no-warnings
-          --no-progress
-          --hls-use-mpegts
-          --downloader aria2c
-          --downloader-args "aria2c:-x 16 -s 16 -k 1M --continue=true"
-          --retries 10
-          --fragment-retries 10
-          --socket-timeout 30
-          --extractor-retries 10
-          --file-access-retries 10
-          EOFYTDLP
           
           TOTAL_EPISODES=$(cat urls.txt | wc -l)
           EP_INDEX=1
@@ -209,48 +166,27 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # Try yt-dlp with curl_cffi first
-            echo "📥 Using yt-dlp with curl_cffi and Chrome impersonation..."
-            
-            yt-dlp \
-              --config-location yt-dlp-config.txt \
-              --impersonate chrome \
-              -f "bestvideo[height<=1080]+bestaudio/best[height<=1080]" \
-              -o "$OUT_FILE" \
-              "$URL" < /dev/null 2>&1 || \
-            
-            # Fallback: use yt-dlp with standard approach
-            echo "⚠️ curl_cffi approach failed, trying standard yt-dlp..."
-            yt-dlp \
-              -f "bestvideo+bestaudio/best" \
-              --hls-use-mpegts \
-              --no-progress --no-warnings \
-              --downloader aria2c \
-              --downloader-args "aria2c:-x 16 -s 16 -k 1M --continue=true" \
-              -o "$OUT_FILE" \
-              "$URL" < /dev/null 2>&1 || \
-            
-            # Final fallback: use aria2c directly
-            echo "⚠️ yt-dlp failed, trying aria2c directly..."
-            aria2c -x 16 -s 16 -k 1M --continue=true \
-              --console-log-level=error \
-              --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              --header="Referer: https://www.google.com/" \
-              -o "$OUT_FILE" \
-              "$URL" < /dev/null 2>/dev/null || \
-            curl -sSL --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-              -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
-            
-            # If download failed or file is too small, try yt-dlp with different settings
-            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
-              echo "⚠️ Download failed or file too small, trying yt-dlp with best quality..."
-              rm -f "$OUT_FILE"
-              yt-dlp \
-                -f "bestvideo+bestaudio/best" \
+            # Download the episode - try both methods
+            if [[ "$URL" == *".m3u8"* ]]; then
+              echo "📺 HLS stream - Using yt-dlp"
+              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts \
                 --no-progress --no-warnings \
-                --impersonate chrome \
-                -o "$OUT_FILE" \
-                "$URL" < /dev/null 2>&1
+                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
+            else
+              echo "🎬 Direct file - Using aria2c"
+              aria2c -x 16 -s 16 -k 1M --continue=true \
+                --console-log-level=error \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null || \
+              curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
+            fi
+            
+            # If download failed or file is too small, try yt-dlp as fallback
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ Initial download failed or file too small, trying yt-dlp..."
+              rm -f "$OUT_FILE"
+              yt-dlp -f "bestvideo+bestaudio/best" \
+                --no-progress --no-warnings \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
             fi
             
             if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
@@ -640,13 +576,10 @@ jobs:
                 # Remove the bad file
                 rm -f "$FILE"
                 
-                # Redownload with yt-dlp with curl_cffi
-                yt-dlp \
-                  -f "bestvideo+bestaudio/best" \
+                # Redownload with yt-dlp specifically to ensure video+audio
+                yt-dlp -f "bestvideo+bestaudio/best" \
                   --no-progress --no-warnings \
-                  --impersonate chrome \
-                  -o "$FILE" \
-                  "$URL" < /dev/null 2>&1
+                  -o "$FILE" "$URL" < /dev/null 2>&1
                 
                 if [ -f "$FILE" ] && [ -s "$FILE" ]; then
                   # Verify the new file has video
