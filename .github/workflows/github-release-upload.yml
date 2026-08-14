@@ -813,22 +813,6 @@ jobs:
                   fi
                 else
                   echo "❌ Redownload failed for Episode $EP_NUM_FORMATTED"
-                  # Try to create a video from what we have
-                  DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FILE" 2>/dev/null || echo "30")
-                  TEMP_FILE="EP${EP_NUM_FORMATTED}_temp.mp4"
-                  
-                  ffmpeg -f lavfi -i color=black:size=720x1280:duration="$DURATION" \
-                    -i "$FILE" \
-                    -c:v libx264 -preset veryfast -crf 23 \
-                    -c:a aac -b:a 128k -ar 44100 \
-                    -shortest \
-                    -movflags +faststart \
-                    "$TEMP_FILE" 2>/dev/null
-                  
-                  if [ -f "$TEMP_FILE" ] && [ -s "$TEMP_FILE" ]; then
-                    mv "$TEMP_FILE" "$FILE"
-                    echo "✅ Created video from audio for Episode $EP_NUM_FORMATTED"
-                  fi
                 fi
               else
                 echo "⚠️ Could not find URL for Episode $EP_NUM_FORMATTED"
