@@ -2260,8 +2260,7 @@ EOFUPLOAD
             fi
           }
           
-          # Function to get current episode
-          get_current_episode() {
+          # Function to get current episode          get_current_episode() {
             if [ -f "episode_upload.log" ]; then
               local current=$(grep "STARTING_EP_" episode_upload.log 2>/dev/null | tail -1 | grep -oE "[0-9]+" | head -1)
               if [ -n "$current" ]; then
