@@ -182,9 +182,9 @@ jobs:
             fi
             
             if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
-              FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
-              FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-              FILE_SIZE_GB=$(echo "scale=2; $FILE_SIZE_MB / 1024" | bc)
+              FILE_SIZE_BYTES=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+              FILE_SIZE_MB=$(echo "scale=2; $FILE_SIZE_BYTES / 1024 / 1024" | bc 2>/dev/null || echo "0")
+              FILE_SIZE_GB=$(echo "scale=2; $FILE_SIZE_BYTES / 1024 / 1024 / 1024" | bc 2>/dev/null || echo "0")
               echo "✅ Downloaded: $OUT_FILE (${FILE_SIZE_MB}MB / ${FILE_SIZE_GB}GB)"
             else
               echo "❌ Download failed for Series $SERIES_INDEX"
@@ -225,8 +225,9 @@ jobs:
           echo "📊 Downloaded files:"
           for f in *.mp4; do
             if [ -f "$f" ]; then
-              SIZE_MB=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null | awk '{print $1/1024/1024}')
-              SIZE_GB=$(echo "scale=2; $SIZE_MB / 1024" | bc)
+              SIZE_BYTES=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
+              SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1024 / 1024" | bc 2>/dev/null || echo "0")
+              SIZE_GB=$(echo "scale=2; $SIZE_BYTES / 1024 / 1024 / 1024" | bc 2>/dev/null || echo "0")
               printf "   %-50s: %.1f MB (%.2f GB)\n" "$f" "$SIZE_MB" "$SIZE_GB"
             fi
           done
@@ -421,21 +422,25 @@ jobs:
           for f in $SERIES_FILES; do
             if [ ! -f "$f" ]; then continue; fi
             
-            FILE_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
-            FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-            FILE_SIZE_GB=$(echo "scale=2; $FILE_SIZE_MB / 1024" | bc)
+            # Get file size properly using bc
+            FILE_SIZE_BYTES=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
+            FILE_SIZE_MB=$(echo "scale=2; $FILE_SIZE_BYTES / 1024 / 1024" | bc 2>/dev/null || echo "0")
+            FILE_SIZE_GB=$(echo "scale=2; $FILE_SIZE_BYTES / 1024 / 1024 / 1024" | bc 2>/dev/null || echo "0")
             
             echo "📹 $f: ${FILE_SIZE_MB}MB (${FILE_SIZE_GB}GB)"
             
-            if [ $FILE_SIZE_MB -gt 1800 ]; then
+            # Convert to integer for comparison (remove decimal)
+            FILE_SIZE_MB_INT=$(echo "$FILE_SIZE_MB" | cut -d'.' -f1)
+            
+            if [ -n "$FILE_SIZE_MB_INT" ] && [ "$FILE_SIZE_MB_INT" -gt 1800 ] 2>/dev/null; then
               echo "⚠️  $f exceeds 1.8GB (${FILE_SIZE_GB}GB), compressing..."
               
               # Compress to under 1.8GB
               if python3 compress_series.py "$f" < /dev/null; then
                 COMPRESSED_COUNT=$((COMPRESSED_COUNT + 1))
-                NEW_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
-                NEW_SIZE_MB=$((NEW_SIZE / 1024 / 1024))
-                NEW_SIZE_GB=$(echo "scale=2; $NEW_SIZE_MB / 1024" | bc)
+                NEW_SIZE_BYTES=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
+                NEW_SIZE_MB=$(echo "scale=2; $NEW_SIZE_BYTES / 1024 / 1024" | bc 2>/dev/null || echo "0")
+                NEW_SIZE_GB=$(echo "scale=2; $NEW_SIZE_BYTES / 1024 / 1024 / 1024" | bc 2>/dev/null || echo "0")
                 echo "✅ $f compressed: ${NEW_SIZE_MB}MB (${NEW_SIZE_GB}GB)"
               else
                 echo "❌ Failed to compress $f"
@@ -468,8 +473,9 @@ jobs:
           echo "📊 Final series sizes:"
           for f in *.mp4; do
             if [ -f "$f" ]; then
-              SIZE_MB=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null | awk '{print $1/1024/1024}')
-              SIZE_GB=$(echo "scale=2; $SIZE_MB / 1024" | bc)
+              SIZE_BYTES=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
+              SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1024 / 1024" | bc 2>/dev/null || echo "0")
+              SIZE_GB=$(echo "scale=2; $SIZE_BYTES / 1024 / 1024 / 1024" | bc 2>/dev/null || echo "0")
               printf "   %-50s: %.1f MB (%.2f GB)\n" "$f" "$SIZE_MB" "$SIZE_GB"
             fi
           done
@@ -484,44 +490,95 @@ jobs:
           echo "🔍 VERIFYING SERIES FILES"
           echo "========================================="
           
+          # Get all MP4 files
           TOTAL_FILES=$(ls -1 *.mp4 2>/dev/null | wc -l)
           FAILED_FILES=""
+          
+          echo "📊 Found $TOTAL_FILES files to verify"
+          echo ""
           
           for f in *.mp4; do
             if [ ! -f "$f" ]; then continue; fi
             
             echo "🔍 Checking: $f"
             
-            # Check if file is valid and has video
-            if ffprobe -v error "$f" 2>/dev/null; then
-              # Check file size
-              SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
-              SIZE_MB=$((SIZE / 1024 / 1024))
-              
-              if [ $SIZE_MB -gt 2000 ]; then
-                echo "❌ $f exceeds 2GB (${SIZE_MB}MB) - Telegram limit!"
-                FAILED_FILES="$FAILED_FILES $f"
-              else
-                echo "✅ $f is valid (${SIZE_MB}MB)"
-                
-                # Get duration
-                DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "0")
-                echo "   Duration: ${DURATION}s"
-              fi
-            else
-              echo "❌ $f is invalid!"
+            # Get file size properly using bc
+            FILE_SIZE_BYTES=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
+            FILE_SIZE_MB=$(echo "scale=2; $FILE_SIZE_BYTES / 1024 / 1024" | bc 2>/dev/null || echo "0")
+            FILE_SIZE_GB=$(echo "scale=2; $FILE_SIZE_BYTES / 1024 / 1024 / 1024" | bc 2>/dev/null || echo "0")
+            
+            echo "   📊 Size: ${FILE_SIZE_MB} MB (${FILE_SIZE_GB} GB)"
+            
+            # Check if file exceeds 2GB (Telegram limit)
+            FILE_SIZE_MB_INT=$(echo "$FILE_SIZE_MB" | cut -d'.' -f1)
+            if [ -n "$FILE_SIZE_MB_INT" ] && [ "$FILE_SIZE_MB_INT" -gt 2000 ] 2>/dev/null; then
+              echo "   ❌ File exceeds 2GB (${FILE_SIZE_MB}MB) - Telegram limit!"
               FAILED_FILES="$FAILED_FILES $f"
+              echo ""
+              continue
             fi
+            
+            # Check if file is valid video - use timeout to avoid hanging
+            if timeout 60 ffprobe -v error "$f" 2>/dev/null; then
+              echo "   ✅ File is a valid video"
+              
+              # Get duration
+              DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "0")
+              echo "   ⏱️  Duration: ${DURATION}s"
+              
+              # Get resolution
+              WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null || echo "0")
+              HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null || echo "0")
+              echo "   📐 Resolution: ${WIDTH}x${HEIGHT}"
+            else
+              # Check if file has video stream using a different method
+              echo "   ⚠️ ffprobe check failed or timed out, trying mediainfo..."
+              
+              if mediainfo "$f" 2>/dev/null | grep -q "Video"; then
+                echo "   ✅ File appears to be a valid video (mediainfo)"
+                
+                # Try to get duration from mediainfo
+                DURATION=$(mediainfo --Inform="General;%Duration%" "$f" 2>/dev/null || echo "0")
+                if [ -n "$DURATION" ] && [ "$DURATION" != "0" ]; then
+                  DURATION_SEC=$(echo "scale=0; $DURATION / 1000" | bc 2>/dev/null || echo "0")
+                  echo "   ⏱️  Duration: ${DURATION_SEC}s"
+                fi
+              else
+                echo "   ❌ File is invalid or corrupted!"
+                FAILED_FILES="$FAILED_FILES $f"
+              fi
+            fi
+            
+            echo ""
           done
+          
+          echo "========================================="
+          echo "📊 VERIFICATION SUMMARY"
+          echo "========================================="
+          echo "📊 Total Files: $TOTAL_FILES"
           
           if [ -n "$FAILED_FILES" ]; then
             echo "❌ Failed files: $FAILED_FILES"
+            echo "========================================="
+            echo ""
+            echo "⚠️  Some files failed verification."
+            echo "   This could be due to:"
+            echo "   1. File is corrupted"
+            echo "   2. File exceeds 2GB (Telegram limit)"
+            echo "   3. File has no video stream"
+            echo ""
+            echo "📋 Failed files:"
+            for f in $FAILED_FILES; do
+              echo "   - $f"
+            done
+            echo ""
             exit 1
           fi
           
           echo "✅ All $TOTAL_FILES series files verified!"
           echo "verify_success=true" >> $GITHUB_OUTPUT
           echo "total_files=$TOTAL_FILES" >> $GITHUB_OUTPUT
+          echo "========================================="
 
       - name: Upload Series to Telegram Channel
         if: steps.verify.outputs.verify_success == 'true'
