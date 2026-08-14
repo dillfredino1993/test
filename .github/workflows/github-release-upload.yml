@@ -43,23 +43,62 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg & Tools
+      - name: Install FFmpeg & Tools with curl_cffi
         run: |
           echo "========================================="
-          echo "🔧 INSTALLING TOOLS"
+          echo "🔧 INSTALLING TOOLS WITH curl_cffi"
           echo "========================================="
           echo "📺 Series: ${{ env.series_title }}"
           echo "========================================="
           
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool
-          pip3 install --upgrade pip
-          pip3 install telethon qrcode yt-dlp requests
-          pip3 install aiohttp python-socks[asyncio]
-          python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')"
           
+          # Install Python packages with curl_cffi for impersonation
+          pip3 install --upgrade pip
+          
+          # Install yt-dlp with curl_cffi for Cloudflare bypass
+          echo "📦 Installing yt-dlp with curl_cffi support..."
+          pip3 install --upgrade --pre "yt-dlp[default,curl-cffi]"
+          
+          # Install other dependencies
+          pip3 install telethon qrcode requests aiohttp python-socks[asyncio]
+          
+          # Verify installations
+          echo ""
+          echo "📊 VERIFYING INSTALLATIONS:"
+          python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')"
+          python3 -c "import curl_cffi; print(f'✅ curl_cffi version: {curl_cffi.__version__}')"
+          yt-dlp --version
+          
+          # Test impersonation support
+          echo ""
+          echo "📊 IMPERSONATION SUPPORT:"
+          echo "Available impersonation targets:"
+          yt-dlp --list-impersonate-targets | head -20
+          
+          echo ""
           echo "========================================="
           echo "✅ INSTALLATION COMPLETE"
+          echo "========================================="
+
+      - name: Verify Impersonation Support
+        run: |
+          echo "========================================="
+          echo "🔍 VERIFYING IMPERSONATION SUPPORT"
+          echo "========================================="
+          
+          # Check if curl_cffi is installed
+          python3 -c "import curl_cffi; print('✅ curl_cffi installed successfully')" || {
+            echo "❌ curl_cffi not installed, installing..."
+            pip3 install curl_cffi
+          }
+          
+          # Check yt-dlp impersonation support
+          echo "Testing yt-dlp impersonation..."
+          yt-dlp --impersonate chrome --version
+          
+          echo "✅ Impersonation support verified"
           echo "========================================="
 
       - name: Compute Dynamic Formatted Output Filename & Label
@@ -128,7 +167,7 @@ jobs:
           
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
-      - name: Download All Episodes First
+      - name: Download All Episodes First with Impersonation
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -141,7 +180,124 @@ jobs:
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Total Episodes: $(cat urls.txt | wc -l)"
+          echo "⚡ Using yt-dlp with curl_cffi impersonation"
           echo "========================================="
+          
+          # Define download function with multiple fallback strategies
+          download_with_fallback() {
+            local url="$1"
+            local output="$2"
+            
+            echo "🔄 Attempting download with multiple strategies..."
+            
+            # Strategy 1: yt-dlp with chrome impersonation
+            echo "📌 Strategy 1: yt-dlp + chrome impersonation"
+            yt-dlp -f "bestvideo+bestaudio/best" \
+              --hls-use-mpegts \
+              --no-progress --no-warnings \
+              --impersonate chrome \
+              --extractor-args "generic:impersonate=chrome" \
+              -o "$output" "$url" < /dev/null 2>&1
+            
+            if [ -f "$output" ] && [ -s "$output" ]; then
+              local size=$(stat -c%s "$output" 2>/dev/null || echo "0")
+              if [ "$size" -gt 100000 ]; then
+                echo "✅ Download successful with Strategy 1"
+                return 0
+              fi
+            fi
+            
+            # Strategy 2: yt-dlp with edge impersonation
+            echo "📌 Strategy 2: yt-dlp + edge impersonation"
+            yt-dlp -f "bestvideo+bestaudio/best" \
+              --hls-use-mpegts \
+              --no-progress --no-warnings \
+              --impersonate edge \
+              --extractor-args "generic:impersonate=edge" \
+              -o "$output" "$url" < /dev/null 2>&1
+            
+            if [ -f "$output" ] && [ -s "$output" ]; then
+              local size=$(stat -c%s "$output" 2>/dev/null || echo "0")
+              if [ "$size" -gt 100000 ]; then
+                echo "✅ Download successful with Strategy 2"
+                return 0
+              fi
+            fi
+            
+            # Strategy 3: yt-dlp with safari impersonation
+            echo "📌 Strategy 3: yt-dlp + safari impersonation"
+            yt-dlp -f "bestvideo+bestaudio/best" \
+              --hls-use-mpegts \
+              --no-progress --no-warnings \
+              --impersonate safari \
+              --extractor-args "generic:impersonate=safari" \
+              -o "$output" "$url" < /dev/null 2>&1
+            
+            if [ -f "$output" ] && [ -s "$output" ]; then
+              local size=$(stat -c%s "$output" 2>/dev/null || echo "0")
+              if [ "$size" -gt 100000 ]; then
+                echo "✅ Download successful with Strategy 3"
+                return 0
+              fi
+            fi
+            
+            # Strategy 4: yt-dlp with chrome-110 (specific version)
+            echo "📌 Strategy 4: yt-dlp + chrome-110 impersonation"
+            yt-dlp -f "bestvideo+bestaudio/best" \
+              --hls-use-mpegts \
+              --no-progress --no-warnings \
+              --impersonate chrome-110 \
+              --extractor-args "generic:impersonate=chrome-110" \
+              -o "$output" "$url" < /dev/null 2>&1
+            
+            if [ -f "$output" ] && [ -s "$output" ]; then
+              local size=$(stat -c%s "$output" 2>/dev/null || echo "0")
+              if [ "$size" -gt 100000 ]; then
+                echo "✅ Download successful with Strategy 4"
+                return 0
+              fi
+            fi
+            
+            # Strategy 5: aria2c fallback
+            echo "📌 Strategy 5: aria2c fallback"
+            aria2c -x 16 -s 16 -k 1M --continue=true \
+              --console-log-level=error \
+              -o "$output" "$url" < /dev/null 2>/dev/null
+            
+            if [ -f "$output" ] && [ -s "$output" ]; then
+              local size=$(stat -c%s "$output" 2>/dev/null || echo "0")
+              if [ "$size" -gt 100000 ]; then
+                echo "✅ Download successful with Strategy 5"
+                return 0
+              fi
+            fi
+            
+            # Strategy 6: curl fallback with browser headers
+            echo "📌 Strategy 6: curl with browser headers"
+            curl -L -o "$output" \
+              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              -H "Accept: video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5" \
+              -H "Accept-Language: en-US,en;q=0.9" \
+              -H "Accept-Encoding: gzip, deflate, br" \
+              -H "Connection: keep-alive" \
+              -H "Sec-Fetch-Dest: video" \
+              -H "Sec-Fetch-Mode: navigate" \
+              -H "Sec-Fetch-Site: none" \
+              -H "Upgrade-Insecure-Requests: 1" \
+              "$url" < /dev/null 2>/dev/null
+            
+            if [ -f "$output" ] && [ -s "$output" ]; then
+              local size=$(stat -c%s "$output" 2>/dev/null || echo "0")
+              if [ "$size" -gt 100000 ]; then
+                echo "✅ Download successful with Strategy 6"
+                return 0
+              fi
+            fi
+            
+            echo "❌ All download strategies failed for $output"
+            rm -f "$output"
+            return 1
+          }
           
           TOTAL_EPISODES=$(cat urls.txt | wc -l)
           EP_INDEX=1
@@ -166,30 +322,8 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # Download the episode - try both methods
-            if [[ "$URL" == *".m3u8"* ]]; then
-              echo "📺 HLS stream - Using yt-dlp"
-              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts \
-                --no-progress --no-warnings \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
-            else
-              echo "🎬 Direct file - Using aria2c"
-              aria2c -x 16 -s 16 -k 1M --continue=true \
-                --console-log-level=error \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null || \
-              curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
-            fi
-            
-            # If download failed or file is too small, try yt-dlp as fallback
-            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
-              echo "⚠️ Initial download failed or file too small, trying yt-dlp..."
-              rm -f "$OUT_FILE"
-              yt-dlp -f "bestvideo+bestaudio/best" \
-                --no-progress --no-warnings \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
-            fi
-            
-            if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+            # Try download with fallback strategies
+            if download_with_fallback "$URL" "$OUT_FILE"; then
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
               FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
               echo "✅ Downloaded: $OUT_FILE (${FILE_SIZE_MB}MB)"
@@ -533,7 +667,6 @@ jobs:
             if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
               echo "⚠️ $f has no video stream!"
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
-              # Remove leading zeros for the list
               EP_NUM_CLEAN=$(echo "$EP_NUM" | sed 's/^0*//')
               REDOWNLOAD_LIST="$REDOWNLOAD_LIST $EP_NUM_CLEAN"
               NEEDS_REDOWNLOAD=true
@@ -557,7 +690,7 @@ jobs:
           # Redownload episodes that need it
           if [ "$NEEDS_REDOWNLOAD" = true ]; then
             echo ""
-            echo "🔄 Redownloading episodes with yt-dlp to ensure proper video..."
+            echo "🔄 Redownloading episodes with yt-dlp impersonation..."
             
             # Read URLs into array
             mapfile -t URL_ARRAY < urls.txt
@@ -570,15 +703,22 @@ jobs:
               if [ $URL_INDEX -ge 0 ] && [ $URL_INDEX -lt ${#URL_ARRAY[@]} ]; then
                 URL="${URL_ARRAY[$URL_INDEX]}"
                 echo ""
-                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp..."
+                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp impersonation..."
                 echo "📎 URL: $URL"
                 
                 # Remove the bad file
                 rm -f "$FILE"
                 
-                # Redownload with yt-dlp specifically to ensure video+audio
+                # Redownload with yt-dlp using impersonation
                 yt-dlp -f "bestvideo+bestaudio/best" \
                   --no-progress --no-warnings \
+                  --impersonate chrome \
+                  --extractor-args "generic:impersonate=chrome" \
+                  -o "$FILE" "$URL" < /dev/null 2>&1 || \
+                yt-dlp -f "bestvideo+bestaudio/best" \
+                  --no-progress --no-warnings \
+                  --impersonate edge \
+                  --extractor-args "generic:impersonate=edge" \
                   -o "$FILE" "$URL" < /dev/null 2>&1
                 
                 if [ -f "$FILE" ] && [ -s "$FILE" ]; then
@@ -682,7 +822,6 @@ jobs:
               fi
               if [ -z "$video_codec" ] || [ "$video_codec" = "unknown" ]; then
                 video_codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "avc1")
-                # Convert codec name to codec ID format
                 if [ "$video_codec" = "h264" ]; then
                   video_codec="avc1"
                 elif [ "$video_codec" = "hevc" ]; then
@@ -719,7 +858,6 @@ jobs:
           if [ -n "$VALID_RESOLUTIONS" ]; then
             TARGET_RES=$(echo "$VALID_RESOLUTIONS" | tr ' ' '\n' | grep -v "0x0" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           else
-            # No valid resolutions found, use default
             TARGET_RES="720x1280"
           fi
           
@@ -767,10 +905,8 @@ jobs:
             CURRENT_VIDEO_CODEC="${video_codecs[$f]:-}"
             CURRENT_AUDIO_CODEC="${audio_codecs[$f]:-AAC}"
             
-            # Check if file has video
             HAS_VIDEO="${has_video[$f]:-false}"
             
-            # If file has no video or resolution is invalid, we need to normalize
             if [ "$HAS_VIDEO" = "false" ] || [ "$CURRENT_RES" = "0x0" ] || [ "$CURRENT_RES" = "x" ] || [ -z "$CURRENT_RES" ]; then
               echo "⚠️ $f has no video or invalid resolution, will normalize"
               NEEDS_NORMALIZE=true
@@ -778,7 +914,6 @@ jobs:
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
               EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
               
-              # For files without video, create a blank video with audio
               echo "  🎵 $f is audio-only, creating video with audio..."
               DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "30")
               ffmpeg -f lavfi -i color=black:size=${TARGET_W}x${TARGET_H}:duration="$DURATION" \
@@ -852,7 +987,6 @@ jobs:
               continue
             fi
             
-            # Check if file is valid
             if ffprobe -v error "$f" 2>/dev/null; then
               echo "✅ Valid: $f"
               VERIFIED_FILES="$VERIFIED_FILES $f"
@@ -925,12 +1059,10 @@ jobs:
           if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
             echo "✅ Merge successful!"
             
-            # Verify duration
             MERGED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
             MERGED_DURATION_INT=${MERGED_DURATION%.*}
             echo "📊 Merged file duration: ${MERGED_DURATION_INT} seconds"
             
-            # Generate thumbnails
             echo "🖼️ Generating thumbnails..."
             ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
               -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
@@ -940,7 +1072,6 @@ jobs:
               -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
               -q:v 2 "square_thumb.jpg" 2>/dev/null
             
-            # Cleanup
             rm -f normalized_*.mp4 concat_list.txt
             
             echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
