@@ -168,8 +168,14 @@ jobs:
             
             # Download the episode - try both methods
             if [[ "$URL" == *".m3u8"* ]]; then
-              echo "📺 HLS stream - Using yt-dlp"
-              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts \
+              echo "📺 HLS stream - Using yt-dlp with Chrome impersonation"
+              # Use yt-dlp with Chrome impersonation for HLS streams
+              # --impersonate chrome: Uses Chrome's TLS fingerprint and headers
+              # --extractor-args "hls:prefer_native": Use native HLS downloader for better compatibility
+              yt-dlp -f "bestvideo+bestaudio/best" \
+                --hls-use-mpegts \
+                --impersonate chrome \
+                --extractor-args "hls:prefer_native" \
                 --no-progress --no-warnings \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>&1
             else
@@ -180,11 +186,13 @@ jobs:
               curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
             fi
             
-            # If download failed or file is too small, try yt-dlp as fallback
+            # If download failed or file is too small, try yt-dlp with Chrome impersonation as fallback
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
-              echo "⚠️ Initial download failed or file too small, trying yt-dlp..."
+              echo "⚠️ Initial download failed or file too small, trying yt-dlp with Chrome impersonation..."
               rm -f "$OUT_FILE"
               yt-dlp -f "bestvideo+bestaudio/best" \
+                --impersonate chrome \
+                --extractor-args "hls:prefer_native" \
                 --no-progress --no-warnings \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>&1
             fi
@@ -557,7 +565,7 @@ jobs:
           # Redownload episodes that need it
           if [ "$NEEDS_REDOWNLOAD" = true ]; then
             echo ""
-            echo "🔄 Redownloading episodes with yt-dlp to ensure proper video..."
+            echo "🔄 Redownloading episodes with yt-dlp with Chrome impersonation..."
             
             # Read URLs into array
             mapfile -t URL_ARRAY < urls.txt
@@ -570,14 +578,16 @@ jobs:
               if [ $URL_INDEX -ge 0 ] && [ $URL_INDEX -lt ${#URL_ARRAY[@]} ]; then
                 URL="${URL_ARRAY[$URL_INDEX]}"
                 echo ""
-                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp..."
+                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp with Chrome impersonation..."
                 echo "📎 URL: $URL"
                 
                 # Remove the bad file
                 rm -f "$FILE"
                 
-                # Redownload with yt-dlp specifically to ensure video+audio
+                # Redownload with yt-dlp specifically to ensure video+audio with Chrome impersonation
                 yt-dlp -f "bestvideo+bestaudio/best" \
+                  --impersonate chrome \
+                  --extractor-args "hls:prefer_native" \
                   --no-progress --no-warnings \
                   -o "$FILE" "$URL" < /dev/null 2>&1
                 
