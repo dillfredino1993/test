@@ -43,23 +43,51 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg & Tools
+      - name: Install FFmpeg & Tools with curl_cffi Support
         run: |
           echo "========================================="
-          echo "🔧 INSTALLING TOOLS"
+          echo "🔧 INSTALLING TOOLS WITH CURL_CFFI SUPPORT"
           echo "========================================="
           echo "📺 Series: ${{ env.series_title }}"
           echo "========================================="
           
           sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool
-          pip3 install --upgrade pip
-          pip3 install telethon qrcode yt-dlp requests
-          pip3 install aiohttp python-socks[asyncio]
+          sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool build-essential libssl-dev libffi-dev python3-dev
+          
+          # Upgrade pip
+          pip3 install --upgrade pip setuptools wheel
+          
+          # Install base requirements
+          pip3 install telethon qrcode requests aiohttp python-socks[asyncio]
+          
+          # Install curl_cffi for Cloudflare impersonation
+          echo "📥 Installing curl_cffi for Cloudflare bypass..."
+          pip3 install curl-cffi
+          
+          # Install yt-dlp with curl_cffi support
+          echo "📥 Installing yt-dlp with curl_cffi support..."
+          pip3 uninstall -y yt-dlp 2>/dev/null || true
+          pip3 install yt-dlp[curl_cffi]
+          
+          # Install additional dependencies
+          pip3 install brotli websockets pycryptodome certifi
+          
+          # Verify installation
+          echo "✅ yt-dlp version:"
+          yt-dlp --version
+          
+          echo ""
+          echo "🔍 Available impersonation targets:"
+          yt-dlp --list-impersonate-targets || echo "⚠️ Impersonation not available"
+          
+          echo ""
+          echo "✅ Testing curl_cffi installation:"
+          python3 -c "from curl_cffi import requests; print('curl_cffi installed successfully')"
+          
           python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')"
           
           echo "========================================="
-          echo "✅ INSTALLATION COMPLETE"
+          echo "✅ INSTALLATION COMPLETE WITH CURL_CFFI"
           echo "========================================="
 
       - name: Compute Dynamic Formatted Output Filename & Label
@@ -128,7 +156,7 @@ jobs:
           
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
-      - name: Download All Episodes First
+      - name: Download All Episodes First with Generic Impersonation
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -137,7 +165,7 @@ jobs:
           cd downloads
           
           echo "========================================="
-          echo "📥 DOWNLOADING ALL EPISODES"
+          echo "📥 DOWNLOADING ALL EPISODES WITH GENERIC IMPERSONATION"
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Total Episodes: $(cat urls.txt | wc -l)"
@@ -166,31 +194,69 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # Download the episode - try both methods
-            if [[ "$URL" == *".m3u8"* ]]; then
-              echo "📺 HLS stream - Using yt-dlp"
-              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts \
+            # Try yt-dlp with generic impersonation
+            echo "🌐 Using yt-dlp with generic impersonation..."
+            
+            # Try different impersonation targets - generic ones first
+            for IMPERSONATE_TARGET in "generic" "chrome" "edge" "firefox" "safari"; do
+              echo "🔄 Trying impersonation: $IMPERSONATE_TARGET"
+              
+              yt-dlp -f "bestvideo+bestaudio/best" \
+                --impersonate "$IMPERSONATE_TARGET" \
+                --extractor-args "hls:prefer_native" \
+                --no-check-certificate \
                 --no-progress --no-warnings \
-                --impersonate chrome \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>&1
-            else
-              echo "🎬 Direct file - Using aria2c"
+              
+              # Check if download succeeded
+              if [ -f "$OUT_FILE" ] && [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -gt 100000 ]; then
+                echo "✅ Successfully downloaded with impersonation: $IMPERSONATE_TARGET"
+                break
+              else
+                rm -f "$OUT_FILE"
+                echo "⚠️ Failed with $IMPERSONATE_TARGET, trying next target..."
+              fi
+            done
+            
+            # If impersonation failed, try yt-dlp without impersonation
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ Impersonation failed, trying yt-dlp without impersonation..."
+              rm -f "$OUT_FILE"
+              
+              yt-dlp -f "bestvideo+bestaudio/best" \
+                --extractor-args "hls:prefer_native" \
+                --no-check-certificate \
+                --no-progress --no-warnings \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
+            fi
+            
+            # If yt-dlp failed, try aria2c
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ yt-dlp failed, trying aria2c..."
+              rm -f "$OUT_FILE"
+              
               aria2c -x 16 -s 16 -k 1M --continue=true \
                 --console-log-level=error \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null || \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
+            fi
+            
+            # If aria2c failed, try curl
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ aria2c failed, trying curl..."
+              rm -f "$OUT_FILE"
+              
               curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
             fi
             
-            # If download failed or file is too small, try yt-dlp as fallback
+            # Final fallback: wget
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
-              echo "⚠️ Initial download failed or file too small, trying yt-dlp..."
+              echo "⚠️ curl failed, trying wget..."
               rm -f "$OUT_FILE"
-              yt-dlp -f "bestvideo+bestaudio/best" \
-                --no-progress --no-warnings \
-                --impersonate chrome \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
+              
+              wget -q -O "$OUT_FILE" "$URL" < /dev/null 2>&1
             fi
             
+            # Verify download
             if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
               FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
@@ -559,7 +625,7 @@ jobs:
           # Redownload episodes that need it
           if [ "$NEEDS_REDOWNLOAD" = true ]; then
             echo ""
-            echo "🔄 Redownloading episodes with yt-dlp to ensure proper video..."
+            echo "🔄 Redownloading episodes with generic impersonation..."
             
             # Read URLs into array
             mapfile -t URL_ARRAY < urls.txt
@@ -572,17 +638,49 @@ jobs:
               if [ $URL_INDEX -ge 0 ] && [ $URL_INDEX -lt ${#URL_ARRAY[@]} ]; then
                 URL="${URL_ARRAY[$URL_INDEX]}"
                 echo ""
-                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp..."
+                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with generic impersonation..."
                 echo "📎 URL: $URL"
                 
                 # Remove the bad file
                 rm -f "$FILE"
                 
-                # Redownload with yt-dlp specifically to ensure video+audio
-                yt-dlp -f "bestvideo+bestaudio/best" \
-                  --no-progress --no-warnings \
-                  --impersonate chrome \
-                  -o "$FILE" "$URL" < /dev/null 2>&1
+                # Try generic impersonation targets
+                DOWNLOADED=false
+                for IMPERSONATE_TARGET in "generic" "chrome" "edge" "firefox" "safari"; do
+                  echo "🔄 Trying impersonation: $IMPERSONATE_TARGET"
+                  
+                  yt-dlp -f "bestvideo+bestaudio/best" \
+                    --impersonate "$IMPERSONATE_TARGET" \
+                    --extractor-args "hls:prefer_native" \
+                    --no-check-certificate \
+                    --no-progress --no-warnings \
+                    -o "$FILE" "$URL" < /dev/null 2>&1
+                  
+                  if [ -f "$FILE" ] && [ -s "$FILE" ]; then
+                    echo "✅ Successfully downloaded with impersonation: $IMPERSONATE_TARGET"
+                    DOWNLOADED=true
+                    break
+                  else
+                    rm -f "$FILE"
+                  fi
+                done
+                
+                # If impersonation failed, try without
+                if [ "$DOWNLOADED" = false ]; then
+                  echo "⚠️ Impersonation failed, trying yt-dlp without impersonation..."
+                  yt-dlp -f "bestvideo+bestaudio/best" \
+                    --extractor-args "hls:prefer_native" \
+                    --no-check-certificate \
+                    --no-progress --no-warnings \
+                    -o "$FILE" "$URL" < /dev/null 2>&1
+                fi
+                
+                # If all methods failed, try wget
+                if [ ! -f "$FILE" ] || [ ! -s "$FILE" ]; then
+                  echo "⚠️ All download methods failed, trying wget..."
+                  rm -f "$FILE"
+                  wget -q -O "$FILE" "$URL" < /dev/null 2>&1
+                fi
                 
                 if [ -f "$FILE" ] && [ -s "$FILE" ]; then
                   # Verify the new file has video
@@ -2245,8 +2343,7 @@ jobs:
               BAR_LENGTH=40
               FILLED=$(echo "scale=0; ($MERGED_PERCENT * $BAR_LENGTH) / 100" | bc 2>/dev/null || echo "0")
               BAR=""
-              for ((i=0; i<$FILLED && i<$BAR_LENGTH; i++)); do BAR="${BAR}█"; done
-              for ((i=$FILLED; i<$BAR_LENGTH; i++)); do BAR="${BAR}░"; done
+              for ((i=0; i<$FILLED && i<$BAR_LENGTH; i++)); do BAR="${BAR}█"; done              for ((i=$FILLED; i<$BAR_LENGTH; i++)); do BAR="${BAR}░"; done
               echo "║    [${BAR}] ║"
               
               # ETA calculation
