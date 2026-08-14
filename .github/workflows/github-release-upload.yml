@@ -372,133 +372,70 @@ import json
 import time
 
 def get_video_info(file_path):
-    """Get video duration, width, height using ffprobe"""
     try:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-show_entries", "stream=width,height,codec_name",
-            "-of", "json",
-            file_path
-        ]
+        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-show_entries", "stream=width,height,codec_name", "-of", "json", file_path]
         result = subprocess.check_output(cmd, text=True)
         data = json.loads(result)
-        
         duration = float(data.get('format', {}).get('duration', 0))
-        
         width, height = 1280, 720
         for stream in data.get('streams', []):
             if stream.get('codec_type') == 'video':
                 width = int(stream.get('width', 1280))
                 height = int(stream.get('height', 720))
                 break
-        
         return duration, width, height
     except:
         return 0, 1280, 720
 
 def compress_with_veryfast(file_path, target_size_mb=80):
-    """
-    Compress video using FFmpeg with VERY FAST preset
-    This prioritizes speed over compression efficiency
-    """
     print(f"  ⚡ Compressing with VERY FAST preset...")
-    
     file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
     print(f"  📊 Original size: {file_size_mb:.1f}MB")
-    
     if file_size_mb <= target_size_mb:
         print(f"  ✅ File already under {target_size_mb}MB, skipping compression")
         return True
-    
-    # Get video info
     duration, width, height = get_video_info(file_path)
     print(f"  📊 Duration: {duration:.1f}s, Resolution: {width}x{height}")
-    
-    # Calculate target bitrate for target size
     if duration > 0:
         target_bitrate = (target_size_mb * 8 * 1024) / duration
         target_bitrate = min(max(target_bitrate, 500), 2000)
     else:
         target_bitrate = 1000
-    
     print(f"  📊 Target bitrate: {int(target_bitrate)}kbps")
-    
     base_name = os.path.splitext(file_path)[0]
     temp_file = f"{base_name}_fast.mp4"
-    
-    # Use VERY FAST preset for maximum speed
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", file_path,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-b:v", f"{int(target_bitrate)}k",
-        "-maxrate", f"{int(target_bitrate * 1.5)}k",
-        "-bufsize", f"{int(target_bitrate * 2)}k",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-ar", "44100",
-        "-movflags", "+faststart",
-        "-threads", str(os.cpu_count() or 2),
-        temp_file
-    ]
-    
+    cmd = ["ffmpeg", "-y", "-i", file_path, "-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{int(target_bitrate)}k", "-maxrate", f"{int(target_bitrate * 1.5)}k", "-bufsize", f"{int(target_bitrate * 2)}k", "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-movflags", "+faststart", "-threads", str(os.cpu_count() or 2), temp_file]
     try:
         print(f"  🔄 Encoding...")
         start_time = time.time()
-        
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        
         elapsed = time.time() - start_time
         print(f"  ⏱️  Encoding time: {elapsed:.1f}s")
-        
         if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
             new_size_mb = os.path.getsize(temp_file) / (1024 * 1024)
             print(f"  ✅ Compressed: {new_size_mb:.1f}MB ({file_size_mb:.1f}MB -> {new_size_mb:.1f}MB)")
-            
             if new_size_mb <= target_size_mb * 1.1:
                 os.replace(temp_file, file_path)
                 return True
             else:
                 print(f"  ⚠️ Still too large: {new_size_mb:.1f}MB")
-                
-                # Try even more aggressive compression
                 print(f"  🔄 Trying ULTRA FAST with higher CRF...")
                 temp_file2 = f"{base_name}_ultrafast.mp4"
-                
-                cmd2 = [
-                    "ffmpeg", "-y",
-                    "-i", file_path,
-                    "-c:v", "libx264",
-                    "-preset", "ultrafast",
-                    "-crf", "28",
-                    "-c:a", "aac",
-                    "-b:a", "96k",
-                    "-ar", "44100",
-                    "-movflags", "+faststart",
-                    "-threads", str(os.cpu_count() or 2),
-                    temp_file2
-                ]
-                
+                cmd2 = ["ffmpeg", "-y", "-i", file_path, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-movflags", "+faststart", "-threads", str(os.cpu_count() or 2), temp_file2]
                 result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=300)
-                
                 if result2.returncode == 0 and os.path.exists(temp_file2) and os.path.getsize(temp_file2) > 0:
                     new_size_mb2 = os.path.getsize(temp_file2) / (1024 * 1024)
                     print(f"  ✅ UltraFast compressed: {new_size_mb2:.1f}MB")
-                    
                     if new_size_mb2 < new_size_mb:
                         os.replace(temp_file2, file_path)
                         return True
                     else:
                         os.remove(temp_file2)
-                
                 os.remove(temp_file)
                 return False
         else:
             print(f"  ❌ Compression failed: {result.stderr[:200]}")
             return False
-            
     except subprocess.TimeoutExpired:
         print(f"  ❌ Compression timeout")
         return False
@@ -506,30 +443,24 @@ def compress_with_veryfast(file_path, target_size_mb=80):
         print(f"  ❌ Compression error: {e}")
         return False
     finally:
-        # Cleanup temp files
         for f in [temp_file, f"{base_name}_ultrafast.mp4"]:
             if os.path.exists(f):
                 try: os.remove(f)
                 except: pass
-    
     return False
 
 def process_episode(file_path, target_size_mb=80):
-    """Process episode with fast compression"""
     if not os.path.exists(file_path):
         print(f"❌ File not found: {file_path}")
         return False
-    
     return compress_with_veryfast(file_path, target_size_mb)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python fast_compress.py <file_path> [target_size_mb]")
         sys.exit(1)
-    
     file_path = sys.argv[1]
     target_size = int(sys.argv[2]) if len(sys.argv) > 2 else 80
-    
     success = process_episode(file_path, target_size)
     sys.exit(0 if success else 1)
 EOFCOMPRESS
