@@ -71,6 +71,12 @@ jobs:
           python3 -c "import curl_cffi; print(f'✅ curl_cffi version: {curl_cffi.__version__}')"
           yt-dlp --version
           
+          # Test Cloudflare bypass
+          echo ""
+          echo "🛡️ TESTING CLOUDFLARE BYPASS:"
+          echo "Available impersonation targets:"
+          yt-dlp --list-impersonate-targets | head -20
+          
           echo ""
           echo "========================================="
           echo "✅ INSTALLATION COMPLETE"
@@ -142,7 +148,7 @@ jobs:
           
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
-      - name: Download All Episodes in Parallel (FAST - Multiple at Once)
+      - name: Download All Episodes in Parallel (SMART 3-TIER with CLOUDFLARE DETECTION)
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -151,89 +157,250 @@ jobs:
           cd downloads
           
           echo "========================================="
-          echo "📥 PARALLEL DOWNLOAD - MULTIPLE EPISODES"
+          echo "📥 PARALLEL DOWNLOAD - SMART 3-TIER"
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Total Episodes: $(cat urls.txt | wc -l)"
-          echo "⚡ Downloading 4 episodes simultaneously"
-          echo "🔄 Using yt-dlp with Cloudflare bypass"
+          echo ""
+          echo "📋 Download Strategy:"
+          echo "   📺 HLS/m3u8 → Skip aria2c → yt-dlp → Cloudflare fallback"
+          echo "   📁 Direct MP4 → aria2c (FAST) → yt-dlp → Cloudflare fallback"
+          echo ""
+          echo "🛡️ Cloudflare Detection:"
+          echo "   - Detects Cloudflare challenges in yt-dlp output"
+          echo "   - Auto-switches to impersonation (chrome/edge/safari)"
+          echo "   - Multiple retry attempts with different impersonation targets"
+          echo ""
+          echo "📥 Downloading 4 episodes simultaneously"
           echo "========================================="
           
           TOTAL_EPISODES=$(cat urls.txt | wc -l)
           
-          # Create download script for yt-dlp
-          cat > download_episode.sh << 'EOF'
-          #!/bin/bash
-          URL="$1"
-          OUTPUT="$2"
-          EP_NUM="$3"
-          
-          echo "📥 [Episode $EP_NUM] Starting download..."
-          
-          # Try yt-dlp with multiple impersonation targets
-          for TARGET in chrome edge safari; do
-            echo "📥 [Episode $EP_NUM] Trying $TARGET impersonation..."
+          # Create smart download function with enhanced Cloudflare detection
+          download_episode() {
+            local URL="$1"
+            local OUTPUT="$2"
+            local EP_NUM="$3"
             
-            yt-dlp \
+            echo "📥 [Episode $EP_NUM] Starting download..."
+            
+            # =============================================
+            # DETECT STREAM TYPE
+            # =============================================
+            local IS_HLS=false
+            if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *"m3u8"* ]] || [[ "$URL" == *"playlist"* ]] || [[ "$URL" == *"index.m3u8"* ]]; then
+              IS_HLS=true
+              echo "📺 [Episode $EP_NUM] HLS/m3u8 stream detected - skipping aria2c"
+            else
+              echo "📁 [Episode $EP_NUM] Direct file detected"
+            fi
+            
+            # =============================================
+            # FUNCTION: Check for Cloudflare in output
+            # =============================================
+            check_cloudflare() {
+              local OUTPUT="$1"
+              if echo "$OUTPUT" | grep -qiE "cloudflare|cf-challenge|403|anti-bot|challenge|cf-ray|captcha|Access denied|blocked"; then
+                return 0  # Cloudflare detected
+              fi
+              return 1  # No Cloudflare
+            }
+            
+            # =============================================
+            # TIER 1: aria2c (ONLY for direct downloads, NOT HLS)
+            # =============================================
+            if [ "$IS_HLS" = false ]; then
+              echo "⚡ [Episode $EP_NUM] TIER 1: aria2c (16 parallel connections)"
+              
+              if aria2c \
+                -x 16 -s 16 -k 1M \
+                --max-connection-per-server=16 \
+                --split=16 \
+                --min-split-size=1M \
+                --enable-http-pipelining=true \
+                --http-pipelining=true \
+                --max-tries=3 \
+                --retry-wait=1 \
+                --continue=true \
+                --allow-overwrite=true \
+                --console-log-level=error \
+                --summary-interval=0 \
+                --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                --header="Accept: video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5" \
+                --header="Accept-Language: en-US,en;q=0.9" \
+                --header="Accept-Encoding: gzip, deflate, br" \
+                --header="Connection: keep-alive" \
+                -o "$OUTPUT" \
+                "$URL" 2>/dev/null; then
+                
+                if [ -f "$OUTPUT" ] && [ -s "$OUTPUT" ]; then
+                  SIZE=$(stat -c%s "$OUTPUT" 2>/dev/null || echo "0")
+                  if [ "$SIZE" -gt 100000 ]; then
+                    echo "✅ [Episode $EP_NUM] Downloaded with aria2c ($((SIZE/1024/1024))MB) - FAST!"
+                    return 0
+                  fi
+                  echo "⚠️ [Episode $EP_NUM] aria2c download too small, trying TIER 2..."
+                  rm -f "$OUTPUT"
+                fi
+              else
+                echo "⚠️ [Episode $EP_NUM] aria2c failed, trying TIER 2..."
+              fi
+            fi
+            
+            # =============================================
+            # TIER 2: yt-dlp (standard - NO impersonation)
+            # =============================================
+            echo "🔄 [Episode $EP_NUM] TIER 2: yt-dlp (standard)"
+            
+            # Try standard yt-dlp first (no impersonation)
+            local YT_OUTPUT=""
+            local YT_EXIT_CODE=0
+            
+            # Run yt-dlp and capture output
+            YT_OUTPUT=$(yt-dlp \
               --no-progress \
               --no-warnings \
               --no-check-certificates \
-              --impersonate "$TARGET" \
-              --extractor-args "generic:impersonate=$TARGET" \
+              --no-part \
               -f "bestvideo+bestaudio/best" \
               --hls-use-mpegts \
               -o "$OUTPUT" \
-              "$URL" 2>/dev/null
+              "$URL" 2>&1) || YT_EXIT_CODE=$?
+            
+            # Check for Cloudflare in output
+            if check_cloudflare "$YT_OUTPUT"; then
+              echo "🛡️ [Episode $EP_NUM] CLOUDFLARE DETECTED in standard yt-dlp!"
+              echo "   ${YT_OUTPUT##*$'\n'}"  # Show last line of error
+              rm -f "$OUTPUT"
+            fi
             
             # Check if download was successful
+            if [ $YT_EXIT_CODE -eq 0 ] && [ -f "$OUTPUT" ] && [ -s "$OUTPUT" ]; then
+              SIZE=$(stat -c%s "$OUTPUT" 2>/dev/null || echo "0")
+              if [ "$SIZE" -gt 100000 ]; then
+                echo "✅ [Episode $EP_NUM] Downloaded with yt-dlp (standard) ($((SIZE/1024/1024))MB)"
+                return 0
+              fi
+              echo "⚠️ [Episode $EP_NUM] yt-dlp download too small, trying TIER 3..."
+              rm -f "$OUTPUT"
+            else
+              if ! check_cloudflare "$YT_OUTPUT"; then
+                echo "⚠️ [Episode $EP_NUM] yt-dlp failed, trying TIER 3..."
+              fi
+            fi
+            
+            # =============================================
+            # TIER 3: yt-dlp with Cloudflare bypass
+            # =============================================
+            echo "🛡️ [Episode $EP_NUM] TIER 3: yt-dlp with Cloudflare bypass"
+            
+            # Try multiple impersonation targets for Cloudflare
+            local CLOUDFLARE_SUCCESS=false
+            local IMPERSONATION_TARGETS=("chrome" "edge" "safari" "chrome-110" "chrome-120")
+            
+            for TARGET in "${IMPERSONATION_TARGETS[@]}"; do
+              echo "🛡️ [Episode $EP_NUM] Trying $TARGET impersonation..."
+              
+              local CF_OUTPUT=""
+              local CF_EXIT_CODE=0
+              
+              # Try with impersonation
+              CF_OUTPUT=$(yt-dlp \
+                --no-progress \
+                --no-warnings \
+                --no-check-certificates \
+                --no-part \
+                --impersonate "$TARGET" \
+                --extractor-args "generic:impersonate=$TARGET" \
+                -f "bestvideo+bestaudio/best" \
+                --hls-use-mpegts \
+                -o "$OUTPUT" \
+                "$URL" 2>&1) || CF_EXIT_CODE=$?
+              
+              # Check if download was successful
+              if [ $CF_EXIT_CODE -eq 0 ] && [ -f "$OUTPUT" ] && [ -s "$OUTPUT" ]; then
+                SIZE=$(stat -c%s "$OUTPUT" 2>/dev/null || echo "0")
+                if [ "$SIZE" -gt 100000 ]; then
+                  echo "✅ [Episode $EP_NUM] Downloaded with yt-dlp $TARGET (Cloudflare bypass) ($((SIZE/1024/1024))MB)"
+                  CLOUDFLARE_SUCCESS=true
+                  break
+                fi
+                rm -f "$OUTPUT"
+              fi
+              
+              # Check if still getting Cloudflare
+              if check_cloudflare "$CF_OUTPUT"; then
+                echo "⚠️ [Episode $EP_NUM] Still getting Cloudflare with $TARGET, trying next..."
+              fi
+              
+              # Small delay between attempts
+              sleep 1
+            done
+            
+            if [ "$CLOUDFLARE_SUCCESS" = true ]; then
+              return 0
+            fi
+            
+            # =============================================
+            # ULTIMATE FALLBACK: yt-dlp with all options
+            # =============================================
+            echo "🔄 [Episode $EP_NUM] ULTIMATE FALLBACK: yt-dlp with all options"
+            
+            if yt-dlp \
+              --no-progress \
+              --no-warnings \
+              --no-check-certificates \
+              --no-part \
+              --impersonate chrome \
+              --extractor-args "generic:impersonate=chrome" \
+              --add-header "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --add-header "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
+              --add-header "Accept-Language: en-US,en;q=0.9" \
+              --add-header "Accept-Encoding: gzip, deflate, br" \
+              --add-header "Connection: keep-alive" \
+              -f "bestvideo+bestaudio/best" \
+              --hls-use-mpegts \
+              -o "$OUTPUT" \
+              "$URL" 2>/dev/null; then
+              
+              if [ -f "$OUTPUT" ] && [ -s "$OUTPUT" ]; then
+                SIZE=$(stat -c%s "$OUTPUT" 2>/dev/null || echo "0")
+                if [ "$SIZE" -gt 100000 ]; then
+                  echo "✅ [Episode $EP_NUM] Downloaded with yt-dlp (ultimate fallback) ($((SIZE/1024/1024))MB)"
+                  return 0
+                fi
+                rm -f "$OUTPUT"
+              fi
+            fi
+            
+            # =============================================
+            # FINAL FALLBACK: curl with browser headers
+            # =============================================
+            echo "🔄 [Episode $EP_NUM] FINAL FALLBACK: curl"
+            curl -L -C - -o "$OUTPUT" \
+              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
+              -H "Accept-Language: en-US,en;q=0.9" \
+              -H "Accept-Encoding: gzip, deflate, br" \
+              -H "Connection: keep-alive" \
+              --connect-timeout 30 \
+              --max-time 300 \
+              "$URL" 2>/dev/null
+            
             if [ -f "$OUTPUT" ] && [ -s "$OUTPUT" ]; then
               SIZE=$(stat -c%s "$OUTPUT" 2>/dev/null || echo "0")
               if [ "$SIZE" -gt 100000 ]; then
-                echo "✅ [Episode $EP_NUM] Downloaded with $TARGET impersonation ($((SIZE/1024/1024))MB)"
-                exit 0
+                echo "✅ [Episode $EP_NUM] Downloaded with curl ($((SIZE/1024/1024))MB)"
+                return 0
               fi
               rm -f "$OUTPUT"
             fi
-          done
+            
+            echo "❌ [Episode $EP_NUM] All download methods failed"
+            return 1
+          }
           
-          # Fallback: Try aria2c
-          echo "📥 [Episode $EP_NUM] Trying aria2c fallback..."
-          aria2c -x 16 -s 16 -k 1M \
-            --continue=true \
-            --console-log-level=error \
-            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            -o "$OUTPUT" "$URL" 2>/dev/null
-          
-          if [ -f "$OUTPUT" ] && [ -s "$OUTPUT" ]; then
-            SIZE=$(stat -c%s "$OUTPUT" 2>/dev/null || echo "0")
-            if [ "$SIZE" -gt 100000 ]; then
-              echo "✅ [Episode $EP_NUM] Downloaded with aria2c ($((SIZE/1024/1024))MB)"
-              exit 0
-            fi
-            rm -f "$OUTPUT"
-          fi
-          
-          # Ultimate fallback: curl
-          echo "📥 [Episode $EP_NUM] Trying curl fallback..."
-          curl -L -C - -o "$OUTPUT" \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            -H "Accept: video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5" \
-            "$URL" 2>/dev/null
-          
-          if [ -f "$OUTPUT" ] && [ -s "$OUTPUT" ]; then
-            SIZE=$(stat -c%s "$OUTPUT" 2>/dev/null || echo "0")
-            if [ "$SIZE" -gt 100000 ]; then
-              echo "✅ [Episode $EP_NUM] Downloaded with curl ($((SIZE/1024/1024))MB)"
-              exit 0
-            fi
-            rm -f "$OUTPUT"
-          fi
-          
-          echo "❌ [Episode $EP_NUM] All download methods failed"
-          exit 1
-          EOF
-          
-          chmod +x download_episode.sh
+          export -f download_episode
           
           # Create command file for parallel execution
           COMMANDS_FILE="parallel_commands.txt"
@@ -247,28 +414,19 @@ jobs:
             EP_NUM=$(printf "%02d" $EP_INDEX)
             OUT_FILE="EP${EP_NUM}.mp4"
             
-            echo "./download_episode.sh \"$URL\" \"$OUT_FILE\" \"$EP_INDEX\"" >> "$COMMANDS_FILE"
+            echo "download_episode \"$URL\" \"$OUT_FILE\" \"$EP_INDEX\"" >> "$COMMANDS_FILE"
             EP_INDEX=$((EP_INDEX + 1))
           done < urls.txt
           
           # Download 4 episodes in parallel
+          echo ""
           echo "🚀 Starting parallel downloads (4 at a time)..."
           echo ""
           
-          # Use xargs for parallel execution
-          cat "$COMMANDS_FILE" | xargs -P 4 -I {} bash -c "{}" &
-          PARALLEL_PID=$!
+          # Use GNU parallel with 4 jobs and progress bar
+          cat "$COMMANDS_FILE" | parallel -j 4 --bar --joblog parallel.log
           
-          # Monitor progress
-          while kill -0 $PARALLEL_PID 2>/dev/null; do
-            CURRENT_DOWNLOADED=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
-            echo "📊 Progress: $CURRENT_DOWNLOADED/$TOTAL_EPISODES episodes downloaded"
-            sleep 5
-          done
-          
-          # Wait for all downloads to complete
-          wait $PARALLEL_PID
-          
+          # Check results
           echo ""
           echo "========================================="
           echo "📊 DOWNLOAD SUMMARY"
@@ -278,6 +436,16 @@ jobs:
           
           FINAL_COUNT=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           echo "✅ Downloaded: $FINAL_COUNT/$TOTAL_EPISODES episodes"
+          
+          # Show download statistics
+          echo ""
+          echo "📊 Download Statistics:"
+          if [ -f "parallel.log" ]; then
+            SUCCESS_COUNT=$(awk 'NR>1 && $7==0' parallel.log | wc -l)
+            FAIL_COUNT=$(awk 'NR>1 && $7!=0' parallel.log | wc -l)
+            echo "   ✅ Successful: $SUCCESS_COUNT"
+            echo "   ❌ Failed: $FAIL_COUNT"
+          fi
           
           # Check for missing episodes
           FAILED_DOWNLOADS=""
@@ -290,11 +458,10 @@ jobs:
           
           if [ -n "$FAILED_DOWNLOADS" ]; then
             echo "❌ FAILED EPISODES: $FAILED_DOWNLOADS"
-            echo "❌ Not all episodes downloaded successfully!"
             
-            # Try to redownload failed episodes individually
+            # Try to redownload failed episodes sequentially
             echo ""
-            echo "🔄 Attempting to redownload failed episodes..."
+            echo "🔄 Attempting to redownload failed episodes sequentially..."
             
             EP_INDEX=1
             while IFS= read -r URL || [ -n "$URL" ]; do
@@ -305,8 +472,8 @@ jobs:
               OUT_FILE="EP${EP_NUM}.mp4"
               
               if [ ! -f "$OUT_FILE" ] || [ ! -s "$OUT_FILE" ]; then
-                echo "🔄 Redownloading Episode $EP_INDEX..."
-                ./download_episode.sh "$URL" "$OUT_FILE" "$EP_INDEX"
+                echo "🔄 Redownloading Episode $EP_INDEX (sequential)..."
+                download_episode "$URL" "$OUT_FILE" "$EP_INDEX"
               fi
               
               EP_INDEX=$((EP_INDEX + 1))
@@ -321,6 +488,18 @@ jobs:
           fi
           
           echo "✅ All $TOTAL_EPISODES episodes downloaded successfully!"
+          echo "========================================="
+          
+          # Show file sizes
+          echo ""
+          echo "📊 Final Episode Sizes:"
+          for f in EP*.mp4; do
+            if [ -f "$f" ]; then
+              SIZE=$(stat -c%s "$f" 2>/dev/null || echo "0")
+              SIZE_MB=$((SIZE / 1024 / 1024))
+              printf "   %-10s: %3d MB\n" "$f" "$SIZE_MB"
+            fi
+          done
           echo "========================================="
 
       - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
@@ -619,8 +798,138 @@ jobs:
           echo "📁 File: $MERGED_PATH"
           echo "========================================="
           
-          # Rest of upload code (same as before)...
-          # [Upload code here - kept concise for this example]
+          # Create merged upload script
+          cat > upload_merged.py << 'EOFUPLOAD'
+          import os
+          import sys
+          import subprocess
+          import asyncio
+          import datetime
+          import traceback
+          
+          try:
+              from telethon import TelegramClient
+              from telethon.sessions import StringSession
+              from telethon.errors import FloodWaitError
+              from telethon.tl.types import DocumentAttributeVideo
+              import telethon
+              print(f"✅ Telethon version: {telethon.__version__}")
+          except ImportError as e:
+              print(f"❌ Import error: {e}")
+              sys.exit(1)
+          
+          api_id = os.environ.get("TG_API_ID")
+          api_hash = os.environ.get("TG_API_HASH")
+          session_string = os.environ.get("TG_SESSION_STRING")
+          chat_id_raw = os.environ.get("TG_MERGED_CHAT_ID")
+          video_path = os.environ.get("MERGED_PATH")
+          title = os.environ.get("TITLE")
+          series_title = os.environ.get("SERIES_TITLE", "Series")
+          label = os.environ.get("LABEL", "NONE")
+          
+          if not all([api_id, api_hash, session_string]):
+              print("❌ Missing Telegram credentials")
+              sys.exit(0)
+          
+          def get_video_metadata(file_path):
+              try:
+                  cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  duration = float(result) if result else 0
+                  
+                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  parts = result.split('|')
+                  w = int(parts[0]) if len(parts) >= 2 and parts[0].isdigit() else 1280
+                  h = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 720
+                  
+                  return int(duration), w, h
+              except:
+                  return 0, 1280, 720
+          
+          def progress_callback(current, total):
+              percent = (current / total) * 100
+              mb_uploaded = current / (1024 * 1024)
+              mb_total = total / (1024 * 1024)
+              if int(percent) % 5 == 0 or int(percent) == 100:
+                  print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
+          
+          async def main():
+              try:
+                  client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
+                  await client.connect()
+                  
+                  if not await client.is_user_authorized():
+                      print("❌ Session invalid")
+                      return
+                  
+                  me = await client.get_me()
+                  print(f"✅ Logged in: {me.first_name}")
+                  
+                  chat_id = int(chat_id_raw) if chat_id_raw and chat_id_raw.lstrip('-').isdigit() else chat_id_raw
+                  entity = await client.get_entity(chat_id)
+                  
+                  print(f"📤 Uploading to: {entity.title if hasattr(entity, 'title') else entity.id}")
+                  
+                  if not os.path.exists(video_path):
+                      print(f"❌ File not found: {video_path}")
+                      return
+                  
+                  duration, w, h = get_video_metadata(video_path)
+                  print(f"📊 Duration: {duration}s, Resolution: {w}x{h}")
+                  
+                  # Generate thumbnail
+                  thumb_path = f"{video_path}_thumb.jpg"
+                  try:
+                      subprocess.run([
+                          "ffmpeg", "-y", "-ss", "00:00:01", "-i", video_path,
+                          "-vf", "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black",
+                          "-vframes", "1", "-q:v", "2", thumb_path
+                      ], capture_output=True, check=True)
+                  except:
+                      thumb_path = None
+                  
+                  video_attr = DocumentAttributeVideo(duration=duration, w=w, h=h, supports_streaming=True)
+                  
+                  now = datetime.datetime.now()
+                  month_year = now.strftime("%B%Y").upper()
+                  caption = f"{title}\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{label}"
+                  
+                  print("⏫ Uploading file...")
+                  
+                  uploaded_file = await client.upload_file(
+                      video_path,
+                      part_size_kb=512,
+                      progress_callback=progress_callback
+                  )
+                  
+                  kwargs = {
+                      "entity": entity,
+                      "file": uploaded_file,
+                      "caption": caption,
+                      "attributes": [video_attr],
+                      "supports_streaming": True
+                  }
+                  
+                  if thumb_path and os.path.exists(thumb_path):
+                      kwargs["thumb"] = thumb_path
+                  
+                  await client.send_file(**kwargs)
+                  print("✅ Upload complete!")
+                  
+                  await client.disconnect()
+                  
+              except Exception as e:
+                  print(f"❌ Error: {e}")
+                  traceback.print_exc()
+          
+          if __name__ == '__main__':
+              asyncio.run(main())
+          EOFUPLOAD
+          
+          echo "🚀 Starting merged upload..."
+          python3 -u upload_merged.py
+          echo "✅ Merged upload completed!"
 
       - name: Upload Single Episodes (Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
@@ -644,15 +953,115 @@ jobs:
           echo "📊 Episodes: $(ls -1 EP*.mp4 2>/dev/null | wc -l)"
           echo "========================================="
           
-          # Upload episodes one by one
-          EP_INDEX=1
-          for f in EP*.mp4; do
-            if [ -f "$f" ]; then
-              echo "📤 Uploading Episode $EP_INDEX..."
-              # [Upload code here - kept concise]
-              EP_INDEX=$((EP_INDEX + 1))
-            fi
-          done
+          # Create single upload script
+          cat > upload_single.py << 'EOFUPLOAD'
+          import os
+          import sys
+          import glob
+          import subprocess
+          import asyncio
+          import datetime
+          import traceback
+          
+          try:
+              from telethon import TelegramClient
+              from telethon.sessions import StringSession
+              from telethon.errors import FloodWaitError
+              from telethon.tl.types import DocumentAttributeVideo
+              import telethon
+          except ImportError as e:
+              print(f"❌ Import error: {e}")
+              sys.exit(1)
+          
+          api_id = os.environ.get("TG_API_ID")
+          api_hash = os.environ.get("TG_API_HASH")
+          session_string = os.environ.get("TG_SESSION_STRING")
+          chat_id_raw = os.environ.get("TG_SINGLE_EPISODES_CHAT_ID")
+          series_title = os.environ.get("SERIES_TITLE", "Series")
+          
+          if not all([api_id, api_hash, session_string]):
+              print("❌ Missing Telegram credentials")
+              sys.exit(0)
+          
+          def get_video_metadata(file_path):
+              try:
+                  cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  duration = float(result) if result else 0
+                  
+                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  parts = result.split('|')
+                  w = int(parts[0]) if len(parts) >= 2 and parts[0].isdigit() else 1280
+                  h = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 720
+                  
+                  return int(duration), w, h
+              except:
+                  return 0, 1280, 720
+          
+          def progress_callback(current, total):
+              percent = (current / total) * 100
+              if int(percent) % 10 == 0 or int(percent) == 100:
+                  print(f"   Upload: {percent:.0f}%")
+          
+          async def main():
+              try:
+                  client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
+                  await client.connect()
+                  
+                  if not await client.is_user_authorized():
+                      print("❌ Session invalid")
+                      return
+                  
+                  me = await client.get_me()
+                  print(f"✅ Logged in: {me.first_name}")
+                  
+                  chat_id = int(chat_id_raw) if chat_id_raw and chat_id_raw.lstrip('-').isdigit() else chat_id_raw
+                  entity = await client.get_entity(chat_id)
+                  
+                  print(f"📤 Uploading episodes to: {entity.title if hasattr(entity, 'title') else entity.id}")
+                  
+                  ep_files = sorted(glob.glob("EP*.mp4"))
+                  
+                  for ep_file in ep_files:
+                      print(f"\n📤 Uploading {ep_file}...")
+                      
+                      duration, w, h = get_video_metadata(ep_file)
+                      video_attr = DocumentAttributeVideo(duration=duration, w=w, h=h, supports_streaming=True)
+                      
+                      uploaded_file = await client.upload_file(
+                          ep_file,
+                          part_size_kb=512,
+                          progress_callback=progress_callback
+                      )
+                      
+                      await client.send_file(
+                          entity=entity,
+                          file=uploaded_file,
+                          caption=f"📺 {ep_file}",
+                          attributes=[video_attr],
+                          supports_streaming=True
+                      )
+                      
+                      print(f"✅ {ep_file} uploaded!")
+                      
+                      # Small delay between uploads
+                      await asyncio.sleep(1)
+                  
+                  await client.disconnect()
+                  print("\n✅ All episodes uploaded!")
+                  
+              except Exception as e:
+                  print(f"❌ Error: {e}")
+                  traceback.print_exc()
+          
+          if __name__ == '__main__':
+              asyncio.run(main())
+          EOFUPLOAD
+          
+          echo "🚀 Uploading episodes..."
+          python3 -u upload_single.py
+          echo "✅ Episode uploads completed!"
 
       - name: Cleanup - Delete Workflow Run if Successful
         if: success()
