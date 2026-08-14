@@ -1,0 +1,1142 @@
+name: GitHub Telegram Series Upload Pipeline
+
+on:
+  repository_dispatch:
+    types: [github_series_upload]
+
+# ONLY ONE WORKFLOW RUN AT A TIME
+concurrency:
+  group: series-upload-processor
+  cancel-in-progress: false
+  queue: max
+
+# Add permissions for deleting workflow runs
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📋 Series Information & Setup
+        run: |
+          echo "========================================="
+          echo "📋 SERIES INFORMATION"
+          echo "========================================="
+          
+          # Extract series information from payload
+          SERIES_COUNT="${{ github.event.client_payload.series_count || 'Unknown' }}"
+          
+          echo "📊 Series Count: $SERIES_COUNT"
+          echo "⏰ Started at: $(date)"
+          echo "========================================="
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg & Tools
+        run: |
+          echo "========================================="
+          echo "🔧 INSTALLING TOOLS"
+          echo "========================================="
+          
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool
+          pip3 install --upgrade pip
+          pip3 install telethon qrcode yt-dlp requests
+          pip3 install aiohttp python-socks[asyncio]
+          python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')"
+          
+          echo "========================================="
+          echo "✅ INSTALLATION COMPLETE"
+          echo "========================================="
+
+      - name: Parse URLs and Names from Payload
+        run: |
+          echo "========================================="
+          echo "📋 PARSING SERIES DATA"
+          echo "========================================="
+          
+          mkdir -p downloads && cd downloads
+          
+          # Extract series data from payload
+          echo '${{ toJson(github.event.client_payload) }}' > payload.json
+          
+          # Extract series names and URLs from the series array
+          jq -r '.series[]?.name // empty' payload.json > names.txt
+          jq -r '.series[]?.url // empty' payload.json > urls.txt
+          
+          # If no series array, try video_urls or video_url
+          if [ ! -s names.txt ] || [ ! -s urls.txt ]; then
+            echo "⚠️ No series array found, trying video_urls..."
+            jq -r '.video_urls[]? // empty' payload.json > urls.txt
+            # If no names provided, use URL as name
+            if [ ! -s names.txt ]; then
+              echo "⚠️ No names provided, using URLs as names"
+              cp urls.txt names.txt
+            fi
+          fi
+          
+          # If still no URLs, try video_url
+          if [ ! -s urls.txt ]; then
+            jq -r '.video_url // empty' payload.json > urls.txt
+            if [ -s urls.txt ]; then
+              echo "📹 Single video URL found"
+            fi
+          fi
+          
+          # Remove empty lines
+          sed -i '/^$/d' urls.txt 2>/dev/null || true
+          sed -i '/^$/d' names.txt 2>/dev/null || true
+          
+          echo "========================================="
+          echo "📋 Series to process:"
+          echo "========================================="
+          
+          # Display the series data
+          paste -d '|' names.txt urls.txt 2>/dev/null | while IFS='|' read -r name url; do
+            if [ -n "$name" ] && [ -n "$url" ]; then
+              echo "📺 Series: $name"
+              echo "📎 URL: $url"
+              echo "-----------------------------------------"
+            fi
+          done
+          
+          TOTAL_SERIES=$(cat urls.txt | wc -l)
+          echo "📊 Total Series: $TOTAL_SERIES"
+          echo "total_series=$TOTAL_SERIES" >> $GITHUB_ENV
+          
+          if [ ! -s urls.txt ]; then
+            echo "❌ No valid URLs found!"
+            exit 1
+          fi
+          
+          echo "✅ Found $TOTAL_SERIES series to download"
+          echo "========================================="
+
+      - name: Download All Series
+        run: |
+          cd downloads
+          
+          echo "========================================="
+          echo "📥 DOWNLOADING ALL SERIES"
+          echo "========================================="
+          echo "📊 Total Series: $(cat urls.txt | wc -l)"
+          echo "========================================="
+          
+          TOTAL_SERIES=$(cat urls.txt | wc -l)
+          SERIES_INDEX=1
+          FAILED_DOWNLOADS=""
+          
+          # Read URLs and names into arrays
+          mapfile -t URL_ARRAY < urls.txt
+          mapfile -t NAME_ARRAY < names.txt
+          
+          while IFS= read -u 3 -r URL || [ -n "$URL" ]; do
+            URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [ -z "$URL" ]; then continue; fi
+            
+            # Get series name
+            if [ ${#NAME_ARRAY[@]} -ge $SERIES_INDEX ]; then
+              SERIES_NAME="${NAME_ARRAY[$((SERIES_INDEX-1))]}"
+              SERIES_NAME=$(echo "$SERIES_NAME" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            else
+              SERIES_NAME="Series_${SERIES_INDEX}"
+            fi
+            
+            # Clean filename
+            CLEAN_NAME=$(echo "$SERIES_NAME" | sed -e 's/[\/:*?"<>|]/_/g' -e 's/^ *//' -e 's/ *$//' -e 's/ /_/g')
+            OUT_FILE="${CLEAN_NAME}.mp4"
+            
+            echo "========================================="
+            echo "📥 Downloading Series $SERIES_INDEX/$TOTAL_SERIES"
+            echo "📺 Name: $SERIES_NAME"
+            echo "📎 URL: $URL"
+            echo "💾 Output: $OUT_FILE"
+            echo "========================================="
+            
+            # Download the series file
+            if [[ "$URL" == *".m3u8"* ]]; then
+              echo "📺 HLS stream - Using yt-dlp"
+              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts \
+                --no-progress --no-warnings \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
+            else
+              echo "🎬 Direct file - Using aria2c"
+              aria2c -x 16 -s 16 -k 1M --continue=true \
+                --console-log-level=error \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null || \
+              curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
+            fi
+            
+            # If download failed or file is too small, try yt-dlp as fallback
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ Initial download failed or file too small, trying yt-dlp..."
+              rm -f "$OUT_FILE"
+              yt-dlp -f "bestvideo+bestaudio/best" \
+                --no-progress --no-warnings \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
+            fi
+            
+            if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+              FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+              FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+              FILE_SIZE_GB=$(echo "scale=2; $FILE_SIZE_MB / 1024" | bc)
+              echo "✅ Downloaded: $OUT_FILE (${FILE_SIZE_MB}MB / ${FILE_SIZE_GB}GB)"
+            else
+              echo "❌ Download failed for Series $SERIES_INDEX"
+              FAILED_DOWNLOADS="$FAILED_DOWNLOADS $SERIES_INDEX"
+              rm -f "$OUT_FILE"
+            fi
+            
+            SERIES_INDEX=$((SERIES_INDEX + 1))
+            echo ""
+          done 3< urls.txt
+          
+          echo "========================================="
+          echo "📊 DOWNLOAD SUMMARY"
+          echo "========================================="
+          echo "📊 Expected: $TOTAL_SERIES series"
+          
+          TOTAL_FILES=$(ls -1 *.mp4 2>/dev/null | wc -l)
+          echo "✅ Downloaded: $TOTAL_FILES/$TOTAL_SERIES series"
+          
+          if [ -n "$FAILED_DOWNLOADS" ]; then
+            echo "❌ FAILED DOWNLOADS: $FAILED_DOWNLOADS"
+            echo "❌ Not all series downloaded successfully!"
+            echo "   This is an all-or-nothing workflow. Exiting."
+            exit 1
+          fi
+          
+          if [ "$TOTAL_FILES" -ne "$TOTAL_SERIES" ]; then
+            echo "❌ Expected $TOTAL_SERIES series, but only $TOTAL_FILES downloaded!"
+            echo "❌ Exiting - all series required."
+            exit 1
+          fi
+          
+          echo "✅ All $TOTAL_SERIES series downloaded successfully!"
+          echo "========================================="
+          
+          # List downloaded files with sizes
+          echo ""
+          echo "📊 Downloaded files:"
+          for f in *.mp4; do
+            if [ -f "$f" ]; then
+              SIZE_MB=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null | awk '{print $1/1024/1024}')
+              SIZE_GB=$(echo "scale=2; $SIZE_MB / 1024" | bc)
+              printf "   %-50s: %.1f MB (%.2f GB)\n" "$f" "$SIZE_MB" "$SIZE_GB"
+            fi
+          done
+          echo ""
+
+      - name: Compress Series Larger Than 1.8GB (Very Fast Preset)
+        run: |
+          cd downloads
+          
+          echo "========================================="
+          echo "🔧 COMPRESSING SERIES > 1.8GB"
+          echo "========================================="
+          echo "⚡ Using VERY FAST compression preset"
+          echo "========================================="
+          
+          # Create compression script
+          cat > compress_series.py << 'EOFCOMPRESS'
+          import os
+          import sys
+          import subprocess
+          import json
+          import time
+          
+          def get_video_info(file_path):
+              """Get video duration using ffprobe"""
+              try:
+                  cmd = [
+                      "ffprobe", "-v", "error",
+                      "-show_entries", "format=duration",
+                      "-of", "json",
+                      file_path
+                  ]
+                  result = subprocess.check_output(cmd, text=True)
+                  data = json.loads(result)
+                  duration = float(data.get('format', {}).get('duration', 0))
+                  return duration
+              except:
+                  return 0
+          
+          def compress_to_under_1_8gb(file_path):
+              """
+              Compress video to under 1.8GB using FFmpeg with VERY FAST preset
+              """
+              print(f"  ⚡ Compressing with VERY FAST preset...")
+              
+              file_size_bytes = os.path.getsize(file_path)
+              file_size_mb = file_size_bytes / (1024 * 1024)
+              file_size_gb = file_size_mb / 1024
+              print(f"  📊 Original size: {file_size_mb:.1f}MB ({file_size_gb:.2f}GB)")
+              
+              if file_size_gb <= 1.8:
+                  print(f"  ✅ File already under 1.8GB, skipping compression")
+                  return True
+              
+              # Get duration
+              duration = get_video_info(file_path)
+              print(f"  📊 Duration: {duration:.1f}s")
+              
+              if duration <= 0:
+                  print(f"  ⚠️ Could not determine duration, using 1800s estimate")
+                  duration = 1800
+              
+              # Calculate target bitrate for 1.7GB (leaving some margin)
+              TARGET_SIZE_MB = 1700  # 1.7GB target
+              target_bitrate = int((TARGET_SIZE_MB * 8 * 1024) / duration)
+              
+              # Ensure bitrate is reasonable
+              if target_bitrate < 300:
+                  target_bitrate = 300
+              elif target_bitrate > 4000:
+                  target_bitrate = 4000
+              
+              print(f"  📊 Target bitrate: {target_bitrate}kbps (for {TARGET_SIZE_MB}MB)")
+              
+              base_name = os.path.splitext(file_path)[0]
+              temp_file = f"{base_name}_compressed.mp4"
+              
+              # Use VERY FAST preset for maximum speed
+              cmd = [
+                  "ffmpeg", "-y",
+                  "-i", file_path,
+                  "-c:v", "libx264",
+                  "-preset", "veryfast",
+                  "-b:v", f"{target_bitrate}k",
+                  "-maxrate", f"{int(target_bitrate * 1.5)}k",
+                  "-bufsize", f"{int(target_bitrate * 2)}k",
+                  "-c:a", "aac",
+                  "-b:a", "128k",
+                  "-ar", "44100",
+                  "-movflags", "+faststart",
+                  "-threads", str(os.cpu_count() or 2),
+                  temp_file
+              ]
+              
+              try:
+                  print(f"  🔄 Encoding...")
+                  start_time = time.time()
+                  
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                  
+                  elapsed = time.time() - start_time
+                  print(f"  ⏱️  Encoding time: {elapsed:.1f}s")
+                  
+                  if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                      new_size_bytes = os.path.getsize(temp_file)
+                      new_size_mb = new_size_bytes / (1024 * 1024)
+                      new_size_gb = new_size_mb / 1024
+                      print(f"  ✅ Compressed: {new_size_mb:.1f}MB ({new_size_gb:.2f}GB)")
+                      
+                      if new_size_gb <= 1.8:
+                          os.replace(temp_file, file_path)
+                          return True
+                      else:
+                          print(f"  ⚠️ Still too large: {new_size_gb:.2f}GB")
+                          
+                          # Try more aggressive compression with CRF
+                          print(f"  🔄 Trying CRF-based compression...")
+                          temp_file2 = f"{base_name}_crf.mp4"
+                          
+                          # Try different CRF values
+                          for crf in [28, 30, 32]:
+                              print(f"    Trying CRF {crf}...")
+                              cmd2 = [
+                                  "ffmpeg", "-y",
+                                  "-i", file_path,
+                                  "-c:v", "libx264",
+                                  "-preset", "veryfast",
+                                  "-crf", str(crf),
+                                  "-c:a", "aac",
+                                  "-b:a", "96k",
+                                  "-ar", "44100",
+                                  "-movflags", "+faststart",
+                                  "-threads", str(os.cpu_count() or 2),
+                                  temp_file2
+                              ]
+                              
+                              result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=600)
+                              
+                              if result2.returncode == 0 and os.path.exists(temp_file2) and os.path.getsize(temp_file2) > 0:
+                                  new_size_mb2 = os.path.getsize(temp_file2) / (1024 * 1024)
+                                  new_size_gb2 = new_size_mb2 / 1024
+                                  print(f"    CRF {crf} result: {new_size_mb2:.1f}MB ({new_size_gb2:.2f}GB)")
+                                  
+                                  if new_size_gb2 <= 1.8:
+                                      os.replace(temp_file2, file_path)
+                                      return True
+                                  else:
+                                      os.remove(temp_file2)
+                          
+                          # Clean up temp file
+                          if os.path.exists(temp_file):
+                              os.remove(temp_file)
+                          return False
+                  else:
+                      print(f"  ❌ Compression failed: {result.stderr[:200] if result.stderr else 'Unknown error'}")
+                      return False
+                      
+              except subprocess.TimeoutExpired:
+                  print(f"  ❌ Compression timeout")
+                  return False
+              except Exception as e:
+                  print(f"  ❌ Compression error: {e}")
+                  return False
+              finally:
+                  # Cleanup temp files
+                  for f in [temp_file, f"{base_name}_crf.mp4"]:
+                      if os.path.exists(f):
+                          try: os.remove(f)
+                          except: pass
+              
+              return False
+          
+          if __name__ == "__main__":
+              if len(sys.argv) < 2:
+                  print("Usage: python compress_series.py <file_path>")
+                  sys.exit(1)
+              
+              file_path = sys.argv[1]
+              success = compress_to_under_1_8gb(file_path)
+              sys.exit(0 if success else 1)
+          EOFCOMPRESS
+          
+          # Get list of all series files
+          SERIES_FILES=$(ls -1 *.mp4 2>/dev/null)
+          TOTAL_SERIES=$(echo "$SERIES_FILES" | wc -l)
+          COMPRESSED_COUNT=0
+          FAILED_COMPRESSIONS=""
+          
+          echo "📊 Checking series sizes..."
+          echo ""
+          
+          for f in $SERIES_FILES; do
+            if [ ! -f "$f" ]; then continue; fi
+            
+            FILE_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
+            FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+            FILE_SIZE_GB=$(echo "scale=2; $FILE_SIZE_MB / 1024" | bc)
+            
+            echo "📹 $f: ${FILE_SIZE_MB}MB (${FILE_SIZE_GB}GB)"
+            
+            if [ $FILE_SIZE_MB -gt 1800 ]; then
+              echo "⚠️  $f exceeds 1.8GB (${FILE_SIZE_GB}GB), compressing..."
+              
+              # Compress to under 1.8GB
+              if python3 compress_series.py "$f" < /dev/null; then
+                COMPRESSED_COUNT=$((COMPRESSED_COUNT + 1))
+                NEW_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
+                NEW_SIZE_MB=$((NEW_SIZE / 1024 / 1024))
+                NEW_SIZE_GB=$(echo "scale=2; $NEW_SIZE_MB / 1024" | bc)
+                echo "✅ $f compressed: ${NEW_SIZE_MB}MB (${NEW_SIZE_GB}GB)"
+              else
+                echo "❌ Failed to compress $f"
+                FAILED_COMPRESSIONS="$FAILED_COMPRESSIONS $f"
+              fi
+            else
+              echo "✅ $f already under 1.8GB, skipping compression"
+            fi
+            echo ""
+          done
+          
+          echo "========================================="
+          echo "📊 COMPRESSION SUMMARY"
+          echo "========================================="
+          echo "📊 Total Series: $TOTAL_SERIES"
+          echo "📊 Compressed: $COMPRESSED_COUNT series"
+          
+          if [ -n "$FAILED_COMPRESSIONS" ]; then
+            echo "❌ FAILED COMPRESSIONS: $FAILED_COMPRESSIONS"
+            echo "❌ Not all series compressed successfully!"
+            echo "   This is an all-or-nothing workflow. Exiting."
+            exit 1
+          fi
+          
+          echo "✅ All series processed successfully!"
+          echo "========================================="
+          
+          # Show final file sizes
+          echo ""
+          echo "📊 Final series sizes:"
+          for f in *.mp4; do
+            if [ -f "$f" ]; then
+              SIZE_MB=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null | awk '{print $1/1024/1024}')
+              SIZE_GB=$(echo "scale=2; $SIZE_MB / 1024" | bc)
+              printf "   %-50s: %.1f MB (%.2f GB)\n" "$f" "$SIZE_MB" "$SIZE_GB"
+            fi
+          done
+          echo ""
+
+      - name: Verify Series Files
+        id: verify
+        run: |
+          cd downloads
+          
+          echo "========================================="
+          echo "🔍 VERIFYING SERIES FILES"
+          echo "========================================="
+          
+          TOTAL_FILES=$(ls -1 *.mp4 2>/dev/null | wc -l)
+          FAILED_FILES=""
+          
+          for f in *.mp4; do
+            if [ ! -f "$f" ]; then continue; fi
+            
+            echo "🔍 Checking: $f"
+            
+            # Check if file is valid and has video
+            if ffprobe -v error "$f" 2>/dev/null; then
+              # Check file size
+              SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
+              SIZE_MB=$((SIZE / 1024 / 1024))
+              
+              if [ $SIZE_MB -gt 2000 ]; then
+                echo "❌ $f exceeds 2GB (${SIZE_MB}MB) - Telegram limit!"
+                FAILED_FILES="$FAILED_FILES $f"
+              else
+                echo "✅ $f is valid (${SIZE_MB}MB)"
+                
+                # Get duration
+                DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "0")
+                echo "   Duration: ${DURATION}s"
+              fi
+            else
+              echo "❌ $f is invalid!"
+              FAILED_FILES="$FAILED_FILES $f"
+            fi
+          done
+          
+          if [ -n "$FAILED_FILES" ]; then
+            echo "❌ Failed files: $FAILED_FILES"
+            exit 1
+          fi
+          
+          echo "✅ All $TOTAL_FILES series files verified!"
+          echo "verify_success=true" >> $GITHUB_OUTPUT
+          echo "total_files=$TOTAL_FILES" >> $GITHUB_OUTPUT
+
+      - name: Upload Series to Telegram Channel
+        if: steps.verify.outputs.verify_success == 'true'
+        env:
+          TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
+          TG_CHAT_ID: ${{ secrets.TELEGRAM_MERGED_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
+          TG_CHAT_NAME: ${{ secrets.TELEGRAM_MERGED_NAME }}
+          TG_INVITE_LINK: ${{ secrets.TELEGRAM_MERGED_INVITE_LINK }}
+          TOTAL_FILES: ${{ steps.verify.outputs.total_files }}
+        run: |
+          cd downloads
+          
+          echo "========================================="
+          echo "📤 UPLOADING SERIES TO TELEGRAM"
+          echo "========================================="
+          echo "📊 Total Series: ${{ steps.verify.outputs.total_files }}"
+          echo "========================================="
+          
+          cat > upload_series.py << 'EOFUPLOAD'
+          import os
+          import sys
+          import glob
+          import re
+          import subprocess
+          import asyncio
+          import datetime
+          import traceback
+          import json
+          import math
+
+          if hasattr(sys.stdout, "reconfigure"):
+              sys.stdout.reconfigure(line_buffering=True)
+              sys.stderr.reconfigure(line_buffering=True)
+
+          try:
+              from telethon import TelegramClient
+              from telethon.sessions import StringSession
+              from telethon.errors import FloodWaitError
+              from telethon.tl.functions.channels import JoinChannelRequest
+              from telethon.tl.functions.messages import ImportChatInviteRequest
+              from telethon.tl.types import DocumentAttributeVideo
+              import telethon
+              print(f"✅ Telethon version: {telethon.__version__}")
+          except ImportError as e:
+              print(f"❌ Import error: {e}")
+              sys.exit(1)
+
+          api_id = os.environ.get("TG_API_ID")
+          api_hash = os.environ.get("TG_API_HASH")
+          session_string = os.environ.get("TG_SESSION_STRING")
+          
+          chat_id_raw = os.environ.get("TG_CHAT_ID")
+          chat_name = os.environ.get("TG_CHAT_NAME")
+          invite_link = os.environ.get("TG_INVITE_LINK")
+
+          if not all([api_id, api_hash]):
+              print("❌ Missing Telegram API credentials.")
+              sys.exit(0)
+
+          if not session_string:
+              print("❌ Missing session string!")
+              sys.exit(0)
+
+          def parse_chat_id(val):
+              if not val:
+                  return None
+              val = str(val).strip().strip('"').strip("'")
+              try:
+                  return int(val)
+              except ValueError:
+                  return val
+
+          def get_video_metadata(file_path):
+              try:
+                  cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  if result and result.replace('.', '', 1).isdigit():
+                      duration = float(result)
+                  else:
+                      cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      duration = float(result) if result.replace('.', '', 1).isdigit() else 0.0
+                  
+                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  parts = result.split('|')
+                  
+                  if len(parts) >= 2:
+                      w = int(parts[0]) if parts[0].isdigit() else 1280
+                      h = int(parts[1]) if parts[1].isdigit() else 720
+                  else:
+                      w, h = 1280, 720
+                  
+                  return int(duration), w, h
+              except:
+                  pass
+              return 0, 1280, 720
+
+          def generate_thumbnail(file_path):
+              try:
+                  thumb_path = f"{file_path}_thumb.jpg"
+                  
+                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  parts = result.split('|')
+                  
+                  if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                      w = int(parts[0])
+                      h = int(parts[1])
+                      
+                      ffmpeg_cmd = [
+                          "ffmpeg", "-y", "-ss", "00:00:01",
+                          "-i", file_path,
+                          "-vf", f"crop=min({w},{h}):min({w},{h}),scale=512:512:flags=lanczos",
+                          "-vframes", "1",
+                          "-q:v", "2",
+                          thumb_path
+                      ]
+                      
+                      subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                      return thumb_path if os.path.exists(thumb_path) else None
+              except:
+                  pass
+              return None
+
+          chat_id = parse_chat_id(chat_id_raw)
+
+          print("=" * 60)
+          print("📤 Uploading Series to Telegram")
+          print("=" * 60)
+
+          with open("series_upload.log", "w") as f:
+              f.write(f"{datetime.datetime.now()}: Starting series uploads\n")
+
+          def progress_callback(current, total):
+              """Progress callback for upload"""
+              percent = (current / total) * 100
+              mb_uploaded = current / (1024 * 1024)
+              mb_total = total / (1024 * 1024)
+              if int(percent) % 5 == 0 or int(percent) == 100:
+                  print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
+                  with open("series_upload.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)\n")
+
+          async def join_chat(client, invite_link):
+              if not invite_link:
+                  return None
+              try:
+                  entity = await client.get_entity(invite_link)
+                  return entity
+              except:
+                  pass
+              return None
+
+          async def resolve_chat(client, chat_id, invite_link, search_name):
+              if invite_link:
+                  entity = await join_chat(client, invite_link)
+                  if entity:
+                      return entity
+              if chat_id:
+                  try:
+                      return await client.get_entity(chat_id)
+                  except:
+                      pass
+              if search_name:
+                  async for dialog in client.iter_dialogs(limit=50):
+                      if search_name.lower() in str(dialog.name).lower():
+                          return dialog.entity
+              return None
+
+          async def fast_upload_file(client, file_path, progress_callback=None):
+              """Custom fast upload implementation using parallel chunk uploading"""
+              if not os.path.exists(file_path):
+                  print(f"❌ File not found: {file_path}")
+                  return None
+              
+              file_size = os.path.getsize(file_path)
+              print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
+              
+              try:
+                  result = await client.upload_file(
+                      file_path,
+                      part_size_kb=512,
+                      file_name=os.path.basename(file_path),
+                      progress_callback=progress_callback
+                  )
+                  return result
+              except Exception as e:
+                  print(f"❌ Upload failed: {e}")
+                  raise
+
+          async def send_file_with_thumb(client, entity, file_path, caption):
+              # Check if file exists
+              if not os.path.exists(file_path):
+                  print(f"❌ File not found: {file_path}")
+                  return False, None
+              
+              file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+              if file_size_mb > 2000:
+                  print(f"❌ File exceeds 2GB ({file_size_mb:.1f} MB)")
+                  print("⚠️ Telegram limit is 2GB.")
+                  return False, None
+              
+              duration, w, h = get_video_metadata(file_path)
+              print(f"📊 Video duration: {duration} seconds, {w}x{h}")
+              
+              thumb = generate_thumbnail(file_path)
+              
+              print(f"⏫ Uploading {os.path.basename(file_path)}...")
+              try:
+                  uploaded_file = await fast_upload_file(
+                      client=client,
+                      file_path=file_path,
+                      progress_callback=progress_callback
+                  )
+                  
+                  if uploaded_file is None:
+                      print(f"❌ Upload returned None for {os.path.basename(file_path)}")
+                      return False, None
+                      
+                  print(f"✅ Upload complete for {os.path.basename(file_path)}!")
+                  
+                  with open("series_upload.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: UPLOAD_COMPLETE_{os.path.basename(file_path)}\n")
+                  
+              except Exception as e:
+                  print(f"❌ Upload failed: {e}")
+                  return False, None
+              
+              video_attr = DocumentAttributeVideo(
+                  duration=duration,
+                  w=w if w > 0 else 1280,
+                  h=h if h > 0 else 720,
+                  supports_streaming=True
+              )
+              
+              kwargs = {
+                  "entity": entity,
+                  "file": uploaded_file,
+                  "caption": caption,
+                  "attributes": [video_attr],
+                  "supports_streaming": True,
+                  "force_document": False,
+                  "allow_cache": True
+              }
+              
+              if thumb and os.path.exists(thumb):
+                  kwargs["thumb"] = thumb
+                  print(f"📸 Using thumbnail: {thumb}")
+              
+              try:
+                  result = await client.send_file(**kwargs)
+                  print(f"✅ File sent to Telegram: {os.path.basename(file_path)}")
+                  return True, result
+              except Exception as e:
+                  print(f"❌ Send failed: {e}")
+                  if "thumb" in kwargs:
+                      del kwargs["thumb"]
+                      try:
+                          result = await client.send_file(**kwargs)
+                          return True, result
+                      except Exception as e2:
+                          print(f"❌ Send failed without thumb: {e2}")
+                          return False, None
+                  return False, None
+              finally:
+                  if thumb and os.path.exists(thumb):
+                      try: os.remove(thumb)
+                      except: pass
+
+          def extract_date_and_label_from_name(name):
+              """Extract date and label from series name like [2026-07-17]-[BLLA]-in His Cold Eyes"""
+              date_pattern = r'\[([0-9]{4}-[0-9]{2}-[0-9]{2})\]'
+              label_pattern = r'\]-\[([A-Z]+)\]'
+              
+              date_match = re.search(date_pattern, name)
+              label_match = re.search(label_pattern, name)
+              
+              date_str = date_match.group(1) if date_match else None
+              label_str = label_match.group(1) if label_match else None
+              
+              return date_str, label_str
+
+          def generate_hashtags(date_str, label_str):
+              """Generate hashtags from date and label"""
+              hashtags = ["#UNWATCHED"]
+              
+              if date_str:
+                  try:
+                      date_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+                      month_upper = date_obj.strftime("%B").upper()
+                      year_str = date_obj.strftime("%Y")
+                      month_year = f"{month_upper}{year_str}"
+                      
+                      hashtags.append(f"#{month_year}")
+                      hashtags.append(f"#{month_year}UNWATCHED")
+                      
+                      if label_str:
+                          clean_label = label_str.upper().replace("-", "").replace(" ", "").replace("_", "")
+                          if clean_label and clean_label != "NONE":
+                              hashtags.append(f"#{month_year}{clean_label}")
+                              hashtags.append(f"#{clean_label}")
+                  except:
+                      pass
+              
+              return hashtags
+
+          async def upload_series_files(client, entity):
+              # Get all MP4 files sorted
+              series_files = sorted(glob.glob("*.mp4"))
+              
+              if not series_files:
+                  print("❌ No series files found!")
+                  return False
+              
+              total_files = len(series_files)
+              print(f"📊 Found {total_files} series to upload")
+              print("⚡ Each series will use parallel upload!")
+              
+              success_count = 0
+              
+              for idx, file_path in enumerate(series_files, 1):
+                  file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                  print(f"\n{'='*50}")
+                  print(f"📤 Uploading {idx}/{total_files}: {os.path.basename(file_path)}")
+                  print(f"💾 Size: {file_size_mb:.1f} MB")
+                  
+                  if file_size_mb > 2000:
+                      print(f"❌ {os.path.basename(file_path)} exceeds 2GB! Skipping.")
+                      continue
+                  
+                  # Get the series name from the filename (remove .mp4 extension)
+                  file_basename = os.path.basename(file_path)
+                  series_name = os.path.splitext(file_basename)[0]
+                  
+                  # Extract date and label from the series name
+                  date_str, label_str = extract_date_and_label_from_name(series_name)
+                  
+                  # Generate hashtags
+                  hashtags = generate_hashtags(date_str, label_str)
+                  hashtag_str = " ".join(hashtags)
+                  
+                  # Build caption
+                  caption = f"{series_name}\n{hashtag_str}"
+                  
+                  print(f"📝 Caption:")
+                  print(f"   Line 1: {series_name}")
+                  print(f"   Line 2: {hashtag_str}")
+                  print(f"📅 Date: {date_str if date_str else 'Not found'}")
+                  print(f"🏷️  Label: {label_str if label_str else 'Not found'}")
+                  print("=" * 50)
+                  
+                  with open("series_upload.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: STARTING_{os.path.basename(file_path)}\n")
+                  
+                  try:
+                      success, result = await send_file_with_thumb(client, entity, file_path, caption)
+                      if success:
+                          success_count += 1
+                          print(f"✅ {os.path.basename(file_path)} uploaded successfully!")
+                          with open("series_upload.log", "a") as f:
+                              f.write(f"{datetime.datetime.now()}: COMPLETE_{os.path.basename(file_path)}\n")
+                      else:
+                          print(f"❌ {os.path.basename(file_path)} failed")
+                  except FloodWaitError as e:
+                      print(f"⏳ Rate limited: waiting {e.seconds}s")
+                      await asyncio.sleep(e.seconds)
+                      success, result = await send_file_with_thumb(client, entity, file_path, caption)
+                      if success:
+                          success_count += 1
+                          print(f"✅ {os.path.basename(file_path)} uploaded successfully!")
+                          with open("series_upload.log", "a") as f:
+                              f.write(f"{datetime.datetime.now()}: COMPLETE_{os.path.basename(file_path)}\n")
+                  except Exception as e:
+                      print(f"❌ {os.path.basename(file_path)} error: {e}")
+                  
+                  # Small delay between uploads to avoid rate limiting
+                  if idx < total_files:
+                      await asyncio.sleep(2)
+              
+              print(f"\n✅ Uploaded {success_count}/{total_files} series")
+              return success_count > 0
+
+          async def main():
+              try:
+                  print("🔌 Connecting to Telegram...")
+                  
+                  client = TelegramClient(
+                      StringSession(session_string), 
+                      int(api_id), 
+                      api_hash,
+                      connection_retries=5,
+                      flood_sleep_threshold=180
+                  )
+                  await client.connect()
+                  
+                  if not await client.is_user_authorized():
+                      print("❌ Session invalid")
+                      return
+                  
+                  me = await client.get_me()
+                  print(f"✅ Logged in: {me.first_name}")
+                  
+                  entity = await resolve_chat(client, chat_id, invite_link, chat_name)
+                  
+                  if not entity:
+                      print("❌ Could not resolve chat!")
+                      return
+                  
+                  print(f"\n📤 Uploading series to: {entity.title if hasattr(entity, 'title') else entity.id}")
+                  await upload_series_files(client, entity)
+                  
+                  await client.disconnect()
+                  print("\n✅ All series upload complete!")
+                          
+              except Exception as e:
+                  print(f"❌ Error: {e}")
+                  traceback.print_exc()
+
+          if __name__ == '__main__':
+              asyncio.run(main())
+          EOFUPLOAD
+          
+          echo "🚀 Starting series upload with parallel upload..."
+          python3 -u upload_series.py
+          
+          echo "done" > series_upload_complete.txt
+          echo "✅ All series uploaded successfully!"
+
+      - name: Wait for Uploads with Progress Monitoring
+        if: steps.verify.outputs.verify_success == 'true'
+        run: |
+          cd downloads
+          
+          echo "========================================="
+          echo "⏳ MONITORING UPLOAD PROGRESS"
+          echo "========================================="
+          
+          # Function to get upload progress
+          get_upload_progress() {
+            if [ -f "series_upload_complete.txt" ]; then
+              echo "100|complete"
+              return
+            fi
+            
+            if [ -f "series_upload.log" ]; then
+              # Count total files
+              local total_files=$(ls -1 *.mp4 2>/dev/null | wc -l)
+              # Count completed files
+              local completed=$(grep -c "COMPLETE_" series_upload.log 2>/dev/null || echo "0")
+              # Count currently uploading
+              local current=$(grep "STARTING_" series_upload.log 2>/dev/null | tail -1 | grep -oE "[^_]+\.mp4" | head -1)
+              
+              if [ "$total_files" -gt 0 ]; then
+                local percent=$((completed * 100 / total_files))
+                echo "$percent|${completed}/${total_files}|${current}"
+              else
+                echo "0|0/0|"
+              fi
+            else
+              echo "0|0/0|"
+            fi
+          }
+          
+          # Main monitoring loop
+          START_TIME=$(date +%s)
+          UPLOAD_COMPLETE=false
+          
+          echo ""
+          echo "🔄 Monitoring upload progress..."
+          echo "   (Updates every 5 seconds)"
+          echo ""
+          
+          while true; do
+            # Check completion
+            if [ -f "series_upload_complete.txt" ]; then
+              UPLOAD_COMPLETE=true
+            fi
+            
+            # If complete, break out of loop
+            if [ "$UPLOAD_COMPLETE" = true ]; then
+              echo ""
+              echo "✅ ALL UPLOADS COMPLETED!"
+              echo ""
+              break
+            fi
+            
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            
+            # Format elapsed time
+            if [ $ELAPSED -lt 60 ]; then
+              ELAPSED_STR="${ELAPSED}s"
+            elif [ $ELAPSED -lt 3600 ]; then
+              ELAPSED_STR="$((ELAPSED / 60))m $((ELAPSED % 60))s"
+            else
+              ELAPSED_STR="$((ELAPSED / 3600))h $(((ELAPSED % 3600) / 60))m"
+            fi
+            
+            clear 2>/dev/null || printf "\033c" 2>/dev/null || echo ""
+            
+            echo "╔══════════════════════════════════════════════════════════════╗"
+            echo "║           📤 SERIES UPLOAD PROGRESS MONITOR                 ║"
+            echo "╠══════════════════════════════════════════════════════════════╣"
+            echo "║ ⏱️  Elapsed Time: $(printf "%-40s" "$ELAPSED_STR")║"
+            echo "║                                                              ║"
+            
+            # Get progress
+            PROGRESS_DATA=$(get_upload_progress)
+            PERCENT=$(echo "$PROGRESS_DATA" | cut -d'|' -f1)
+            COUNT=$(echo "$PROGRESS_DATA" | cut -d'|' -f2)
+            CURRENT_FILE=$(echo "$PROGRESS_DATA" | cut -d'|' -f3)
+            
+            TOTAL_FILES=$(ls -1 *.mp4 2>/dev/null | wc -l)
+            
+            echo "║ 📹 Series Uploads:                                        ║"
+            echo "║    Progress: $(printf "%-51s" "${PERCENT}% (${COUNT} of ${TOTAL_FILES})")║"
+            
+            # Create progress bar
+            BAR_LENGTH=40
+            FILLED=$((PERCENT * BAR_LENGTH / 100))
+            BAR=""
+            for ((i=0; i<$FILLED && i<$BAR_LENGTH; i++)); do BAR="${BAR}█"; done
+            for ((i=$FILLED; i<$BAR_LENGTH; i++)); do BAR="${BAR}░"; done
+            echo "║    [${BAR}] ║"
+            
+            if [ -n "$CURRENT_FILE" ] && [ "$CURRENT_FILE" != "null" ]; then
+              echo "║    Current: $(printf "%-49s" "${CURRENT_FILE}")║"
+            fi
+            
+            # Calculate ETA if we have progress
+            if [[ "$COUNT" == *"/"* ]]; then
+              COMPLETED=$(echo "$COUNT" | cut -d'/' -f1)
+              if [ "$COMPLETED" -gt 0 ] && [ "$ELAPSED" -gt 10 ]; then
+                AVG_TIME=$((ELAPSED / COMPLETED))
+                REMAINING=$((TOTAL_FILES - COMPLETED))
+                ETA_SECONDS=$((AVG_TIME * REMAINING))
+                if [ $ETA_SECONDS -lt 60 ]; then
+                  ETA_STR="${ETA_SECONDS}s"
+                elif [ $ETA_SECONDS -lt 3600 ]; then
+                  ETA_STR="$((ETA_SECONDS / 60))m $((ETA_SECONDS % 60))s"
+                else
+                  ETA_STR="$((ETA_SECONDS / 3600))h $(((ETA_SECONDS % 3600) / 60))m"
+                fi
+                echo "║    ETA: $(printf "%-51s" "$ETA_STR")║"
+              fi
+            fi
+            
+            echo "║                                                              ║"
+            echo "╚══════════════════════════════════════════════════════════════╝"
+            
+            # Check for errors
+            if [ -f "series_upload.log" ]; then
+              if tail -5 series_upload.log 2>/dev/null | grep -q "❌"; then
+                echo ""
+                echo "⚠️  Warning: Possible errors detected in upload log"
+                echo "   Check series_upload.log for details"
+              fi
+            fi
+            
+            sleep 5
+          done
+          
+          echo "========================================="
+          echo "✅ ALL UPLOADS COMPLETED SUCCESSFULLY!"
+          echo "========================================="
+          
+          # Show final logs
+          if [ -f "series_upload.log" ]; then
+            echo ""
+            echo "📋 Final upload log:"
+            echo "========================================="
+            tail -20 series_upload.log
+            echo "========================================="
+          fi
+          
+          echo ""
+          echo "📊 Upload Summary:"
+          echo "========================================="
+          echo "⏱️  Total Time: $ELAPSED_STR"
+          echo "📊 Total Series: $(ls -1 *.mp4 2>/dev/null | wc -l)"
+          echo "========================================="
+          if [ -f "series_upload_complete.txt" ]; then
+            echo "🎉 All series uploaded successfully!"
+          fi
+          echo "========================================="
+
+      - name: Cleanup - Delete Workflow Run if Successful
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const runId = context.runId;
+            const repo = context.repo;
+            
+            console.log(`🧹 Cleaning up workflow run ${runId}`);
+            console.log(`📦 Repository: ${repo.owner}/${repo.repo}`);
+            
+            try {
+              await github.rest.actions.deleteWorkflowRun({
+                owner: repo.owner,
+                repo: repo.repo,
+                run_id: runId
+              });
+              console.log(`✅ Successfully deleted workflow run ${runId}`);
+            } catch (error) {
+              console.log(`❌ Failed to delete workflow run: ${error.message}`);
+              if (error.status === 403) {
+                console.log('⚠️ Permission denied. The token may not have "actions: write" permission.');
+                console.log('ℹ️ You may need to manually delete this workflow run.');
+              } else if (error.status === 404) {
+                console.log('⚠️ Workflow run not found. It may have been already deleted.');
+              } else {
+                console.log(`⚠️ Error details: ${JSON.stringify(error, null, 2)}`);
+              }
+              console.log('ℹ️ Continuing workflow execution...');
+            }
