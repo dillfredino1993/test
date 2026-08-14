@@ -43,23 +43,51 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg & Tools
+      - name: Install FFmpeg & Tools with Cloudflare Support
         run: |
           echo "========================================="
-          echo "🔧 INSTALLING TOOLS"
+          echo "🔧 INSTALLING TOOLS WITH CLOUDFLARE SUPPORT"
           echo "========================================="
           echo "📺 Series: ${{ env.series_title }}"
           echo "========================================="
           
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool
+          
+          # Upgrade pip
           pip3 install --upgrade pip
-          pip3 install telethon qrcode yt-dlp requests
-          pip3 install aiohttp python-socks[asyncio]
+          
+          # Install base requirements
+          pip3 install telethon qrcode requests aiohttp python-socks[asyncio]
+          
+          # Install yt-dlp with Cloudflare support - using latest version with impersonation
+          echo "📥 Installing yt-dlp with Cloudflare impersonation support..."
+          
+          # Uninstall any existing yt-dlp
+          pip3 uninstall -y yt-dlp 2>/dev/null || true
+          
+          # Install the latest yt-dlp from GitHub with full impersonation support
+          pip3 install git+https://github.com/yt-dlp/yt-dlp.git
+          
+          # Install required dependencies for Cloudflare impersonation
+          pip3 install brotli websockets pycryptodome certifi
+          
+          # Verify installation and available impersonation targets
+          echo "✅ yt-dlp version:"
+          yt-dlp --version
+          
+          echo ""
+          echo "🔍 Available impersonation targets:"
+          yt-dlp --list-impersonate-targets || echo "⚠️ Impersonation not available in this version"
+          
+          echo ""
+          echo "🔍 Testing Cloudflare impersonation support:"
+          yt-dlp --impersonate chrome --help | grep -i impersonate || echo "⚠️ Impersonation flag may not be fully supported"
+          
           python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')"
           
           echo "========================================="
-          echo "✅ INSTALLATION COMPLETE"
+          echo "✅ INSTALLATION COMPLETE WITH CLOUDFLARE SUPPORT"
           echo "========================================="
 
       - name: Compute Dynamic Formatted Output Filename & Label
@@ -128,7 +156,7 @@ jobs:
           
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
-      - name: Download All Episodes First
+      - name: Download All Episodes First with Cloudflare Support
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -137,11 +165,30 @@ jobs:
           cd downloads
           
           echo "========================================="
-          echo "📥 DOWNLOADING ALL EPISODES"
+          echo "📥 DOWNLOADING ALL EPISODES WITH CLOUDFLARE SUPPORT"
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Total Episodes: $(cat urls.txt | wc -l)"
           echo "========================================="
+          
+          # Define Chrome version-specific user agents and headers
+          # Chrome 127 (Latest as of August 2026)
+          CHROME_127_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+          CHROME_126_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+          CHROME_125_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+          CHROME_124_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+          CHROME_123_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+          CHROME_122_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+          
+          # Edge browsers (some sites prefer Edge)
+          EDGE_127_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0"
+          EDGE_126_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"
+          
+          # Firefox (alternative if Chrome fails)
+          FIREFOX_128_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+          FIREFOX_127_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0"
+          
+          REFERER="https://dramafren.org/"
           
           TOTAL_EPISODES=$(cat urls.txt | wc -l)
           EP_INDEX=1
@@ -166,37 +213,184 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # Download the episode - try both methods
-            if [[ "$URL" == *".m3u8"* ]]; then
-              echo "📺 HLS stream - Using yt-dlp with Chrome impersonation"
-              # Use yt-dlp with Chrome impersonation for HLS streams
-              # --impersonate chrome: Uses Chrome's TLS fingerprint and headers
-              # --extractor-args "hls:prefer_native": Use native HLS downloader for better compatibility
+            # PRIMARY METHOD: yt-dlp with Chrome 127 impersonation (newest)
+            echo "🌐 Using yt-dlp with Chrome 127 impersonation (Cloudflare bypass)..."
+            
+            # Try multiple impersonation targets starting with newest
+            for IMPERSONATE_TARGET in "chrome-127" "chrome-126" "chrome-125" "chrome-124" "chrome-123" "chrome-122" "chrome-121" "chrome-120" "chrome-119" "chrome-118" "chrome-117"; do
+              echo "🔄 Trying impersonation: $IMPERSONATE_TARGET"
+              
+              # Select appropriate User-Agent based on impersonation target
+              case $IMPERSONATE_TARGET in
+                "chrome-127") UA="$CHROME_127_UA" ;;
+                "chrome-126") UA="$CHROME_126_UA" ;;
+                "chrome-125") UA="$CHROME_125_UA" ;;
+                "chrome-124") UA="$CHROME_124_UA" ;;
+                "chrome-123") UA="$CHROME_123_UA" ;;
+                "chrome-122") UA="$CHROME_122_UA" ;;
+                "chrome-121") UA="$CHROME_122_UA" ;;
+                "chrome-120") UA="$CHROME_122_UA" ;;
+                *) UA="$CHROME_127_UA" ;;
+              esac
+              
               yt-dlp -f "bestvideo+bestaudio/best" \
-                --hls-use-mpegts \
-                --impersonate chrome \
+                --impersonate "$IMPERSONATE_TARGET" \
                 --extractor-args "hls:prefer_native" \
+                --add-header "User-Agent:$UA" \
+                --add-header "Referer:$REFERER" \
+                --add-header "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7" \
+                --add-header "Accept-Language:en-US,en;q=0.9" \
+                --add-header "Accept-Encoding:gzip, deflate, br" \
+                --add-header "Connection:keep-alive" \
+                --add-header "Sec-Ch-Ua:\"Google Chrome\";v=\"127\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"127\"" \
+                --add-header "Sec-Ch-Ua-Mobile:?0" \
+                --add-header "Sec-Ch-Ua-Platform:\"Windows\"" \
+                --add-header "Sec-Fetch-Dest:document" \
+                --add-header "Sec-Fetch-Mode:navigate" \
+                --add-header "Sec-Fetch-Site:none" \
+                --add-header "Sec-Fetch-User:?1" \
+                --add-header "Upgrade-Insecure-Requests:1" \
+                --add-header "Cache-Control:max-age=0" \
+                --no-check-certificate \
                 --no-progress --no-warnings \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>&1
-            else
-              echo "🎬 Direct file - Using aria2c"
-              aria2c -x 16 -s 16 -k 1M --continue=true \
-                --console-log-level=error \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null || \
-              curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
-            fi
+              
+              # Check if download succeeded
+              if [ -f "$OUT_FILE" ] && [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -gt 100000 ]; then
+                echo "✅ Successfully downloaded with impersonation: $IMPERSONATE_TARGET"
+                break
+              else
+                rm -f "$OUT_FILE"
+                echo "⚠️ Failed with $IMPERSONATE_TARGET, trying next target..."
+              fi
+            done
             
-            # If download failed or file is too small, try yt-dlp with Chrome impersonation as fallback
+            # SECONDARY METHOD: Try Edge impersonation
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
-              echo "⚠️ Initial download failed or file too small, trying yt-dlp with Chrome impersonation..."
+              echo "⚠️ Chrome impersonation failed, trying Edge 127 impersonation..."
               rm -f "$OUT_FILE"
+              
               yt-dlp -f "bestvideo+bestaudio/best" \
-                --impersonate chrome \
+                --impersonate "edge-127" \
                 --extractor-args "hls:prefer_native" \
+                --add-header "User-Agent:$EDGE_127_UA" \
+                --add-header "Referer:$REFERER" \
+                --add-header "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7" \
+                --add-header "Accept-Language:en-US,en;q=0.9" \
+                --add-header "Accept-Encoding:gzip, deflate, br" \
+                --add-header "Connection:keep-alive" \
+                --add-header "Sec-Ch-Ua:\"Microsoft Edge\";v=\"127\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"127\"" \
+                --add-header "Sec-Ch-Ua-Mobile:?0" \
+                --add-header "Sec-Ch-Ua-Platform:\"Windows\"" \
+                --add-header "Sec-Fetch-Dest:document" \
+                --add-header "Sec-Fetch-Mode:navigate" \
+                --add-header "Sec-Fetch-Site:none" \
+                --add-header "Sec-Fetch-User:?1" \
+                --add-header "Upgrade-Insecure-Requests:1" \
+                --no-check-certificate \
                 --no-progress --no-warnings \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>&1
             fi
             
+            # TERTIARY METHOD: Try Firefox impersonation
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ Edge impersonation failed, trying Firefox 128 impersonation..."
+              rm -f "$OUT_FILE"
+              
+              yt-dlp -f "bestvideo+bestaudio/best" \
+                --impersonate "firefox-128" \
+                --extractor-args "hls:prefer_native" \
+                --add-header "User-Agent:$FIREFOX_128_UA" \
+                --add-header "Referer:$REFERER" \
+                --add-header "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" \
+                --add-header "Accept-Language:en-US,en;q=0.5" \
+                --add-header "Accept-Encoding:gzip, deflate, br" \
+                --add-header "Connection:keep-alive" \
+                --add-header "Sec-Fetch-Dest:document" \
+                --add-header "Sec-Fetch-Mode:navigate" \
+                --add-header "Sec-Fetch-Site:none" \
+                --add-header "Sec-Fetch-User:?1" \
+                --add-header "Upgrade-Insecure-Requests:1" \
+                --no-check-certificate \
+                --no-progress --no-warnings \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
+            fi
+            
+            # FOURTH METHOD: Try yt-dlp with headers only (no impersonation)
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ Impersonation failed, trying yt-dlp with browser headers only..."
+              rm -f "$OUT_FILE"
+              
+              yt-dlp -f "bestvideo+bestaudio/best" \
+                --add-header "User-Agent:$CHROME_127_UA" \
+                --add-header "Referer:$REFERER" \
+                --add-header "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7" \
+                --add-header "Accept-Language:en-US,en;q=0.9" \
+                --add-header "Accept-Encoding:gzip, deflate, br" \
+                --add-header "Connection:keep-alive" \
+                --no-check-certificate \
+                --no-progress --no-warnings \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
+            fi
+            
+            # FIFTH METHOD: Try aria2c with Chrome 127 headers
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ yt-dlp failed, trying aria2c with Chrome 127 headers..."
+              rm -f "$OUT_FILE"
+              
+              aria2c -x 16 -s 16 -k 1M --continue=true \
+                --header="User-Agent: $CHROME_127_UA" \
+                --header="Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8" \
+                --header="Accept-Language: en-US,en;q=0.9" \
+                --header="Referer: $REFERER" \
+                --header="Accept-Encoding: gzip, deflate, br" \
+                --header="Connection: keep-alive" \
+                --header="Sec-Ch-Ua: \"Google Chrome\";v=\"127\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"127\"" \
+                --header="Sec-Ch-Ua-Mobile: ?0" \
+                --header="Sec-Ch-Ua-Platform: \"Windows\"" \
+                --header="Upgrade-Insecure-Requests: 1" \
+                --console-log-level=error \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
+            fi
+            
+            # SIXTH METHOD: Try curl with Chrome 127 headers
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ aria2c failed, trying curl with Chrome 127 headers..."
+              rm -f "$OUT_FILE"
+              
+              curl -sSL \
+                -H "User-Agent: $CHROME_127_UA" \
+                -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8" \
+                -H "Accept-Language: en-US,en;q=0.9" \
+                -H "Referer: $REFERER" \
+                -H "Accept-Encoding: gzip, deflate, br" \
+                -H "Connection: keep-alive" \
+                -H "Sec-Ch-Ua: \"Google Chrome\";v=\"127\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"127\"" \
+                -H "Sec-Ch-Ua-Mobile: ?0" \
+                -H "Sec-Ch-Ua-Platform: \"Windows\"" \
+                -H "Upgrade-Insecure-Requests: 1" \
+                --compressed \
+                "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
+            fi
+            
+            # FINAL FALLBACK: Try wget as last resort
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ curl failed, trying wget with Chrome 127 headers..."
+              rm -f "$OUT_FILE"
+              
+              wget -q \
+                --header="User-Agent: $CHROME_127_UA" \
+                --header="Referer: $REFERER" \
+                --header="Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8" \
+                --header="Accept-Language: en-US,en;q=0.9" \
+                --header="Sec-Ch-Ua: \"Google Chrome\";v=\"127\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"127\"" \
+                --header="Sec-Ch-Ua-Mobile: ?0" \
+                --header="Sec-Ch-Ua-Platform: \"Windows\"" \
+                --header="Upgrade-Insecure-Requests: 1" \
+                -O "$OUT_FILE" "$URL" < /dev/null 2>&1
+            fi
+            
+            # Verify download
             if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
               FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
@@ -565,7 +759,14 @@ jobs:
           # Redownload episodes that need it
           if [ "$NEEDS_REDOWNLOAD" = true ]; then
             echo ""
-            echo "🔄 Redownloading episodes with yt-dlp with Chrome impersonation..."
+            echo "🔄 Redownloading episodes with Chrome impersonation for Cloudflare..."
+            
+            # Define Chrome version-specific user agents
+            CHROME_127_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+            CHROME_126_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            CHROME_125_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            
+            REFERER="https://dramafren.org/"
             
             # Read URLs into array
             mapfile -t URL_ARRAY < urls.txt
@@ -578,18 +779,86 @@ jobs:
               if [ $URL_INDEX -ge 0 ] && [ $URL_INDEX -lt ${#URL_ARRAY[@]} ]; then
                 URL="${URL_ARRAY[$URL_INDEX]}"
                 echo ""
-                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp with Chrome impersonation..."
+                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with Chrome impersonation..."
                 echo "📎 URL: $URL"
                 
                 # Remove the bad file
                 rm -f "$FILE"
                 
-                # Redownload with yt-dlp specifically to ensure video+audio with Chrome impersonation
-                yt-dlp -f "bestvideo+bestaudio/best" \
-                  --impersonate chrome \
-                  --extractor-args "hls:prefer_native" \
-                  --no-progress --no-warnings \
-                  -o "$FILE" "$URL" < /dev/null 2>&1
+                # Try multiple impersonation targets starting with newest
+                DOWNLOADED=false
+                for IMPERSONATE_TARGET in "chrome-127" "chrome-126" "chrome-125" "chrome-124" "chrome-123" "chrome-122" "chrome-121" "chrome-120"; do
+                  echo "🔄 Trying impersonation: $IMPERSONATE_TARGET"
+                  
+                  # Select appropriate User-Agent
+                  case $IMPERSONATE_TARGET in
+                    "chrome-127") UA="$CHROME_127_UA" ;;
+                    "chrome-126") UA="$CHROME_126_UA" ;;
+                    "chrome-125") UA="$CHROME_125_UA" ;;
+                    *) UA="$CHROME_127_UA" ;;
+                  esac
+                  
+                  yt-dlp -f "bestvideo+bestaudio/best" \
+                    --impersonate "$IMPERSONATE_TARGET" \
+                    --extractor-args "hls:prefer_native" \
+                    --add-header "User-Agent:$UA" \
+                    --add-header "Referer:$REFERER" \
+                    --add-header "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7" \
+                    --add-header "Accept-Language:en-US,en;q=0.9" \
+                    --add-header "Accept-Encoding:gzip, deflate, br" \
+                    --add-header "Connection:keep-alive" \
+                    --add-header "Sec-Ch-Ua:\"Google Chrome\";v=\"127\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"127\"" \
+                    --add-header "Sec-Ch-Ua-Mobile:?0" \
+                    --add-header "Sec-Ch-Ua-Platform:\"Windows\"" \
+                    --add-header "Sec-Fetch-Dest:document" \
+                    --add-header "Sec-Fetch-Mode:navigate" \
+                    --add-header "Sec-Fetch-Site:none" \
+                    --add-header "Sec-Fetch-User:?1" \
+                    --add-header "Upgrade-Insecure-Requests:1" \
+                    --add-header "Cache-Control:max-age=0" \
+                    --no-check-certificate \
+                    --no-progress --no-warnings \
+                    -o "$FILE" "$URL" < /dev/null 2>&1
+                  
+                  if [ -f "$FILE" ] && [ -s "$FILE" ]; then
+                    echo "✅ Successfully downloaded with impersonation: $IMPERSONATE_TARGET"
+                    DOWNLOADED=true
+                    break
+                  else
+                    rm -f "$FILE"
+                  fi
+                done
+                
+                # If impersonation failed, try with headers only
+                if [ "$DOWNLOADED" = false ]; then
+                  echo "⚠️ Impersonation failed, trying yt-dlp with browser headers only..."
+                  yt-dlp -f "bestvideo+bestaudio/best" \
+                    --add-header "User-Agent:$CHROME_127_UA" \
+                    --add-header "Referer:$REFERER" \
+                    --add-header "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8" \
+                    --add-header "Accept-Language:en-US,en;q=0.9" \
+                    --add-header "Accept-Encoding:gzip, deflate, br" \
+                    --add-header "Connection:keep-alive" \
+                    --no-check-certificate \
+                    --no-progress --no-warnings \
+                    -o "$FILE" "$URL" < /dev/null 2>&1
+                fi
+                
+                # If yt-dlp fails, try wget
+                if [ ! -f "$FILE" ] || [ ! -s "$FILE" ]; then
+                  echo "⚠️ yt-dlp failed, trying wget..."
+                  rm -f "$FILE"
+                  wget -q \
+                    --header="User-Agent: $CHROME_127_UA" \
+                    --header="Referer: $REFERER" \
+                    --header="Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8" \
+                    --header="Accept-Language: en-US,en;q=0.9" \
+                    --header="Sec-Ch-Ua: \"Google Chrome\";v=\"127\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"127\"" \
+                    --header="Sec-Ch-Ua-Mobile: ?0" \
+                    --header="Sec-Ch-Ua-Platform: \"Windows\"" \
+                    --header="Upgrade-Insecure-Requests: 1" \
+                    -O "$FILE" "$URL" < /dev/null 2>&1
+                fi
                 
                 if [ -f "$FILE" ] && [ -s "$FILE" ]; then
                   # Verify the new file has video
