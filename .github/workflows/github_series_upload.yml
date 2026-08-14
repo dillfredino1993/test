@@ -45,10 +45,9 @@ jobs:
           sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool
           
           pip3 install --upgrade pip
-          pip3 install yt-dlp  # Install yt-dlp first
+          pip3 install yt-dlp
           pip3 install telethon qrcode requests aiohttp python-socks[asyncio]
           
-          # Verify yt-dlp installation
           echo "✅ yt-dlp version: $(yt-dlp --version)"
           python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')"
           
@@ -66,25 +65,20 @@ jobs:
           
           mkdir -p downloads && cd downloads
           
-          # Write the payload to a file using the env variable
           echo "$CLIENT_PAYLOAD" > payload.json
           
-          # Extract series names and URLs from the series array
           jq -r '.series[]?.name // empty' payload.json > names.txt
           jq -r '.series[]?.url // empty' payload.json > urls.txt
           
-          # If no series array, try video_urls or video_url
           if [ ! -s names.txt ] || [ ! -s urls.txt ]; then
             echo "⚠️ No series array found, trying video_urls..."
             jq -r '.video_urls[]? // empty' payload.json > urls.txt
-            # If no names provided, use URL as name
             if [ ! -s names.txt ]; then
               echo "⚠️ No names provided, using URLs as names"
               cp urls.txt names.txt
             fi
           fi
           
-          # If still no URLs, try video_url
           if [ ! -s urls.txt ]; then
             jq -r '.video_url // empty' payload.json > urls.txt
             if [ -s urls.txt ]; then
@@ -92,7 +86,6 @@ jobs:
             fi
           fi
           
-          # Remove empty lines
           sed -i '/^$/d' urls.txt 2>/dev/null || true
           sed -i '/^$/d' names.txt 2>/dev/null || true
           
@@ -100,7 +93,6 @@ jobs:
           echo "📋 Series to process:"
           echo "========================================="
           
-          # Display the series data
           paste -d '|' names.txt urls.txt 2>/dev/null | while IFS='|' read -r name url; do
             if [ -n "$name" ] && [ -n "$url" ]; then
               echo "📺 Series: $name"
@@ -135,7 +127,6 @@ jobs:
           SERIES_INDEX=1
           FAILED_DOWNLOADS=""
           
-          # Read URLs and names into arrays
           mapfile -t URL_ARRAY < urls.txt
           mapfile -t NAME_ARRAY < names.txt
           
@@ -143,7 +134,6 @@ jobs:
             URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [ -z "$URL" ]; then continue; fi
             
-            # Get series name
             if [ ${#NAME_ARRAY[@]} -ge $SERIES_INDEX ]; then
               SERIES_NAME="${NAME_ARRAY[$((SERIES_INDEX-1))]}"
               SERIES_NAME=$(echo "$SERIES_NAME" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
@@ -151,7 +141,7 @@ jobs:
               SERIES_NAME="Series_${SERIES_INDEX}"
             fi
             
-            # Clean filename
+            # Clean filename - replace spaces with underscores for filesystem
             CLEAN_NAME=$(echo "$SERIES_NAME" | sed -e 's/[\/:*?"<>|]/_/g' -e 's/^ *//' -e 's/ *$//' -e 's/ /_/g')
             OUT_FILE="${CLEAN_NAME}.mp4"
             
@@ -162,10 +152,8 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # PRIMARY: Use yt-dlp for all downloads
             echo "🎬 Using yt-dlp as primary downloader..."
             
-            # Try yt-dlp with best quality
             yt-dlp -f "bestvideo+bestaudio/best" \
               --merge-output-format mp4 \
               --no-progress --no-warnings \
@@ -174,12 +162,10 @@ jobs:
               -o "$OUT_FILE" \
               "$URL" < /dev/null 2>&1
             
-            # If yt-dlp failed or file is too small, try with different options
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
               echo "⚠️ yt-dlp first attempt failed, trying with different options..."
               rm -f "$OUT_FILE"
               
-              # Try yt-dlp with HLS native
               yt-dlp -f "bestvideo+bestaudio/best" \
                 --merge-output-format mp4 \
                 --hls-prefer-native \
@@ -190,12 +176,10 @@ jobs:
                 "$URL" < /dev/null 2>&1
             fi
             
-            # If still failed, try with cookies and referer
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
               echo "⚠️ yt-dlp second attempt failed, trying with referer..."
               rm -f "$OUT_FILE"
               
-              # Extract domain for referer
               DOMAIN=$(echo "$URL" | sed -E 's/(https?:\/\/[^\/]*).*/\1/')
               
               yt-dlp -f "bestvideo+bestaudio/best" \
@@ -209,7 +193,6 @@ jobs:
                 "$URL" < /dev/null 2>&1
             fi
             
-            # FALLBACK 1: If yt-dlp completely fails, try aria2c for direct downloads
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
               echo "⚠️ yt-dlp failed, trying aria2c as fallback..."
               rm -f "$OUT_FILE"
@@ -220,7 +203,6 @@ jobs:
                 -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
             fi
             
-            # FALLBACK 2: Try curl with cookies
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
               echo "⚠️ aria2c failed, trying curl as final fallback..."
               rm -f "$OUT_FILE"
@@ -271,7 +253,6 @@ jobs:
           echo "✅ All $TOTAL_SERIES series downloaded successfully!"
           echo "========================================="
           
-          # List downloaded files with sizes
           echo ""
           echo "📊 Downloaded files:"
           for f in *.mp4; do
@@ -294,7 +275,6 @@ jobs:
           echo "⚡ Using VERY FAST compression preset"
           echo "========================================="
           
-          # Create compression script
           cat > compress_series.py << 'EOFCOMPRESS'
           import os
           import sys
@@ -303,7 +283,6 @@ jobs:
           import time
           
           def get_video_info(file_path):
-              """Get video duration using ffprobe"""
               try:
                   cmd = [
                       "ffprobe", "-v", "error",
@@ -319,9 +298,6 @@ jobs:
                   return 0
           
           def compress_to_under_1_8gb(file_path):
-              """
-              Compress video to under 1.8GB using FFmpeg with VERY FAST preset
-              """
               print(f"  ⚡ Compressing with VERY FAST preset...")
               
               file_size_bytes = os.path.getsize(file_path)
@@ -333,7 +309,6 @@ jobs:
                   print(f"  ✅ File already under 1.8GB, skipping compression")
                   return True
               
-              # Get duration
               duration = get_video_info(file_path)
               print(f"  📊 Duration: {duration:.1f}s")
               
@@ -341,11 +316,9 @@ jobs:
                   print(f"  ⚠️ Could not determine duration, using 1800s estimate")
                   duration = 1800
               
-              # Calculate target bitrate for 1.7GB (leaving some margin)
               TARGET_SIZE_MB = 1700
               target_bitrate = int((TARGET_SIZE_MB * 8 * 1024) / duration)
               
-              # Ensure bitrate is reasonable
               if target_bitrate < 300:
                   target_bitrate = 300
               elif target_bitrate > 4000:
@@ -356,7 +329,6 @@ jobs:
               base_name = os.path.splitext(file_path)[0]
               temp_file = f"{base_name}_compressed.mp4"
               
-              # Use VERY FAST preset for maximum speed
               cmd = [
                   "ffmpeg", "-y",
                   "-i", file_path,
@@ -394,11 +366,9 @@ jobs:
                       else:
                           print(f"  ⚠️ Still too large: {new_size_gb:.2f}GB")
                           
-                          # Try more aggressive compression with CRF
                           print(f"  🔄 Trying CRF-based compression...")
                           temp_file2 = f"{base_name}_crf.mp4"
                           
-                          # Try different CRF values
                           for crf in [28, 30, 32]:
                               print(f"    Trying CRF {crf}...")
                               cmd2 = [
@@ -428,7 +398,6 @@ jobs:
                                   else:
                                       os.remove(temp_file2)
                           
-                          # Clean up temp file
                           if os.path.exists(temp_file):
                               os.remove(temp_file)
                           return False
@@ -443,7 +412,6 @@ jobs:
                   print(f"  ❌ Compression error: {e}")
                   return False
               finally:
-                  # Cleanup temp files
                   for f in [temp_file, f"{base_name}_crf.mp4"]:
                       if os.path.exists(f):
                           try: os.remove(f)
@@ -461,7 +429,6 @@ jobs:
               sys.exit(0 if success else 1)
           EOFCOMPRESS
           
-          # Get list of all series files
           SERIES_FILES=$(ls -1 *.mp4 2>/dev/null)
           TOTAL_SERIES=$(echo "$SERIES_FILES" | wc -l)
           COMPRESSED_COUNT=0
@@ -473,20 +440,17 @@ jobs:
           for f in $SERIES_FILES; do
             if [ ! -f "$f" ]; then continue; fi
             
-            # Get file size properly using bc
             FILE_SIZE_BYTES=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
             FILE_SIZE_MB=$(echo "scale=2; $FILE_SIZE_BYTES / 1024 / 1024" | bc 2>/dev/null || echo "0")
             FILE_SIZE_GB=$(echo "scale=2; $FILE_SIZE_BYTES / 1024 / 1024 / 1024" | bc 2>/dev/null || echo "0")
             
             echo "📹 $f: ${FILE_SIZE_MB}MB (${FILE_SIZE_GB}GB)"
             
-            # Convert to integer for comparison (remove decimal)
             FILE_SIZE_MB_INT=$(echo "$FILE_SIZE_MB" | cut -d'.' -f1)
             
             if [ -n "$FILE_SIZE_MB_INT" ] && [ "$FILE_SIZE_MB_INT" -gt 1800 ] 2>/dev/null; then
               echo "⚠️  $f exceeds 1.8GB (${FILE_SIZE_GB}GB), compressing..."
               
-              # Compress to under 1.8GB
               if python3 compress_series.py "$f" < /dev/null; then
                 COMPRESSED_COUNT=$((COMPRESSED_COUNT + 1))
                 NEW_SIZE_BYTES=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
@@ -519,7 +483,6 @@ jobs:
           echo "✅ All series processed successfully!"
           echo "========================================="
           
-          # Show final file sizes
           echo ""
           echo "📊 Final series sizes:"
           for f in *.mp4; do
@@ -541,7 +504,6 @@ jobs:
           echo "🔍 VERIFYING SERIES FILES"
           echo "========================================="
           
-          # Get all MP4 files
           TOTAL_FILES=$(ls -1 *.mp4 2>/dev/null | wc -l)
           FAILED_FILES=""
           
@@ -553,14 +515,12 @@ jobs:
             
             echo "🔍 Checking: $f"
             
-            # Get file size properly using bc
             FILE_SIZE_BYTES=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
             FILE_SIZE_MB=$(echo "scale=2; $FILE_SIZE_BYTES / 1024 / 1024" | bc 2>/dev/null || echo "0")
             FILE_SIZE_GB=$(echo "scale=2; $FILE_SIZE_BYTES / 1024 / 1024 / 1024" | bc 2>/dev/null || echo "0")
             
             echo "   📊 Size: ${FILE_SIZE_MB} MB (${FILE_SIZE_GB} GB)"
             
-            # Check if file exceeds 2GB (Telegram limit)
             FILE_SIZE_MB_INT=$(echo "$FILE_SIZE_MB" | cut -d'.' -f1)
             if [ -n "$FILE_SIZE_MB_INT" ] && [ "$FILE_SIZE_MB_INT" -gt 2000 ] 2>/dev/null; then
               echo "   ❌ File exceeds 2GB (${FILE_SIZE_MB}MB) - Telegram limit!"
@@ -569,26 +529,21 @@ jobs:
               continue
             fi
             
-            # Check if file is valid video - use timeout to avoid hanging
             if timeout 60 ffprobe -v error "$f" 2>/dev/null; then
               echo "   ✅ File is a valid video"
               
-              # Get duration
               DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "0")
               echo "   ⏱️  Duration: ${DURATION}s"
               
-              # Get resolution
               WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null || echo "0")
               HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null || echo "0")
               echo "   📐 Resolution: ${WIDTH}x${HEIGHT}"
             else
-              # Check if file has video stream using a different method
               echo "   ⚠️ ffprobe check failed or timed out, trying mediainfo..."
               
               if mediainfo "$f" 2>/dev/null | grep -q "Video"; then
                 echo "   ✅ File appears to be a valid video (mediainfo)"
                 
-                # Try to get duration from mediainfo
                 DURATION=$(mediainfo --Inform="General;%Duration%" "$f" 2>/dev/null || echo "0")
                 if [ -n "$DURATION" ] && [ "$DURATION" != "0" ]; then
                   DURATION_SEC=$(echo "scale=0; $DURATION / 1000" | bc 2>/dev/null || echo "0")
@@ -767,7 +722,6 @@ jobs:
               f.write(f"{datetime.datetime.now()}: Starting series uploads\n")
 
           def progress_callback(current, total):
-              """Progress callback for upload"""
               percent = (current / total) * 100
               mb_uploaded = current / (1024 * 1024)
               mb_total = total / (1024 * 1024)
@@ -803,7 +757,6 @@ jobs:
               return None
 
           async def fast_upload_file(client, file_path, progress_callback=None):
-              """Custom fast upload implementation using parallel chunk uploading"""
               if not os.path.exists(file_path):
                   print(f"❌ File not found: {file_path}")
                   return None
@@ -824,7 +777,6 @@ jobs:
                   raise
 
           async def send_file_with_thumb(client, entity, file_path, caption):
-              # Check if file exists
               if not os.path.exists(file_path):
                   print(f"❌ File not found: {file_path}")
                   return False, None
@@ -902,8 +854,16 @@ jobs:
                       try: os.remove(thumb)
                       except: pass
 
+          def format_series_name(filename):
+              """Convert filename with underscores back to spaces for display"""
+              # Remove .mp4 extension
+              name = os.path.splitext(filename)[0]
+              # Replace underscores with spaces
+              name = name.replace('_', ' ')
+              return name
+
           def extract_date_and_label_from_name(name):
-              """Extract date and label from series name like [2026-07-17]-[BLLA]-in His Cold Eyes"""
+              """Extract date and label from series name"""
               date_pattern = r'\[([0-9]{4}-[0-9]{2}-[0-9]{2})\]'
               label_pattern = r'\]-\[([A-Z]+)\]'
               
@@ -940,7 +900,6 @@ jobs:
               return hashtags
 
           async def upload_series_files(client, entity):
-              # Get all MP4 files sorted
               series_files = sorted(glob.glob("*.mp4"))
               
               if not series_files:
@@ -963,9 +922,11 @@ jobs:
                       print(f"❌ {os.path.basename(file_path)} exceeds 2GB! Skipping.")
                       continue
                   
-                  # Get the series name from the filename (remove .mp4 extension)
+                  # Get the formatted series name with spaces instead of underscores
                   file_basename = os.path.basename(file_path)
-                  series_name = os.path.splitext(file_basename)[0]
+                  series_name = format_series_name(file_basename)
+                  
+                  print(f"📝 Formatted name: {series_name}")
                   
                   # Extract date and label from the series name
                   date_str, label_str = extract_date_and_label_from_name(series_name)
@@ -974,7 +935,7 @@ jobs:
                   hashtags = generate_hashtags(date_str, label_str)
                   hashtag_str = " ".join(hashtags)
                   
-                  # Build caption
+                  # Build caption with properly formatted name
                   caption = f"{series_name}\n{hashtag_str}"
                   
                   print(f"📝 Caption:")
@@ -1008,7 +969,6 @@ jobs:
                   except Exception as e:
                       print(f"❌ {os.path.basename(file_path)} error: {e}")
                   
-                  # Small delay between uploads to avoid rate limiting
                   if idx < total_files:
                       await asyncio.sleep(2)
               
@@ -1070,7 +1030,6 @@ jobs:
           echo "⏳ MONITORING UPLOAD PROGRESS"
           echo "========================================="
           
-          # Function to get upload progress
           get_upload_progress() {
             if [ -f "series_upload_complete.txt" ]; then
               echo "100|complete"
@@ -1078,11 +1037,8 @@ jobs:
             fi
             
             if [ -f "series_upload.log" ]; then
-              # Count total files
               local total_files=$(ls -1 *.mp4 2>/dev/null | wc -l)
-              # Count completed files
               local completed=$(grep -c "COMPLETE_" series_upload.log 2>/dev/null || echo "0")
-              # Count currently uploading
               local current=$(grep "STARTING_" series_upload.log 2>/dev/null | tail -1 | grep -oE "[^_]+\.mp4" | head -1)
               
               if [ "$total_files" -gt 0 ]; then
@@ -1096,7 +1052,6 @@ jobs:
             fi
           }
           
-          # Main monitoring loop
           START_TIME=$(date +%s)
           UPLOAD_COMPLETE=false
           
@@ -1106,12 +1061,10 @@ jobs:
           echo ""
           
           while true; do
-            # Check completion
             if [ -f "series_upload_complete.txt" ]; then
               UPLOAD_COMPLETE=true
             fi
             
-            # If complete, break out of loop
             if [ "$UPLOAD_COMPLETE" = true ]; then
               echo ""
               echo "✅ ALL UPLOADS COMPLETED!"
@@ -1122,7 +1075,6 @@ jobs:
             CURRENT_TIME=$(date +%s)
             ELAPSED=$((CURRENT_TIME - START_TIME))
             
-            # Format elapsed time
             if [ $ELAPSED -lt 60 ]; then
               ELAPSED_STR="${ELAPSED}s"
             elif [ $ELAPSED -lt 3600 ]; then
@@ -1139,7 +1091,6 @@ jobs:
             echo "║ ⏱️  Elapsed Time: $(printf "%-40s" "$ELAPSED_STR")║"
             echo "║                                                              ║"
             
-            # Get progress
             PROGRESS_DATA=$(get_upload_progress)
             PERCENT=$(echo "$PROGRESS_DATA" | cut -d'|' -f1)
             COUNT=$(echo "$PROGRESS_DATA" | cut -d'|' -f2)
@@ -1150,7 +1101,6 @@ jobs:
             echo "║ 📹 Series Uploads:                                        ║"
             echo "║    Progress: $(printf "%-51s" "${PERCENT}% (${COUNT} of ${TOTAL_FILES})")║"
             
-            # Create progress bar
             BAR_LENGTH=40
             FILLED=$((PERCENT * BAR_LENGTH / 100))
             BAR=""
@@ -1162,7 +1112,6 @@ jobs:
               echo "║    Current: $(printf "%-49s" "${CURRENT_FILE}")║"
             fi
             
-            # Calculate ETA if we have progress
             if [[ "$COUNT" == *"/"* ]]; then
               COMPLETED=$(echo "$COUNT" | cut -d'/' -f1)
               if [ "$COMPLETED" -gt 0 ] && [ "$ELAPSED" -gt 10 ]; then
@@ -1183,7 +1132,6 @@ jobs:
             echo "║                                                              ║"
             echo "╚══════════════════════════════════════════════════════════════╝"
             
-            # Check for errors
             if [ -f "series_upload.log" ]; then
               if tail -5 series_upload.log 2>/dev/null | grep -q "❌"; then
                 echo ""
@@ -1199,7 +1147,6 @@ jobs:
           echo "✅ ALL UPLOADS COMPLETED SUCCESSFULLY!"
           echo "========================================="
           
-          # Show final logs
           if [ -f "series_upload.log" ]; then
             echo ""
             echo "📋 Final upload log:"
