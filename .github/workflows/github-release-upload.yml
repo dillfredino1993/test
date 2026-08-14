@@ -64,10 +64,10 @@ jobs:
           echo "📥 Installing curl_cffi for Cloudflare bypass..."
           pip3 install curl-cffi
           
-          # Install yt-dlp with curl_cffi support
-          echo "📥 Installing yt-dlp with curl_cffi support..."
+          # Install yt-dlp (without impersonation)
+          echo "📥 Installing yt-dlp..."
           pip3 uninstall -y yt-dlp 2>/dev/null || true
-          pip3 install yt-dlp[curl_cffi]
+          pip3 install yt-dlp
           
           # Install additional dependencies
           pip3 install brotli websockets pycryptodome certifi
@@ -77,12 +77,9 @@ jobs:
           yt-dlp --version
           
           echo ""
-          echo "🔍 Available impersonation targets:"
-          yt-dlp --list-impersonate-targets || echo "⚠️ Impersonation not available"
-          
-          echo ""
           echo "✅ Testing curl_cffi installation:"
           python3 -c "from curl_cffi import requests; print('curl_cffi installed successfully')"
+          python3 -c "from curl_cffi.requests import Session; s = Session(impersonate='chrome120'); print('curl_cffi Session with impersonation works')"
           
           python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')"
           
@@ -156,7 +153,7 @@ jobs:
           
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
-      - name: Download All Episodes First with Generic Impersonation
+      - name: Download All Episodes First with curl_cffi
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -165,7 +162,7 @@ jobs:
           cd downloads
           
           echo "========================================="
-          echo "📥 DOWNLOADING ALL EPISODES WITH GENERIC IMPERSONATION"
+          echo "📥 DOWNLOADING ALL EPISODES WITH CURL_CFFI"
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Total Episodes: $(cat urls.txt | wc -l)"
@@ -194,35 +191,89 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # Try yt-dlp with generic impersonation
-            echo "🌐 Using yt-dlp with generic impersonation..."
+            # Try curl_cffi Python script for Cloudflare bypass
+            echo "🌐 Using curl_cffi for Cloudflare bypass..."
             
-            # Try different impersonation targets - generic ones first
-            for IMPERSONATE_TARGET in "generic" "chrome" "edge" "firefox" "safari"; do
-              echo "🔄 Trying impersonation: $IMPERSONATE_TARGET"
-              
-              yt-dlp -f "bestvideo+bestaudio/best" \
-                --impersonate "$IMPERSONATE_TARGET" \
-                --extractor-args "hls:prefer_native" \
-                --no-check-certificate \
-                --no-progress --no-warnings \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
-              
-              # Check if download succeeded
-              if [ -f "$OUT_FILE" ] && [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -gt 100000 ]; then
-                echo "✅ Successfully downloaded with impersonation: $IMPERSONATE_TARGET"
-                break
-              else
-                rm -f "$OUT_FILE"
-                echo "⚠️ Failed with $IMPERSONATE_TARGET, trying next target..."
-              fi
-            done
+            cat > download_with_curl_cffi.py << 'EOF'
+            import sys
+            import os
+            from curl_cffi import requests
+            from curl_cffi.requests import Session
+            import time
             
-            # If impersonation failed, try yt-dlp without impersonation
-            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
-              echo "⚠️ Impersonation failed, trying yt-dlp without impersonation..."
+            url = sys.argv[1]
+            output = sys.argv[2]
+            
+            # Try different impersonation targets
+            targets = ['chrome120', 'chrome119', 'chrome118', 'chrome117', 'chrome116', 'chrome115', 'chrome114', 'chrome113', 'chrome112', 'chrome111', 'chrome110', 'edge', 'firefox']
+            
+            for target in targets:
+                try:
+                    print(f"🔄 Trying curl_cffi impersonation: {target}")
+                    
+                    # Create session with impersonation
+                    session = Session(impersonate=target)
+                    
+                    # Set headers
+                    session.headers.update({
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Accept-Encoding': 'gzip, deflate, br',
+                        'Connection': 'keep-alive',
+                        'Upgrade-Insecure-Requests': '1',
+                        'Sec-Fetch-Dest': 'document',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-Site': 'none',
+                        'Sec-Fetch-User': '?1'
+                    })
+                    
+                    # Make request with timeout
+                    response = session.get(url, timeout=60, allow_redirects=True, verify=False)
+                    
+                    # Check if we got a valid response
+                    if response.status_code == 200 and len(response.content) > 100000:
+                        # Save the file
+                        with open(output, 'wb') as f:
+                            f.write(response.content)
+                        print(f"✅ Downloaded with curl_cffi using {target}")
+                        sys.exit(0)
+                    else:
+                        print(f"⚠️ Response too small or status {response.status_code}")
+                        continue
+                        
+                except Exception as e:
+                    print(f"⚠️ Failed with {target}: {e}")
+                    continue
+            
+            # If all targets fail, try a simple request
+            try:
+                print("🔄 Trying simple request without impersonation...")
+                response = requests.get(url, timeout=60, allow_redirects=True, verify=False)
+                if response.status_code == 200 and len(response.content) > 100000:
+                    with open(output, 'wb') as f:
+                        f.write(response.content)
+                    print(f"✅ Downloaded with simple request")
+                    sys.exit(0)
+            except Exception as e:
+                print(f"⚠️ Simple request failed: {e}")
+            
+            # If everything fails, exit with error
+            print("❌ All download methods with curl_cffi failed")
+            sys.exit(1)
+            EOF
+            
+            # Run the curl_cffi download script
+            python3 download_with_curl_cffi.py "$URL" "$OUT_FILE" < /dev/null 2>&1
+            
+            # Check if curl_cffi succeeded
+            if [ -f "$OUT_FILE" ] && [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -gt 100000 ]; then
+              echo "✅ curl_cffi download successful"
+            else
               rm -f "$OUT_FILE"
+              echo "⚠️ curl_cffi failed, trying yt-dlp..."
               
+              # Try yt-dlp without impersonation
               yt-dlp -f "bestvideo+bestaudio/best" \
                 --extractor-args "hls:prefer_native" \
                 --no-check-certificate \
@@ -625,7 +676,7 @@ jobs:
           # Redownload episodes that need it
           if [ "$NEEDS_REDOWNLOAD" = true ]; then
             echo ""
-            echo "🔄 Redownloading episodes with generic impersonation..."
+            echo "🔄 Redownloading episodes with curl_cffi..."
             
             # Read URLs into array
             mapfile -t URL_ARRAY < urls.txt
@@ -638,36 +689,88 @@ jobs:
               if [ $URL_INDEX -ge 0 ] && [ $URL_INDEX -lt ${#URL_ARRAY[@]} ]; then
                 URL="${URL_ARRAY[$URL_INDEX]}"
                 echo ""
-                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with generic impersonation..."
+                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with curl_cffi..."
                 echo "📎 URL: $URL"
                 
                 # Remove the bad file
                 rm -f "$FILE"
                 
-                # Try generic impersonation targets
-                DOWNLOADED=false
-                for IMPERSONATE_TARGET in "generic" "chrome" "edge" "firefox" "safari"; do
-                  echo "🔄 Trying impersonation: $IMPERSONATE_TARGET"
-                  
-                  yt-dlp -f "bestvideo+bestaudio/best" \
-                    --impersonate "$IMPERSONATE_TARGET" \
-                    --extractor-args "hls:prefer_native" \
-                    --no-check-certificate \
-                    --no-progress --no-warnings \
-                    -o "$FILE" "$URL" < /dev/null 2>&1
-                  
-                  if [ -f "$FILE" ] && [ -s "$FILE" ]; then
-                    echo "✅ Successfully downloaded with impersonation: $IMPERSONATE_TARGET"
-                    DOWNLOADED=true
-                    break
-                  else
-                    rm -f "$FILE"
-                  fi
-                done
+                # Try curl_cffi Python script
+                cat > redownload_with_curl_cffi.py << 'EOF'
+                import sys
+                import os
+                from curl_cffi import requests
+                from curl_cffi.requests import Session
+                import time
                 
-                # If impersonation failed, try without
-                if [ "$DOWNLOADED" = false ]; then
-                  echo "⚠️ Impersonation failed, trying yt-dlp without impersonation..."
+                url = sys.argv[1]
+                output = sys.argv[2]
+                
+                # Try different impersonation targets
+                targets = ['chrome120', 'chrome119', 'chrome118', 'chrome117', 'chrome116', 'chrome115', 'chrome114', 'chrome113', 'chrome112', 'chrome111', 'chrome110', 'edge', 'firefox']
+                
+                for target in targets:
+                    try:
+                        print(f"🔄 Trying curl_cffi impersonation: {target}")
+                        
+                        # Create session with impersonation
+                        session = Session(impersonate=target)
+                        
+                        # Set headers
+                        session.headers.update({
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            'Accept-Encoding': 'gzip, deflate, br',
+                            'Connection': 'keep-alive',
+                            'Upgrade-Insecure-Requests': '1',
+                            'Sec-Fetch-Dest': 'document',
+                            'Sec-Fetch-Mode': 'navigate',
+                            'Sec-Fetch-Site': 'none',
+                            'Sec-Fetch-User': '?1'
+                        })
+                        
+                        # Make request with timeout
+                        response = session.get(url, timeout=60, allow_redirects=True, verify=False)
+                        
+                        # Check if we got a valid response
+                        if response.status_code == 200 and len(response.content) > 100000:
+                            # Save the file
+                            with open(output, 'wb') as f:
+                                f.write(response.content)
+                            print(f"✅ Downloaded with curl_cffi using {target}")
+                            sys.exit(0)
+                        else:
+                            print(f"⚠️ Response too small or status {response.status_code}")
+                            continue
+                            
+                    except Exception as e:
+                        print(f"⚠️ Failed with {target}: {e}")
+                        continue
+                
+                # If all targets fail, try a simple request
+                try:
+                    print("🔄 Trying simple request without impersonation...")
+                    response = requests.get(url, timeout=60, allow_redirects=True, verify=False)
+                    if response.status_code == 200 and len(response.content) > 100000:
+                        with open(output, 'wb') as f:
+                            f.write(response.content)
+                        print(f"✅ Downloaded with simple request")
+                        sys.exit(0)
+                except Exception as e:
+                    print(f"⚠️ Simple request failed: {e}")
+                
+                # If everything fails, exit with error
+                print("❌ All download methods with curl_cffi failed")
+                sys.exit(1)
+                EOF
+                
+                # Run the curl_cffi download script
+                python3 redownload_with_curl_cffi.py "$URL" "$FILE" < /dev/null 2>&1
+                
+                # If curl_cffi failed, try yt-dlp
+                if [ ! -f "$FILE" ] || [ ! -s "$FILE" ]; then
+                  echo "⚠️ curl_cffi failed, trying yt-dlp..."
                   yt-dlp -f "bestvideo+bestaudio/best" \
                     --extractor-args "hls:prefer_native" \
                     --no-check-certificate \
@@ -675,9 +778,9 @@ jobs:
                     -o "$FILE" "$URL" < /dev/null 2>&1
                 fi
                 
-                # If all methods failed, try wget
+                # If yt-dlp fails, try wget
                 if [ ! -f "$FILE" ] || [ ! -s "$FILE" ]; then
-                  echo "⚠️ All download methods failed, trying wget..."
+                  echo "⚠️ yt-dlp failed, trying wget..."
                   rm -f "$FILE"
                   wget -q -O "$FILE" "$URL" < /dev/null 2>&1
                 fi
@@ -2343,7 +2446,8 @@ jobs:
               BAR_LENGTH=40
               FILLED=$(echo "scale=0; ($MERGED_PERCENT * $BAR_LENGTH) / 100" | bc 2>/dev/null || echo "0")
               BAR=""
-              for ((i=0; i<$FILLED && i<$BAR_LENGTH; i++)); do BAR="${BAR}█"; done              for ((i=$FILLED; i<$BAR_LENGTH; i++)); do BAR="${BAR}░"; done
+              for ((i=0; i<$FILLED && i<$BAR_LENGTH; i++)); do BAR="${BAR}█"; done
+              for ((i=$FILLED; i<$BAR_LENGTH; i++)); do BAR="${BAR}░"; done
               echo "║    [${BAR}] ║"
               
               # ETA calculation
