@@ -35,17 +35,21 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg & Tools
+      - name: Install FFmpeg & Tools with yt-dlp
         run: |
           echo "========================================="
-          echo "🔧 INSTALLING TOOLS"
+          echo "🔧 INSTALLING TOOLS WITH YT-DLP"
           echo "========================================="
           
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool
+          
           pip3 install --upgrade pip
-          pip3 install telethon qrcode yt-dlp requests
-          pip3 install aiohttp python-socks[asyncio]
+          pip3 install yt-dlp  # Install yt-dlp first
+          pip3 install telethon qrcode requests aiohttp python-socks[asyncio]
+          
+          # Verify yt-dlp installation
+          echo "✅ yt-dlp version: $(yt-dlp --version)"
           python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')"
           
           echo "========================================="
@@ -117,12 +121,12 @@ jobs:
           echo "✅ Found $TOTAL_SERIES series to download"
           echo "========================================="
 
-      - name: Download All Series
+      - name: Download All Series with yt-dlp
         run: |
           cd downloads
           
           echo "========================================="
-          echo "📥 DOWNLOADING ALL SERIES"
+          echo "📥 DOWNLOADING ALL SERIES WITH YT-DLP"
           echo "========================================="
           echo "📊 Total Series: $(cat urls.txt | wc -l)"
           echo "========================================="
@@ -158,27 +162,74 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # Download the series file
-            if [[ "$URL" == *".m3u8"* ]]; then
-              echo "📺 HLS stream - Using yt-dlp"
-              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts \
+            # PRIMARY: Use yt-dlp for all downloads
+            echo "🎬 Using yt-dlp as primary downloader..."
+            
+            # Try yt-dlp with best quality
+            yt-dlp -f "bestvideo+bestaudio/best" \
+              --merge-output-format mp4 \
+              --no-progress --no-warnings \
+              --no-check-certificate \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              -o "$OUT_FILE" \
+              "$URL" < /dev/null 2>&1
+            
+            # If yt-dlp failed or file is too small, try with different options
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ yt-dlp first attempt failed, trying with different options..."
+              rm -f "$OUT_FILE"
+              
+              # Try yt-dlp with HLS native
+              yt-dlp -f "bestvideo+bestaudio/best" \
+                --merge-output-format mp4 \
+                --hls-prefer-native \
                 --no-progress --no-warnings \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
-            else
-              echo "🎬 Direct file - Using aria2c"
-              aria2c -x 16 -s 16 -k 1M --continue=true \
-                --console-log-level=error \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null || \
-              curl -sSL "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
+                --no-check-certificate \
+                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                -o "$OUT_FILE" \
+                "$URL" < /dev/null 2>&1
             fi
             
-            # If download failed or file is too small, try yt-dlp as fallback
+            # If still failed, try with cookies and referer
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
-              echo "⚠️ Initial download failed or file too small, trying yt-dlp..."
+              echo "⚠️ yt-dlp second attempt failed, trying with referer..."
               rm -f "$OUT_FILE"
+              
+              # Extract domain for referer
+              DOMAIN=$(echo "$URL" | sed -E 's/(https?:\/\/[^\/]*).*/\1/')
+              
               yt-dlp -f "bestvideo+bestaudio/best" \
+                --merge-output-format mp4 \
                 --no-progress --no-warnings \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>&1
+                --no-check-certificate \
+                --referer "$DOMAIN" \
+                --add-header "Origin:$DOMAIN" \
+                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                -o "$OUT_FILE" \
+                "$URL" < /dev/null 2>&1
+            fi
+            
+            # FALLBACK 1: If yt-dlp completely fails, try aria2c for direct downloads
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ yt-dlp failed, trying aria2c as fallback..."
+              rm -f "$OUT_FILE"
+              
+              aria2c -x 16 -s 16 -k 1M --continue=true \
+                --console-log-level=error \
+                --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
+            fi
+            
+            # FALLBACK 2: Try curl with cookies
+            if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
+              echo "⚠️ aria2c failed, trying curl as final fallback..."
+              rm -f "$OUT_FILE"
+              
+              curl -sSL \
+                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                -H "Accept: */*" \
+                -H "Connection: keep-alive" \
+                "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
             fi
             
             if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
