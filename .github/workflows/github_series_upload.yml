@@ -53,6 +53,8 @@ jobs:
           echo "========================================="
 
       - name: Parse URLs and Names from Payload
+        env:
+          CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
           echo "========================================="
           echo "📋 PARSING SERIES DATA"
@@ -60,8 +62,8 @@ jobs:
           
           mkdir -p downloads && cd downloads
           
-          # Extract series data from payload
-          echo '${{ toJson(github.event.client_payload) }}' > payload.json
+          # Write the payload to a file using the env variable
+          echo "$CLIENT_PAYLOAD" > payload.json
           
           # Extract series names and URLs from the series array
           jq -r '.series[]?.name // empty' payload.json > names.txt
@@ -103,7 +105,7 @@ jobs:
             fi
           done
           
-          TOTAL_SERIES=$(cat urls.txt | wc -l)
+          TOTAL_SERIES=$(cat urls.txt 2>/dev/null | wc -l || echo "0")
           echo "📊 Total Series: $TOTAL_SERIES"
           echo "total_series=$TOTAL_SERIES" >> $GITHUB_ENV
           
@@ -288,7 +290,7 @@ jobs:
                   duration = 1800
               
               # Calculate target bitrate for 1.7GB (leaving some margin)
-              TARGET_SIZE_MB = 1700  # 1.7GB target
+              TARGET_SIZE_MB = 1700
               target_bitrate = int((TARGET_SIZE_MB * 8 * 1024) / duration)
               
               # Ensure bitrate is reasonable
