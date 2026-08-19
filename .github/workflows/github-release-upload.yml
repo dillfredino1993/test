@@ -19,6 +19,9 @@ jobs:
   upload:
     runs-on: ubuntu-latest
     
+    # Add timeout for the entire job
+    timeout-minutes: 180
+    
     steps:
       - name: 📋 Series Information & Setup
         run: |
@@ -48,7 +51,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Cache APT packages
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: /var/cache/apt/archives
           key: ${{ runner.os }}-apt-${{ hashFiles('**/apt-packages.txt') }}
@@ -56,14 +59,14 @@ jobs:
             ${{ runner.os }}-apt-
 
       - name: Cache pip packages
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install FFmpeg & Tools (Robust with Mirror Fallbacks)
+      - name: Install FFmpeg & Tools (Azure Mirrors)
         timeout-minutes: 10
         id: install_tools
         run: |
@@ -75,50 +78,6 @@ jobs:
           
           # Set apt options for faster operation
           export DEBIAN_FRONTEND=noninteractive
-          
-          # Function to test if a mirror is working
-          test_mirror() {
-            local mirror="$1"
-            echo "🔍 Testing mirror: $mirror"
-            if curl -s --connect-timeout 5 --max-time 10 "$mirror/dists/jammy/InRelease" > /dev/null 2>&1; then
-              echo "✅ Mirror $mirror is working"
-              return 0
-            else
-              echo "⚠️ Mirror $mirror is not responding"
-              return 1
-            fi
-          }
-          
-          # Function to update sources.list with a working mirror
-          update_mirror() {
-            local mirror="$1"
-            echo "🔄 Updating to mirror: $mirror"
-            sudo sed -i "s|http://archive.ubuntu.com/ubuntu|$mirror|g" /etc/apt/sources.list
-            sudo sed -i "s|http://us.archive.ubuntu.com/ubuntu|$mirror|g" /etc/apt/sources.list
-            sudo sed -i "s|http://security.ubuntu.com/ubuntu|$mirror|g" /etc/apt/sources.list
-            sudo sed -i "s|https://archive.ubuntu.com/ubuntu|$mirror|g" /etc/apt/sources.list
-            sudo sed -i "s|https://security.ubuntu.com/ubuntu|$mirror|g" /etc/apt/sources.list
-          }
-          
-          # List of Ubuntu mirrors (ordered by reliability)
-          MIRRORS=(
-            "http://archive.ubuntu.com/ubuntu"           # Main
-            "http://us.archive.ubuntu.com/ubuntu"        # US
-            "http://mirrors.kernel.org/ubuntu"           # Kernel.org
-            "http://mirror.rackspace.com/ubuntu"         # Rackspace
-            "http://ubuntu.mirror.constant.com"          # Constant
-            "http://mirror.steadfast.net/ubuntu"         # Steadfast
-            "http://mirrors.liquidweb.com/ubuntu"        # Liquid Web
-            "http://mirror.rit.edu/ubuntu"               # RIT
-            "http://mirror.fcix.net/ubuntu"              # FCIX
-            "http://mirrors.advancedhosters.com/ubuntu"  # Advanced Hosters
-            "http://ubuntu.osuosl.org/ubuntu"            # OSU OSL
-            "http://mirrors.ocf.berkeley.edu/ubuntu"     # Berkeley
-            "http://mirror.us.leaseweb.net/ubuntu"       # Leaseweb US
-            "http://ftp.utexas.edu/ubuntu"               # UT Austin
-            "http://mirror.cs.princeton.edu/pub/ubuntu"  # Princeton
-            "http://ubuntu.mirror.tudo.net/ubuntu"       # Tudo
-          )
           
           # Function to retry commands with exponential backoff
           retry_cmd() {
@@ -150,97 +109,45 @@ jobs:
             exit 0
           fi
           
-          # Try to find a working mirror
-          echo "🔍 Searching for working Ubuntu mirror..."
-          WORKING_MIRROR=""
+          # Use Azure Ubuntu mirrors (fastest in GitHub Actions)
+          echo "🌐 Using Azure Ubuntu mirrors for faster downloads..."
           
-          # First, try the default mirror
-          if test_mirror "http://archive.ubuntu.com/ubuntu"; then
-            WORKING_MIRROR="http://archive.ubuntu.com/ubuntu"
-          else
-            # Try each mirror in the list
-            for mirror in "${MIRRORS[@]}"; do
-              if test_mirror "$mirror"; then
-                WORKING_MIRROR="$mirror"
-                break
-              fi
-            done
-          fi
-          
-          # If no working mirror found, try a few more specific ones
-          if [ -z "$WORKING_MIRROR" ]; then
-            echo "⚠️ No working mirror found in list, trying known reliable mirrors..."
-            
-            # Try specific reliable mirrors
-            for mirror in "http://mirrors.kernel.org/ubuntu" "http://mirror.rackspace.com/ubuntu" "http://ubuntu.osuosl.org/ubuntu"; do
-              if test_mirror "$mirror"; then
-                WORKING_MIRROR="$mirror"
-                break
-              fi
-            done
-          fi
-          
-          # If still no mirror, use default and hope for the best
-          if [ -z "$WORKING_MIRROR" ]; then
-            echo "⚠️ No working mirror found, using default mirror with retries..."
-            WORKING_MIRROR="http://archive.ubuntu.com/ubuntu"
-          fi
-          
-          echo "✅ Using mirror: $WORKING_MIRROR"
-          
-          # Update sources.list to use the working mirror
-          update_mirror "$WORKING_MIRROR"
-          
-          # Backup sources.list in case we need to restore
+          # Backup original sources.list
           sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
           
-          # Show current sources
-          echo "📋 Current sources.list:"
-          cat /etc/apt/sources.list | head -5
+          # Update to Azure mirrors
+          sudo tee /etc/apt/sources.list > /dev/null << 'EOF'
+          # Azure Ubuntu Mirrors
+          deb http://azure.archive.ubuntu.com/ubuntu/ jammy main restricted universe multiverse
+          deb http://azure.archive.ubuntu.com/ubuntu/ jammy-updates main restricted universe multiverse
+          deb http://azure.archive.ubuntu.com/ubuntu/ jammy-backports main restricted universe multiverse
+          deb http://security.ubuntu.com/ubuntu/ jammy-security main restricted universe multiverse
+          EOF
           
-          # Update package lists with retry and timeout
+          echo "📋 Updated sources.list:"
+          cat /etc/apt/sources.list
+          
+          # Update package lists with retry
           echo "📦 Updating package lists..."
-          if ! retry_cmd "sudo apt-get update -qq --allow-insecure-repositories"; then
-            echo "⚠️ Update failed with standard options, trying with different options..."
-            if ! retry_cmd "sudo apt-get update -qq -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10"; then
-              echo "⚠️ Update still failing, trying with specific mirrors..."
-              
-              # Try specific mirrors one by one with direct update
-              for specific_mirror in "http://mirrors.kernel.org/ubuntu" "http://mirror.rackspace.com/ubuntu" "http://us.archive.ubuntu.com/ubuntu"; do
-                echo "🔄 Trying mirror: $specific_mirror"
-                update_mirror "$specific_mirror"
-                if retry_cmd "sudo apt-get update -qq"; then
-                  echo "✅ Update successful with mirror: $specific_mirror"
-                  break
-                fi
-              done
-              
-              # If still failing, try with http instead of https
-              if ! retry_cmd "sudo apt-get update -qq"; then
-                echo "⚠️ Update still failing, trying with http only..."
-                sudo sed -i 's|https://|http://|g' /etc/apt/sources.list
-                retry_cmd "sudo apt-get update -qq" || echo "⚠️ Update failed, continuing with caution..."
-              fi
-            fi
-          fi
-          
-          # Try alternative update method if standard update fails
-          if ! sudo apt-get update -qq 2>/dev/null; then
-            echo "⚠️ Standard update failed, trying with apt-get update --fix-missing..."
-            sudo apt-get update --fix-missing -qq || echo "⚠️ Update still failing, but continuing..."
+          if ! retry_cmd "sudo apt-get update -qq -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"; then
+            echo "⚠️ Azure mirror update failed, trying standard mirrors..."
+            
+            # Fallback to standard mirrors
+            sudo cp /etc/apt/sources.list.bak /etc/apt/sources.list
+            retry_cmd "sudo apt-get update -qq" || echo "⚠️ Update failed, continuing with caution..."
           fi
           
           # Install system packages with retry
           echo "📦 Installing system packages..."
           PACKAGES="ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool"
           
-          if ! retry_cmd "sudo apt-get install -y -qq --no-install-recommends $PACKAGES --allow-unauthenticated"; then
+          if ! retry_cmd "sudo apt-get install -y -qq --no-install-recommends $PACKAGES"; then
             echo "⚠️ Bulk install failed, trying individual packages..."
             for pkg in $PACKAGES; do
               echo "📦 Installing $pkg..."
-              retry_cmd "sudo apt-get install -y -qq --no-install-recommends $pkg --allow-unauthenticated" || {
-                echo "⚠️ Failed to install $pkg, trying with different options..."
-                sudo apt-get install -y --no-install-recommends $pkg --fix-missing --allow-unauthenticated || echo "❌ Failed to install $pkg"
+              retry_cmd "sudo apt-get install -y -qq --no-install-recommends $pkg" || {
+                echo "⚠️ Failed to install $pkg, trying with fix-missing..."
+                sudo apt-get install -y --no-install-recommends $pkg --fix-missing || echo "❌ Failed to install $pkg"
               }
             done
           fi
@@ -252,12 +159,8 @@ jobs:
               echo "✅ $cmd: $(which $cmd)"
             else
               echo "⚠️ $cmd not found, trying to install..."
-              retry_cmd "sudo apt-get install -y -qq $cmd --allow-unauthenticated" || {
+              retry_cmd "sudo apt-get install -y -qq $cmd" || {
                 echo "❌ Failed to install $cmd"
-                # Try alternative installation
-                if [ "$cmd" = "ffmpeg" ]; then
-                  sudo snap install ffmpeg || echo "❌ Failed to install ffmpeg via snap"
-                fi
               }
             fi
           done
@@ -293,7 +196,7 @@ jobs:
             }
           fi
           
-          # Restore original sources.list if we modified it
+          # Restore original sources.list
           if [ -f /etc/apt/sources.list.bak ]; then
             sudo cp /etc/apt/sources.list.bak /etc/apt/sources.list 2>/dev/null || true
           fi
@@ -768,7 +671,8 @@ jobs:
             echo "has_merged=true" >> $GITHUB_ENV
             echo "merge_success=true" >> $GITHUB_OUTPUT
             exit 0
-          fi          
+          fi
+          
           echo "📊 Found $EP_COUNT episodes to merge"
           
           # First, verify all files have video streams and redownload if needed
