@@ -18,6 +18,8 @@ permissions:
 jobs:
   upload:
     runs-on: ubuntu-latest
+  
+    
     steps:
       - name: 📋 Series Information & Setup
         run: |
@@ -39,11 +41,32 @@ jobs:
           # Store for later use
           echo "series_title=$SERIES" >> $GITHUB_ENV
           echo "label=$LABEL" >> $GITHUB_ENV
+          
+          # Create a file to track workflow progress
+          echo "STARTED" > workflow_status.txt
 
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg & Tools
+      - name: Cache APT packages
+        uses: actions/cache@v3
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-${{ hashFiles('**/apt-packages.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install FFmpeg & Tools (Robust)
+        timeout-minutes: 10
+        id: install_tools
         run: |
           echo "========================================="
           echo "🔧 INSTALLING TOOLS"
@@ -51,16 +74,112 @@ jobs:
           echo "📺 Series: ${{ env.series_title }}"
           echo "========================================="
           
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool
-          pip3 install --upgrade pip
-          pip3 install telethon qrcode yt-dlp requests
-          pip3 install aiohttp python-socks[asyncio]
-          python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')"
+          # Set apt options for faster operation
+          export DEBIAN_FRONTEND=noninteractive
+          
+          # Function to retry commands with exponential backoff
+          retry_cmd() {
+            local cmd="$1"
+            local max_attempts=3
+            local attempt=1
+            local delay=5
+            
+            while [ $attempt -le $max_attempts ]; do
+              echo "🔄 Attempt $attempt/$max_attempts: $cmd"
+              if eval "$cmd" 2>&1; then
+                return 0
+              fi
+              echo "⚠️ Attempt $attempt failed. Waiting $delay seconds..."
+              sleep $delay
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+            return 1
+          }
+          
+          # Quick check if tools are already installed
+          if command -v ffmpeg &> /dev/null && command -v aria2c &> /dev/null && python3 -c "import telethon" 2>/dev/null; then
+            echo "✅ Tools already installed, skipping..."
+            echo "📊 Tool versions:"
+            ffmpeg -version | head -1 || echo "⚠️ ffmpeg not found"
+            aria2c --version | head -1 || echo "⚠️ aria2 not found"
+            python3 -c "import telethon; print(f'Telethon {telethon.__version__}')" || echo "⚠️ Telethon not found"
+            exit 0
+          fi
+          
+          # Update package lists with retry
+          echo "📦 Updating package lists..."
+          retry_cmd "sudo apt-get update -qq" || {
+            echo "⚠️ Update failed, trying with different mirror..."
+            sudo sed -i 's/archive.ubuntu.com/mirrors.ubuntu.com/g' /etc/apt/sources.list 2>/dev/null || true
+            retry_cmd "sudo apt-get update -qq" || echo "⚠️ Update still failing, continuing..."
+          }
+          
+          # Install system packages
+          echo "📦 Installing system packages..."
+          retry_cmd "sudo apt-get install -y -qq --no-install-recommends ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool" || {
+            echo "⚠️ Bulk install failed, trying individual packages..."
+            for pkg in ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool; do
+              echo "📦 Installing $pkg..."
+              retry_cmd "sudo apt-get install -y -qq --no-install-recommends $pkg" || echo "⚠️ Failed to install $pkg"
+            done
+          }
+          
+          # Verify critical tools
+          echo "🔍 Verifying installations..."
+          for cmd in ffmpeg aria2 curl python3 jq wget; do
+            if command -v $cmd &> /dev/null; then
+              echo "✅ $cmd: $(which $cmd)"
+            else
+              echo "⚠️ $cmd not found, trying to install..."
+              retry_cmd "sudo apt-get install -y -qq $cmd" || echo "❌ Failed to install $cmd"
+            fi
+          done
+          
+          # Upgrade pip with retry
+          echo "📦 Upgrading pip..."
+          retry_cmd "python3 -m pip install --no-cache-dir --upgrade pip --timeout 60" || echo "⚠️ Pip upgrade failed"
+          
+          # Install Python packages
+          echo "📦 Installing Python packages..."
+          
+          # Install telethon with specific version
+          retry_cmd "python3 -m pip install --no-cache-dir telethon==1.34.0 --timeout 60" || {
+            echo "⚠️ Telethon install failed, trying without version..."
+            retry_cmd "python3 -m pip install --no-cache-dir telethon --timeout 60" || echo "⚠️ Telethon install failed"
+          }
+          
+          # Install other packages
+          for pkg in "yt-dlp" "requests" "aiohttp" "python-socks[asyncio]" "qrcode"; do
+            echo "📦 Installing $pkg..."
+            retry_cmd "python3 -m pip install --no-cache-dir $pkg --timeout 60" || echo "⚠️ Failed to install $pkg"
+          done
+          
+          # Verify telethon installation
+          echo "🔍 Verifying Telethon..."
+          if python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')" 2>/dev/null; then
+            echo "✅ Telethon installed successfully"
+          else
+            echo "❌ Telethon import failed. Trying alternative installation..."
+            retry_cmd "python3 -m pip install --no-cache-dir telethon==1.34.0 --timeout 60 --index-url https://pypi.org/simple/" || {
+              echo "❌ Telethon installation failed completely"
+              echo "continue_on_error=true" >> $GITHUB_OUTPUT
+            }
+          fi
           
           echo "========================================="
           echo "✅ INSTALLATION COMPLETE"
           echo "========================================="
+          
+          # Show versions
+          echo "📊 Tool versions:"
+          ffmpeg -version | head -1 || echo "⚠️ ffmpeg not found"
+          aria2c --version | head -1 || echo "⚠️ aria2 not found"
+          python3 --version || echo "⚠️ python3 not found"
+          python3 -c "import telethon; print(f'Telethon {telethon.__version__}')" 2>/dev/null || echo "⚠️ Telethon not found"
+          echo "========================================="
+          
+          echo "INSTALLED" > ../tools_installed.txt
 
       - name: Compute Dynamic Formatted Output Filename & Label
         id: fname
@@ -129,6 +248,7 @@ jobs:
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
       - name: Download All Episodes First
+        timeout-minutes: 60
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -229,6 +349,7 @@ jobs:
           echo "========================================="
 
       - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
+        timeout-minutes: 30
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -485,6 +606,7 @@ jobs:
 
       - name: Smart Merge Episodes
         id: merge
+        timeout-minutes: 30
         run: |
           cd downloads
           
@@ -963,6 +1085,7 @@ jobs:
       - name: Verify, Compress if Needed, and Fix Duration
         if: steps.merge.outputs.merge_success == 'true'
         id: verify
+        timeout-minutes: 30
         run: |
           cd downloads
           
@@ -1137,6 +1260,7 @@ jobs:
 
       - name: Start Merged Upload (Background with Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
+        timeout-minutes: 60
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -1582,6 +1706,7 @@ jobs:
 
       - name: Upload Single Episodes (Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
+        timeout-minutes: 60
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -2028,6 +2153,7 @@ jobs:
 
       - name: Wait for All Uploads with Enhanced Progress Monitoring
         if: steps.verify.outputs.verify_success == 'true'
+        timeout-minutes: 30
         run: |
           cd downloads
           
