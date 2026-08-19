@@ -179,7 +179,7 @@ jobs:
           }
           
           # Install other packages
-          for pkg in "yt-dlp" "requests" "aiohttp" "python-socks[asyncio]" "qrcode"; do
+          for pkg in "yt-dlp[default,curl-cffi]" "curl_cffi" "requests" "aiohttp" "python-socks[asyncio]" "qrcode"; do
             echo "📦 Installing $pkg..."
             retry_cmd "python3 -m pip install --no-cache-dir $pkg --timeout 60" || echo "⚠️ Failed to install $pkg"
           done
@@ -323,7 +323,8 @@ jobs:
             # Download the episode - try both methods
             if [[ "$URL" == *".m3u8"* ]]; then
               echo "📺 HLS stream - Using yt-dlp"
-              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts \
+              yt-dlp --extractor-args "generic:impersonate" --impersonate chrome \
+                -f "bestvideo+bestaudio/best" --hls-use-mpegts \
                 --no-progress --no-warnings \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>&1
             else
@@ -338,7 +339,8 @@ jobs:
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
               echo "⚠️ Initial download failed or file too small, trying yt-dlp..."
               rm -f "$OUT_FILE"
-              yt-dlp -f "bestvideo+bestaudio/best" \
+              yt-dlp --extractor-args "generic:impersonate" --impersonate chrome \
+                -f "bestvideo+bestaudio/best" \
                 --no-progress --no-warnings \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>&1
             fi
@@ -733,7 +735,8 @@ jobs:
                 rm -f "$FILE"
                 
                 # Redownload with yt-dlp specifically to ensure video+audio
-                yt-dlp -f "bestvideo+bestaudio/best" \
+                yt-dlp --extractor-args "generic:impersonate" --impersonate chrome \
+                  -f "bestvideo+bestaudio/best" \
                   --no-progress --no-warnings \
                   -o "$FILE" "$URL" < /dev/null 2>&1
                 
