@@ -19,8 +19,6 @@ jobs:
   upload:
     runs-on: ubuntu-latest
     
-    # Add timeout for the entire job
-    timeout-minutes: 180
     
     steps:
       - name: 📋 Series Information & Setup
@@ -50,14 +48,6 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Cache APT packages
-        uses: actions/cache@v4
-        with:
-          path: /var/cache/apt/archives
-          key: ${{ runner.os }}-apt-${{ hashFiles('**/apt-packages.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-apt-
-
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
@@ -66,141 +56,43 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install FFmpeg & Tools (Azure Mirrors)
-        timeout-minutes: 10
+      - name: Install Tools & Dependencies
+        timeout-minutes: 5
         id: install_tools
         run: |
           echo "========================================="
           echo "🔧 INSTALLING TOOLS"
           echo "========================================="
-          echo "📺 Series: ${{ env.series_title }}"
-          echo "========================================="
           
-          # Set apt options for faster operation
           export DEBIAN_FRONTEND=noninteractive
+          APT_OPTS="-y -qq -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
           
-          # Function to retry commands with exponential backoff
-          retry_cmd() {
-            local cmd="$1"
-            local max_attempts=3
-            local attempt=1
-            local delay=5
-            
-            while [ $attempt -le $max_attempts ]; do
-              echo "🔄 Attempt $attempt/$max_attempts: $cmd"
-              if eval "$cmd" 2>&1; then
-                return 0
-              fi
-              echo "⚠️ Attempt $attempt failed. Waiting $delay seconds..."
-              sleep $delay
-              attempt=$((attempt + 1))
-              delay=$((delay * 2))
-            done
-            return 1
+          echo "📦 Updating apt cache..."
+          sudo apt-get update -qq -o Acquire::Retries=3 || true
+          
+          echo "📦 Installing system packages (aria2, mkvtoolnix, mediainfo, exiftool, bc)..."
+          sudo apt-get install $APT_OPTS aria2 mkvtoolnix mediainfo exiftool bc ffmpeg || {
+            echo "⚠️ First attempt failed, attempting fix-broken install..."
+            sudo apt-get --fix-broken install -y
+            sudo apt-get install $APT_OPTS aria2 mkvtoolnix mediainfo exiftool bc ffmpeg
           }
-          
-          # Quick check if tools are already installed
-          if command -v ffmpeg &> /dev/null && command -v aria2c &> /dev/null && python3 -c "import telethon" 2>/dev/null; then
-            echo "✅ Tools already installed, skipping..."
-            echo "📊 Tool versions:"
-            ffmpeg -version | head -1 || echo "⚠️ ffmpeg not found"
-            aria2c --version | head -1 || echo "⚠️ aria2 not found"
-            python3 -c "import telethon; print(f'Telethon {telethon.__version__}')" || echo "⚠️ Telethon not found"
-            exit 0
-          fi
-          
-          # Use Azure Ubuntu mirrors (fastest in GitHub Actions)
-          echo "🌐 Using Azure Ubuntu mirrors for faster downloads..."
-          
-          # Backup original sources.list
-          sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
-          
-          # Update to Azure mirrors
-          sudo tee /etc/apt/sources.list > /dev/null << 'EOF'
-          # Azure Ubuntu Mirrors
-          deb http://azure.archive.ubuntu.com/ubuntu/ jammy main restricted universe multiverse
-          deb http://azure.archive.ubuntu.com/ubuntu/ jammy-updates main restricted universe multiverse
-          deb http://azure.archive.ubuntu.com/ubuntu/ jammy-backports main restricted universe multiverse
-          deb http://security.ubuntu.com/ubuntu/ jammy-security main restricted universe multiverse
-          EOF
-          
-          echo "📋 Updated sources.list:"
-          cat /etc/apt/sources.list
-          
-          # Update package lists with retry
-          echo "📦 Updating package lists..."
-          if ! retry_cmd "sudo apt-get update -qq -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"; then
-            echo "⚠️ Azure mirror update failed, trying standard mirrors..."
-            
-            # Fallback to standard mirrors
-            sudo cp /etc/apt/sources.list.bak /etc/apt/sources.list
-            retry_cmd "sudo apt-get update -qq" || echo "⚠️ Update failed, continuing with caution..."
-          fi
-          
-          # Install system packages with retry
-          echo "📦 Installing system packages..."
-          PACKAGES="ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool"
-          
-          if ! retry_cmd "sudo apt-get install -y -qq --no-install-recommends $PACKAGES"; then
-            echo "⚠️ Bulk install failed, trying individual packages..."
-            for pkg in $PACKAGES; do
-              echo "📦 Installing $pkg..."
-              retry_cmd "sudo apt-get install -y -qq --no-install-recommends $pkg" || {
-                echo "⚠️ Failed to install $pkg, trying with fix-missing..."
-                sudo apt-get install -y --no-install-recommends $pkg --fix-missing || echo "❌ Failed to install $pkg"
-              }
-            done
-          fi
-          
-          # Verify critical tools
-          echo "🔍 Verifying installations..."
-          for cmd in ffmpeg aria2 curl python3 jq wget; do
-            if command -v $cmd &> /dev/null; then
-              echo "✅ $cmd: $(which $cmd)"
-            else
-              echo "⚠️ $cmd not found, trying to install..."
-              retry_cmd "sudo apt-get install -y -qq $cmd" || {
-                echo "❌ Failed to install $cmd"
-              }
-            fi
-          done
-          
-          # Upgrade pip with retry
-          echo "📦 Upgrading pip..."
-          retry_cmd "python3 -m pip install --no-cache-dir --upgrade pip --timeout 60" || echo "⚠️ Pip upgrade failed"
-          
-          # Install Python packages with retry and timeout
-          echo "📦 Installing Python packages..."
-          
-          # Install telethon with specific version
-          retry_cmd "python3 -m pip install --no-cache-dir telethon==1.34.0 --timeout 60" || {
-            echo "⚠️ Telethon install failed, trying without version..."
-            retry_cmd "python3 -m pip install --no-cache-dir telethon --timeout 60" || echo "⚠️ Telethon install failed"
-          }
-          
-          # Install other packages
-          for pkg in "yt-dlp[default,curl-cffi]" "curl_cffi" "requests" "aiohttp" "python-socks[asyncio]" "qrcode"; do
-            echo "📦 Installing $pkg..."
-            retry_cmd "python3 -m pip install --no-cache-dir $pkg --timeout 60" || echo "⚠️ Failed to install $pkg"
-          done
-          
-          # Verify telethon installation
-          echo "🔍 Verifying Telethon..."
-          if python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')" 2>/dev/null; then
-            echo "✅ Telethon installed successfully"
-          else
-            echo "❌ Telethon import failed. Trying alternative installation..."
-            retry_cmd "python3 -m pip install --no-cache-dir telethon==1.34.0 --timeout 60 --index-url https://pypi.org/simple/" || {
-              echo "❌ Telethon installation failed completely"
-              echo "continue_on_error=true" >> $GITHUB_OUTPUT
-            }
-          fi
-          
-          # Restore original sources.list
-          if [ -f /etc/apt/sources.list.bak ]; then
-            sudo cp /etc/apt/sources.list.bak /etc/apt/sources.list 2>/dev/null || true
-          fi
-          
+
+          echo "📦 Upgrading pip and installing Python packages..."
+          python3 -m pip install --no-cache-dir --upgrade pip
+          python3 -m pip install --no-cache-dir \
+            "yt-dlp[default,curl-cffi]" \
+            "curl_cffi" \
+            "telethon==1.34.0" \
+            "requests" \
+            "aiohttp" \
+            "python-socks[asyncio]" \
+            "qrcode"
+
+          echo "🔍 Verifying installed tools:"
+          ffmpeg -version | head -1 || echo "⚠️ ffmpeg missing"
+          aria2c --version | head -1 || echo "⚠️ aria2c missing"
+          python3 -c "import telethon; print(f'✅ Telethon {telethon.__version__}')" || echo "⚠️ Telethon missing"
+          python3 -c "import yt_dlp, curl_cffi; print('✅ yt-dlp & curl_cffi ready')" || echo "⚠️ yt-dlp / curl_cffi missing"
           echo "========================================="
           echo "✅ INSTALLATION COMPLETE"
           echo "========================================="
