@@ -19,8 +19,8 @@ jobs:
   upload:
     runs-on: ubuntu-latest
     
-    # Add timeout for the entire job
-  
+
+    
     steps:
       - name: 📋 Series Information & Setup
         run: |
@@ -1685,8 +1685,8 @@ jobs:
               from telethon import TelegramClient
               from telethon.sessions import StringSession
               from telethon.errors import FloodWaitError
-              from telethon.tl.functions.channels import JoinChannelRequest
-              from telethon.tl.functions.messages import ImportChatInviteRequest, CreateForumTopicRequest
+              from telethon.tl.functions.channels import JoinChannelRequest, CreateForumTopicRequest
+              from telethon.tl.functions.messages import ImportChatInviteRequest
               from telethon.tl.types import DocumentAttributeVideo
               import telethon
               print(f"✅ Telethon version: {telethon.__version__}")
