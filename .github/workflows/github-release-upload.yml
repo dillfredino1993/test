@@ -19,8 +19,8 @@ jobs:
   upload:
     runs-on: ubuntu-latest
     
+    # Add timeout for the entire job
   
-    
     steps:
       - name: 📋 Series Information & Setup
         run: |
@@ -77,9 +77,9 @@ jobs:
           sudo apt-get update -qq -o Acquire::ForceIPv4=true -o Acquire::Retries=3 || true
           
           echo "📦 Installing system packages (aria2, mkvtoolnix, mediainfo, exiftool, bc)..."
-          sudo apt-get install $APT_FLAGS aria2 mkvtoolnix mediainfo libimage-exiftool-perl bc || {
+          sudo apt-get install $APT_FLAGS ffmpeg aria2 mkvtoolnix mediainfo libimage-exiftool-perl bc jq || {
             echo "⚠️ Retrying package install individually..."
-            for pkg in aria2 mkvtoolnix mediainfo libimage-exiftool-perl bc; do
+            for pkg in ffmpeg aria2 mkvtoolnix mediainfo libimage-exiftool-perl bc jq; do
               sudo apt-get install $APT_FLAGS "$pkg" || echo "⚠️ Warning: $pkg install failed"
             done
           }
