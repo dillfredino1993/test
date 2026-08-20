@@ -183,7 +183,7 @@ jobs:
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
       - name: Download All Episodes First
-        timeout-minutes: 60
+        timeout-minutes: 120
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -543,7 +543,7 @@ jobs:
 
       - name: Smart Merge Episodes
         id: merge
-        timeout-minutes: 30
+        timeout-minutes: 120
         run: |
           cd downloads
           
@@ -1023,7 +1023,7 @@ jobs:
       - name: Verify, Compress if Needed, and Fix Duration
         if: steps.merge.outputs.merge_success == 'true'
         id: verify
-        timeout-minutes: 30
+        timeout-minutes: 120
         run: |
           cd downloads
           
@@ -1198,7 +1198,7 @@ jobs:
 
       - name: Start Merged Upload (Background with Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
-        timeout-minutes: 60
+        timeout-minutes: 120
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -1577,7 +1577,7 @@ jobs:
 
       - name: Upload Single Episodes (Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
-        timeout-minutes: 60
+        timeout-minutes: 120
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
