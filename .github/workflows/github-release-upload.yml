@@ -286,7 +286,7 @@ jobs:
           echo "========================================="
 
       - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
-        timeout-minutes: 30
+        timeout-minutes: 120
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
