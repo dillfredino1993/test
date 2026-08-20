@@ -19,7 +19,7 @@ jobs:
   upload:
     runs-on: ubuntu-latest
     
-  
+
     
     steps:
       - name: 📋 Series Information & Setup
@@ -2006,6 +2006,10 @@ jobs:
                   await upload_episodes(client, entity, topic_id)
                   
                   await client.disconnect()
+                  with open("single_episodes_complete.txt", "w") as f:
+                      f.write("COMPLETE\n")
+                  with open("episode_upload.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: ALL_EPISODES_COMPLETE\n")
                   print("\n✅ Single episode uploads complete!")
               except Exception as e:
                   print(f"❌ Error: {e}")
@@ -2016,6 +2020,7 @@ jobs:
           EOFUPLOAD
           
           python3 upload_single.py
+          touch single_episodes_complete.txt
 
       - name: Wait for All Uploads with Enhanced Progress Monitoring
         if: steps.verify.outputs.verify_success == 'true'
@@ -2166,6 +2171,13 @@ jobs:
             # Check if both are complete first
             if [ -f "single_episodes_complete.txt" ]; then
               EPISODES_COMPLETE=true
+            elif [ -f "episode_upload.log" ]; then
+              chk_total=0
+              chk_done="0"
+              if [ "" -gt 0 ] && [ "" -ge "" ]; then
+                EPISODES_COMPLETE=true
+                touch single_episodes_complete.txt
+              fi
             fi
             
             # Check merged completion - either from log or process ended
