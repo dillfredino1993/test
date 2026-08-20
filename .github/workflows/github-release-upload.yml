@@ -18,6 +18,9 @@ permissions:
 jobs:
   upload:
     runs-on: ubuntu-latest
+    
+  
+    
     steps:
       - name: 📋 Series Information & Setup
         run: |
@@ -39,28 +42,79 @@ jobs:
           # Store for later use
           echo "series_title=$SERIES" >> $GITHUB_ENV
           echo "label=$LABEL" >> $GITHUB_ENV
+          
+          # Create a file to track workflow progress
+          echo "STARTED" > workflow_status.txt
 
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg & Tools
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Tools & Dependencies
+        timeout-minutes: 5
+        id: install_tools
         run: |
           echo "========================================="
           echo "🔧 INSTALLING TOOLS"
           echo "========================================="
-          echo "📺 Series: ${{ env.series_title }}"
-          echo "========================================="
           
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2 curl python3-pip jq mkvtoolnix bc wget mediainfo exiftool
-          pip3 install --upgrade pip
-          pip3 install telethon qrcode yt-dlp requests
-          pip3 install aiohttp python-socks[asyncio]
-          python3 -c "import telethon; print(f'✅ Telethon version: {telethon.__version__}')"
+          # Prevent interactive debconf prompts and disable needrestart hangs
+          export DEBIAN_FRONTEND=noninteractive
+          export NEEDRESTART_MODE=a
+          export NEEDRESTART_SUSPEND=1
+          sudo rm -f /etc/apt/apt.conf.d/99needrestart /var/lib/man-db/auto-update 2>/dev/null || true
           
+          APT_FLAGS="-y -qq --no-install-recommends -o DPkg::Lock::Timeout=120 -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+          
+          echo "📦 Updating apt cache..."
+          sudo apt-get update -qq -o Acquire::ForceIPv4=true -o Acquire::Retries=3 || true
+          
+          echo "📦 Installing system packages (aria2, mkvtoolnix, mediainfo, exiftool, bc)..."
+          sudo apt-get install $APT_FLAGS ffmpeg aria2 mkvtoolnix mediainfo libimage-exiftool-perl bc jq || {
+            echo "⚠️ Retrying package install individually..."
+            for pkg in ffmpeg aria2 mkvtoolnix mediainfo libimage-exiftool-perl bc jq; do
+              sudo apt-get install $APT_FLAGS "$pkg" || echo "⚠️ Warning: $pkg install failed"
+            done
+          }
+
+          echo "📦 Upgrading pip and installing Python packages..."
+          python3 -m pip install --no-cache-dir --upgrade pip
+          python3 -m pip install --no-cache-dir \
+            "yt-dlp[default,curl-cffi]" \
+            "curl_cffi" \
+            "telethon==1.34.0" \
+            "requests" \
+            "aiohttp" \
+            "python-socks[asyncio]" \
+            "qrcode"
+
+          echo "🔍 Verifying installed tools:"
+          command -v ffmpeg &>/dev/null && echo "✅ ffmpeg: $(which ffmpeg)" || echo "⚠️ ffmpeg missing"
+          command -v aria2c &>/dev/null && echo "✅ aria2c: $(which aria2c)" || echo "⚠️ aria2c missing"
+          command -v mkvmerge &>/dev/null && echo "✅ mkvmerge: $(which mkvmerge)" || echo "⚠️ mkvmerge missing"
+          command -v mediainfo &>/dev/null && echo "✅ mediainfo: $(which mediainfo)" || echo "⚠️ mediainfo missing"
+          python3 -c "import telethon; print(f'✅ Telethon {telethon.__version__}')" || echo "⚠️ Telethon missing"
+          python3 -c "import yt_dlp, curl_cffi; print('✅ yt-dlp & curl_cffi ready')" || echo "⚠️ yt-dlp / curl_cffi missing"
           echo "========================================="
           echo "✅ INSTALLATION COMPLETE"
           echo "========================================="
+          
+          # Show versions
+          echo "📊 Tool versions:"
+          ffmpeg -version | head -1 || echo "⚠️ ffmpeg not found"
+          aria2c --version | head -1 || echo "⚠️ aria2 not found"
+          python3 --version || echo "⚠️ python3 not found"
+          python3 -c "import telethon; print(f'Telethon {telethon.__version__}')" 2>/dev/null || echo "⚠️ Telethon not found"
+          echo "========================================="
+          
+          echo "INSTALLED" > ../tools_installed.txt
 
       - name: Compute Dynamic Formatted Output Filename & Label
         id: fname
@@ -129,6 +183,7 @@ jobs:
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
       - name: Download All Episodes First
+        timeout-minutes: 60
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -169,7 +224,8 @@ jobs:
             # Download the episode - try both methods
             if [[ "$URL" == *".m3u8"* ]]; then
               echo "📺 HLS stream - Using yt-dlp"
-              yt-dlp -f "bestvideo+bestaudio/best" --hls-use-mpegts \
+              yt-dlp --extractor-args "generic:impersonate" --impersonate chrome \
+                -f "bestvideo+bestaudio/best" --hls-use-mpegts \
                 --no-progress --no-warnings \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>&1
             else
@@ -184,7 +240,8 @@ jobs:
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
               echo "⚠️ Initial download failed or file too small, trying yt-dlp..."
               rm -f "$OUT_FILE"
-              yt-dlp -f "bestvideo+bestaudio/best" \
+              yt-dlp --extractor-args "generic:impersonate" --impersonate chrome \
+                -f "bestvideo+bestaudio/best" \
                 --no-progress --no-warnings \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>&1
             fi
@@ -229,6 +286,7 @@ jobs:
           echo "========================================="
 
       - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
+        timeout-minutes: 30
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -485,6 +543,7 @@ jobs:
 
       - name: Smart Merge Episodes
         id: merge
+        timeout-minutes: 30
         run: |
           cd downloads
           
@@ -577,7 +636,8 @@ jobs:
                 rm -f "$FILE"
                 
                 # Redownload with yt-dlp specifically to ensure video+audio
-                yt-dlp -f "bestvideo+bestaudio/best" \
+                yt-dlp --extractor-args "generic:impersonate" --impersonate chrome \
+                  -f "bestvideo+bestaudio/best" \
                   --no-progress --no-warnings \
                   -o "$FILE" "$URL" < /dev/null 2>&1
                 
@@ -963,6 +1023,7 @@ jobs:
       - name: Verify, Compress if Needed, and Fix Duration
         if: steps.merge.outputs.merge_success == 'true'
         id: verify
+        timeout-minutes: 30
         run: |
           cd downloads
           
@@ -1137,6 +1198,7 @@ jobs:
 
       - name: Start Merged Upload (Background with Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
+        timeout-minutes: 60
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -1152,24 +1214,17 @@ jobs:
           cd downloads
           
           echo "========================================="
-          echo "📤 STARTING MERGED UPLOAD"
+          echo "📤 STARTING MERGED UPLOAD TO CHANNEL"
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "📁 File: ${{ env.merged_file_path }}"
           echo "========================================="
           
-          # Debug: Verify file exists
-          echo "📁 Current directory: $(pwd)"
-          echo "📁 Files: $(ls -la)"
-          echo "📁 merged_file_path: ${{ env.merged_file_path }}"
-          
-          # If the file doesn't exist in the expected location, try to find it
           if [ ! -f "${{ env.merged_file_path }}" ] && [ ! -f "output.mp4" ]; then
             echo "❌ output.mp4 not found!"
             exit 1
           fi
           
-          # Use the file path from environment or fallback to output.mp4
           if [ -f "${{ env.merged_file_path }}" ]; then
             export MERGED_PATH="${{ env.merged_file_path }}"
           else
@@ -1177,9 +1232,7 @@ jobs:
             echo "⚠️ Using fallback path: $MERGED_PATH"
           fi
           
-          echo "📁 Final MERGED_PATH: $MERGED_PATH"
-          
-          cat > upload_merged.py << 'EOFUPLOAD'
+          python3 -c "import sys, textwrap; open('upload_merged.py', 'w').write(textwrap.dedent(sys.stdin.read()))" << 'EOFUPLOAD'
           import os
           import sys
           import glob
@@ -1201,7 +1254,7 @@ jobs:
               from telethon.errors import FloodWaitError
               from telethon.tl.functions.channels import JoinChannelRequest
               from telethon.tl.functions.messages import ImportChatInviteRequest
-              from telethon.tl.types import DocumentAttributeVideo, InputFile
+              from telethon.tl.types import DocumentAttributeVideo
               import telethon
               print(f"✅ Telethon version: {telethon.__version__}")
           except ImportError as e:
@@ -1267,7 +1320,6 @@ jobs:
           def generate_thumbnail(file_path):
               try:
                   thumb_path = f"{file_path}_thumb.jpg"
-                  
                   cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
                   parts = result.split('|')
@@ -1275,7 +1327,6 @@ jobs:
                   if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
                       w = int(parts[0])
                       h = int(parts[1])
-                      
                       ffmpeg_cmd = [
                           "ffmpeg", "-y", "-ss", "00:00:01",
                           "-i", file_path,
@@ -1284,7 +1335,6 @@ jobs:
                           "-q:v", "2",
                           thumb_path
                       ]
-                      
                       subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
                       return thumb_path if os.path.exists(thumb_path) else None
               except:
@@ -1292,7 +1342,6 @@ jobs:
               return None
 
           def progress_callback(current, total):
-              """Progress callback for upload"""
               percent = (current / total) * 100
               mb_uploaded = current / (1024 * 1024)
               mb_total = total / (1024 * 1024)
@@ -1304,7 +1353,7 @@ jobs:
           chat_id = parse_chat_id(chat_id_raw)
 
           print("=" * 60)
-          print("📤 Uploading Merged Video (FAST UPLOAD ENABLED)")
+          print("📤 Uploading Merged Video to Channel")
           print("=" * 60)
           print(f"📺 Series: {series_title}")
           print(f"📁 File: {video_path}")
@@ -1317,11 +1366,9 @@ jobs:
               if not invite_link:
                   return None
               try:
-                  entity = await client.get_entity(invite_link)
-                  return entity
+                  return await client.get_entity(invite_link)
               except:
-                  pass
-              return None
+                  return None
 
           async def resolve_chat(client, chat_id, invite_link, search_name):
               if invite_link:
@@ -1340,53 +1387,38 @@ jobs:
               return None
 
           async def fast_upload_file(client, file_path, progress_callback=None):
-              """
-              Custom fast upload implementation using parallel chunk uploading
-              """
               if not os.path.exists(file_path):
                   print(f"❌ File not found: {file_path}")
                   return None
               
               file_size = os.path.getsize(file_path)
-              CHUNK_SIZE = 512 * 1024  # 512KB chunks
+              CHUNK_SIZE = 512 * 1024
               NUM_CHUNKS = math.ceil(file_size / CHUNK_SIZE)
               
               print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
               print(f"📊 Chunks: {NUM_CHUNKS} (512KB each)")
-              print(f"📁 File: {file_path}")
-              
-              # For large files, use parallel uploads
-              if file_size > 100 * 1024 * 1024:  # > 100MB
-                  print("⚡ Using parallel upload for large file...")
-              else:
-                  print("📤 Using standard upload for small file...")
               
               try:
-                  result = await client.upload_file(
+                  return await client.upload_file(
                       file_path,
                       part_size_kb=512,
                       file_name=os.path.basename(file_path),
                       progress_callback=progress_callback
                   )
-                  return result
               except Exception as e:
                   print(f"❌ Upload failed: {e}")
                   raise
 
           async def send_file_with_thumb(client, entity, file_path, caption):
-              # Check if file exists
               if not os.path.exists(file_path):
                   print(f"❌ File not found: {file_path}")
                   return False, None
               
               duration, w, h = get_video_metadata(file_path)
               print(f"📊 Video duration: {duration} seconds, {w}x{h}")
-              
               thumb = generate_thumbnail(file_path)
               
-              print(f"⏫ Uploading merged file with parallel chunks...")
-              print(f"📁 File path: {file_path}")
-              
+              print(f"⬆️ Uploading to channel...")
               try:
                   uploaded_file = await fast_upload_file(
                       client=client,
@@ -1399,10 +1431,8 @@ jobs:
                       return False, None
                       
                   print("✅ Upload complete!")
-                  
                   with open("merged_progress.log", "a") as f:
                       f.write(f"{datetime.datetime.now()}: UPLOAD_COMPLETE\n")
-                  
               except Exception as e:
                   print(f"❌ Upload failed: {e}")
                   traceback.print_exc()
@@ -1431,7 +1461,7 @@ jobs:
               
               try:
                   result = await client.send_file(**kwargs)
-                  print("✅ File sent to Telegram!")
+                  print("✅ File sent to Telegram Channel!")
                   return True, result
               except Exception as e:
                   print(f"❌ Send failed: {e}")
@@ -1452,36 +1482,20 @@ jobs:
           async def upload_merged_video(client, entity):
               video_path = os.environ.get("MERGED_PATH")
               
-              # Debug: print current directory and files
-              print(f"📁 Current directory: {os.getcwd()}")
-              print(f"📁 Files in directory: {os.listdir('.')}")
-              print(f"📁 MERGED_PATH: {video_path}")
-              
-              # Try to find the file if path is not set or doesn't exist
               if not video_path or not os.path.isfile(video_path):
-                  # Try to find output.mp4 in current directory
                   if os.path.exists("output.mp4"):
                       video_path = os.path.abspath("output.mp4")
-                      print(f"🔍 Found output.mp4 in current directory: {video_path}")
                   elif os.path.exists("../output.mp4"):
                       video_path = os.path.abspath("../output.mp4")
-                      print(f"🔍 Found output.mp4 in parent directory: {video_path}")
                   else:
-                      print(f"❌ Video not found: {video_path}")
-                      print("🔍 Looking for video files...")
-                      import glob
                       video_files = glob.glob("*.mp4")
                       if video_files:
-                          print(f"📁 Found MP4 files: {video_files}")
-                          # Use the largest MP4 file
-                          largest_file = max(video_files, key=lambda f: os.path.getsize(f))
-                          video_path = os.path.abspath(largest_file)
-                          print(f"📁 Using largest file: {video_path}")
+                          video_path = os.path.abspath(max(video_files, key=lambda f: os.path.getsize(f)))
                       else:
                           return False
               
               if not os.path.isfile(video_path):
-                  print(f"❌ Video still not found: {video_path}")
+                  print(f"❌ Video file not found: {video_path}")
                   return False
               
               file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
@@ -1489,15 +1503,7 @@ jobs:
               
               if file_size_mb > 2000:
                   print(f"❌ File exceeds 2GB ({file_size_mb:.1f} MB)")
-                  print("⚠️ Telegram limit is 2GB.")
                   return False
-              
-              if file_size_mb > 1800:
-                  print(f"⚠️ File is large ({file_size_mb:.1f} MB)")
-                  print("   Using parallel upload for speed...")
-              
-              duration, w, h = get_video_metadata(video_path)
-              print(f"📊 Duration: {duration} seconds")
               
               now = datetime.datetime.now()
               month_year = now.strftime("%B%Y").upper()
@@ -1508,20 +1514,19 @@ jobs:
               
               caption = f"{title}\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}"
               
-              print(f"📤 Uploading merged video...")
+              print(f"📤 Uploading merged video to channel...")
               print(f"📝 Caption: {caption[:50]}...")
               
               try:
                   success, result = await send_file_with_thumb(client, entity, video_path, caption)
                   if success:
-                      print("✅ Merged video uploaded!")
+                      print("✅ Merged video successfully posted to channel!")
                       return True
                   return False
               except FloodWaitError as e:
                   print(f"⏳ Rate limited: waiting {e.seconds}s")
                   await asyncio.sleep(e.seconds)
-                  success, result = await send_file_with_thumb(client, entity, video_path, caption)
-                  return success
+                  return await send_file_with_thumb(client, entity, video_path, caption)
               except Exception as e:
                   print(f"❌ Merged upload failed: {e}")
                   traceback.print_exc()
@@ -1530,7 +1535,6 @@ jobs:
           async def main():
               try:
                   print("🔌 Connecting to Telegram...")
-                  
                   client = TelegramClient(
                       StringSession(session_string), 
                       int(api_id), 
@@ -1548,17 +1552,15 @@ jobs:
                   print(f"✅ Logged in: {me.first_name}")
                   
                   entity = await resolve_chat(client, chat_id, invite_link, chat_name)
-                  
                   if not entity:
-                      print("❌ Could not resolve chat for merged video!")
+                      print("❌ Could not resolve channel for merged video!")
                       return
                   
-                  print(f"\n📤 Uploading merged to: {entity.title if hasattr(entity, 'title') else entity.id}")
+                  print(f"\n📤 Posting to Channel: {entity.title if hasattr(entity, 'title') else entity.id}")
                   await upload_merged_video(client, entity)
                   
                   await client.disconnect()
-                  print("\n✅ Merged upload complete!")
-                          
+                  print("\n✅ Merged channel upload complete!")
               except Exception as e:
                   print(f"❌ Error: {e}")
                   traceback.print_exc()
@@ -1567,26 +1569,21 @@ jobs:
               asyncio.run(main())
           EOFUPLOAD
           
-          echo "🚀 Starting merged video upload with parallel upload..."
-          nohup python3 -u upload_merged.py > merged_upload.log 2>&1 &
+          echo "🚀 Starting upload to channel in background..."
+          python3 upload_merged.py > merged_upload.log 2>&1 &
           MERGED_PID=$!
           echo "merged_pid=$MERGED_PID" >> $GITHUB_ENV
-          echo "✅ Merged upload started (PID: $MERGED_PID)"
-          
-          # Wait a moment and check if it started properly
-          sleep 2
-          if [ -f "merged_upload.log" ]; then
-            echo "📋 Initial log output:"
-            cat merged_upload.log
-          fi
+          echo "✅ Merged upload started with PID: $MERGED_PID"
 
       - name: Upload Single Episodes (Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
+        timeout-minutes: 60
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TG_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
           TG_SINGLE_EPISODES_CHAT_ID: ${{ secrets.TELEGRAM_SINGLE_EPISODES_CHAT_ID }}
+          TG_SINGLE_EPISODES_TOPIC_ID: ${{ secrets.TELEGRAM_SINGLE_EPISODES_TOPIC_ID || secrets.TELEGRAM_TOPIC_ID }}
           TG_SINGLE_EPISODES_NAME: ${{ secrets.TELEGRAM_SINGLE_EPISODES_NAME }}
           TG_SINGLE_EPISODES_INVITE_LINK: ${{ secrets.TELEGRAM_SINGLE_EPISODES_INVITE_LINK }}
           TITLE: ${{ steps.fname.outputs.formatted_title }}
@@ -1596,13 +1593,13 @@ jobs:
           cd downloads
           
           echo "========================================="
-          echo "📤 UPLOADING SINGLE EPISODES"
+          echo "📤 UPLOADING SINGLE EPISODES TO TOPIC"
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "📊 Episodes: $(ls -1 EP*.mp4 2>/dev/null | wc -l)"
           echo "========================================="
           
-          cat > upload_single.py << 'EOFUPLOAD'
+          python3 -c "import sys, textwrap; open('upload_single.py', 'w').write(textwrap.dedent(sys.stdin.read()))" << 'EOFUPLOAD'
           import os
           import sys
           import glob
@@ -1613,6 +1610,7 @@ jobs:
           import traceback
           import json
           import math
+          import random
 
           if hasattr(sys.stdout, "reconfigure"):
               sys.stdout.reconfigure(line_buffering=True)
@@ -1622,8 +1620,8 @@ jobs:
               from telethon import TelegramClient
               from telethon.sessions import StringSession
               from telethon.errors import FloodWaitError
-              from telethon.tl.functions.channels import JoinChannelRequest
-              from telethon.tl.functions.messages import ImportChatInviteRequest, CreateForumTopicRequest
+              from telethon.tl.functions.channels import JoinChannelRequest, CreateForumTopicRequest
+              from telethon.tl.functions.messages import ImportChatInviteRequest
               from telethon.tl.types import DocumentAttributeVideo
               import telethon
               print(f"✅ Telethon version: {telethon.__version__}")
@@ -1636,6 +1634,7 @@ jobs:
           session_string = os.environ.get("TG_SESSION_STRING")
           
           chat_id_raw = os.environ.get("TG_SINGLE_EPISODES_CHAT_ID")
+          topic_id_raw = os.environ.get("TG_SINGLE_EPISODES_TOPIC_ID")
           chat_name = os.environ.get("TG_SINGLE_EPISODES_NAME")
           invite_link = os.environ.get("TG_SINGLE_EPISODES_INVITE_LINK")
           
@@ -1721,7 +1720,6 @@ jobs:
           def generate_thumbnail(file_path):
               try:
                   thumb_path = f"{file_path}_thumb.jpg"
-                  
                   cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
                   parts = result.split('|')
@@ -1729,7 +1727,6 @@ jobs:
                   if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
                       w = int(parts[0])
                       h = int(parts[1])
-                      
                       ffmpeg_cmd = [
                           "ffmpeg", "-y", "-ss", "00:00:01",
                           "-i", file_path,
@@ -1738,7 +1735,6 @@ jobs:
                           "-q:v", "2",
                           thumb_path
                       ]
-                      
                       subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
                       return thumb_path if os.path.exists(thumb_path) else None
               except:
@@ -1748,7 +1744,7 @@ jobs:
           chat_id = parse_chat_id(chat_id_raw)
 
           print("=" * 60)
-          print("📤 Uploading Single Episodes (FAST UPLOAD ENABLED)")
+          print("📤 Uploading Single Episodes (Topic / Group)")
           print("=" * 60)
           print(f"📺 Series: {series_title}")
           print("=" * 60)
@@ -1757,7 +1753,6 @@ jobs:
               f.write(f"{datetime.datetime.now()}: Starting episode uploads\n")
 
           def progress_callback(current, total):
-              """Progress callback for upload"""
               percent = (current / total) * 100
               mb_uploaded = current / (1024 * 1024)
               mb_total = total / (1024 * 1024)
@@ -1768,11 +1763,9 @@ jobs:
               if not invite_link:
                   return None
               try:
-                  entity = await client.get_entity(invite_link)
-                  return entity
+                  return await client.get_entity(invite_link)
               except:
-                  pass
-              return None
+                  return None
 
           async def resolve_chat(client, chat_id, invite_link, search_name):
               if invite_link:
@@ -1790,30 +1783,63 @@ jobs:
                           return dialog.entity
               return None
 
+          async def get_or_create_topic(client, entity, topic_title, explicit_id=None):
+              if explicit_id:
+                  try:
+                      return int(explicit_id)
+                  except (ValueError, TypeError):
+                      pass
+              
+              try:
+                  print(f"📝 Creating forum topic in group: {topic_title[:60]}")
+                  input_channel = await client.get_input_entity(entity)
+                  result = await client(CreateForumTopicRequest(
+                      channel=input_channel,
+                      title=topic_title[:128],
+                      random_id=random.randint(0, 0x7fffffffffffffff)
+                  ))
+                  
+                  topic_id = None
+                  if hasattr(result, 'updates'):
+                      for upd in result.updates:
+                          if hasattr(upd, 'message') and hasattr(upd.message, 'id'):
+                              topic_id = upd.message.id
+                              break
+                          elif hasattr(upd, 'id'):
+                              topic_id = upd.id
+                              break
+                  if not topic_id and hasattr(result, 'id'):
+                      topic_id = result.id
+                  
+                  if topic_id:
+                      print(f"✅ Topic created successfully! Topic ID: {topic_id}")
+                      return int(topic_id)
+                  else:
+                      print("⚠️ Topic created but could not retrieve ID from updates")
+              except Exception as e:
+                  print(f"⚠️ Could not create topic: {e}")
+              return None
+
           async def fast_upload_file(client, file_path, progress_callback=None):
-              """Custom fast upload implementation"""
               if not os.path.exists(file_path):
                   print(f"❌ File not found: {file_path}")
                   return None
               
               file_size = os.path.getsize(file_path)
               print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
-              print(f"⚡ Uploading with parallel chunks...")
               
               try:
-                  result = await client.upload_file(
+                  return await client.upload_file(
                       file_path,
                       part_size_kb=512,
                       file_name=os.path.basename(file_path),
                       progress_callback=progress_callback
                   )
-                  return result
               except Exception as e:
                   print(f"❌ Upload failed: {e}")
                   raise
 
           async def send_file_with_thumb(client, entity, file_path, caption, reply_to=None):
-              # Check if file exists
               if not os.path.exists(file_path):
                   print(f"❌ File not found: {file_path}")
                   return False, None
@@ -1827,13 +1853,12 @@ jobs:
                       result = subprocess.check_output(cmd, text=True).strip()
                       if result and result.replace('.', '', 1).isdigit():
                           duration = int(float(result))
-                          print(f"📊 Retrieved duration from ffprobe: {duration} seconds")
                   except:
                       pass
               
               thumb = generate_thumbnail(file_path)
               
-              print(f"⏫ Uploading {os.path.basename(file_path)}...")
+              print(f"⬆️ Uploading {os.path.basename(file_path)}...")
               try:
                   uploaded_file = await fast_upload_file(
                       client=client,
@@ -1867,11 +1892,12 @@ jobs:
                   "allow_cache": True
               }
               
+              if reply_to:
+                  kwargs["reply_to"] = int(reply_to)
+                  print(f"🎯 Uploading into Topic ID: {reply_to}")
+              
               if thumb and os.path.exists(thumb):
                   kwargs["thumb"] = thumb
-              
-              if reply_to:
-                  kwargs["reply_to"] = reply_to
               
               try:
                   result = await client.send_file(**kwargs)
@@ -1892,7 +1918,7 @@ jobs:
                       try: os.remove(thumb)
                       except: pass
 
-          async def upload_episodes(client, entity, topic_id):
+          async def upload_episodes(client, entity, topic_id=None):
               ep_files = sorted(glob.glob("EP*.mp4"), 
                   key=lambda f: int(re.search(r'EP(\d+)\.mp4', f).group(1)) if re.search(r'EP(\d+)\.mp4', f) else 0)
               
@@ -1900,8 +1926,7 @@ jobs:
                   print("❌ No episode files found!")
                   return False
               
-              print(f"📊 Found {len(ep_files)} episodes to upload")
-              print("⚡ Each episode will use parallel upload!")
+              print(f"📊 Found {len(ep_files)} episodes to upload to topic {topic_id}")
               count = 0
               
               for ep_file in ep_files:
@@ -1913,8 +1938,6 @@ jobs:
                   print(f"🔧 Fixing duration for Episode {ep_num}...")
                   if fix_video_duration(ep_file):
                       print(f"✅ Duration fixed for Episode {ep_num}")
-                  else:
-                      print(f"⚠️ Could not fix duration for Episode {ep_num}")
                   
                   file_size = os.path.getsize(ep_file) / (1024 * 1024)
                   if file_size > 2000:
@@ -1922,17 +1945,16 @@ jobs:
                       continue
                   
                   caption = f"📺 Episode {ep_num}"
-                  
                   print(f"📤 Uploading Episode {ep_num} ({file_size:.1f} MB)...")
                   
                   with open("episode_upload.log", "a") as f:
                       f.write(f"{datetime.datetime.now()}: STARTING_EP_{ep_num}\n")
                   
                   try:
-                      success, result = await send_file_with_thumb(client, entity, ep_file, caption, topic_id)
+                      success, result = await send_file_with_thumb(client, entity, ep_file, caption, reply_to=topic_id)
                       if success:
                           count += 1
-                          print(f"✅ Episode {ep_num} uploaded")
+                          print(f"✅ Episode {ep_num} uploaded into topic")
                           with open("episode_upload.log", "a") as f:
                               f.write(f"{datetime.datetime.now()}: COMPLETE_EP_{ep_num}\n")
                       else:
@@ -1940,12 +1962,10 @@ jobs:
                   except FloodWaitError as e:
                       print(f"⏳ Rate limited: waiting {e.seconds}s")
                       await asyncio.sleep(e.seconds)
-                      success, result = await send_file_with_thumb(client, entity, ep_file, caption, topic_id)
+                      success, result = await send_file_with_thumb(client, entity, ep_file, caption, reply_to=topic_id)
                       if success:
                           count += 1
-                          print(f"✅ Episode {ep_num} uploaded")
-                          with open("episode_upload.log", "a") as f:
-                              f.write(f"{datetime.datetime.now()}: COMPLETE_EP_{ep_num}\n")
+                          print(f"✅ Episode {ep_num} uploaded into topic")
                   except Exception as e:
                       print(f"❌ Episode {ep_num} error: {e}")
                   
@@ -1957,7 +1977,6 @@ jobs:
           async def main():
               try:
                   print("🔌 Connecting to Telegram...")
-                  
                   client = TelegramClient(
                       StringSession(session_string), 
                       int(api_id), 
@@ -1975,43 +1994,19 @@ jobs:
                   print(f"✅ Logged in: {me.first_name}")
                   
                   entity = await resolve_chat(client, chat_id, invite_link, chat_name)
-                  
                   if not entity:
-                      print("❌ Could not resolve chat for episodes!")
+                      print("❌ Could not resolve group for single episodes!")
                       return
                   
-                  print(f"\n📤 Uploading episodes to: {entity.title if hasattr(entity, 'title') else entity.id}")
+                  print(f"\n📤 Target Group: {entity.title if hasattr(entity, 'title') else entity.id}")
                   
-                  topic_id = None
-                  if hasattr(entity, 'forum') and entity.forum:
-                      try:
-                          topic_name = f"[{label}]-{series_title}"
-                          print(f"📝 Creating forum topic: {topic_name[:50]}")
-                          result = await client(CreateForumTopicRequest(
-                              peer=entity,
-                              title=topic_name[:50]
-                          ))
-                          
-                          if hasattr(result, 'updates'):
-                              for update in result.updates:
-                                  if hasattr(update, 'id'):
-                                      topic_id = update.id
-                                      break
-                          if not topic_id and hasattr(result, 'id'):
-                              topic_id = result.id
-                          
-                          if topic_id:
-                              print(f"✅ Topic created: {topic_name[:50]} (ID: {topic_id})")
-                          else:
-                              print(f"⚠️ Topic created but couldn't get ID")
-                      except Exception as e:
-                          print(f"⚠️ Could not create topic: {e}")
+                  topic_name = f"[{label}]-{series_title}"
+                  topic_id = await get_or_create_topic(client, entity, topic_name, topic_id_raw)
                   
                   await upload_episodes(client, entity, topic_id)
                   
                   await client.disconnect()
-                  print("\n✅ Episode upload complete!")
-                          
+                  print("\n✅ Single episode uploads complete!")
               except Exception as e:
                   print(f"❌ Error: {e}")
                   traceback.print_exc()
@@ -2020,14 +2015,11 @@ jobs:
               asyncio.run(main())
           EOFUPLOAD
           
-          echo "🚀 Uploading episodes with parallel upload..."
-          python3 -u upload_single.py
-          
-          echo "done" > single_episodes_complete.txt
-          echo "✅ All episodes uploaded successfully!"
+          python3 upload_single.py
 
       - name: Wait for All Uploads with Enhanced Progress Monitoring
         if: steps.verify.outputs.verify_success == 'true'
+        timeout-minutes: 30
         run: |
           cd downloads
           
