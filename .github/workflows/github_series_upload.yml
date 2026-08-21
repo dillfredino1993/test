@@ -114,6 +114,9 @@ jobs:
           echo "========================================="
 
       - name: Download All Series with yt-dlp
+        env:
+          OK_USERNAME: ${{ secrets.OK_USERNAME }}
+          OK_PASSWORD: ${{ secrets.OK_PASSWORD }}
         run: |
           cd downloads
           
@@ -122,6 +125,25 @@ jobs:
           echo "========================================="
           echo "📊 Total Series: $(cat urls.txt | wc -l)"
           echo "========================================="
+          
+          # Check if OK.ru credentials are available
+          if [ -n "$OK_USERNAME" ] && [ -n "$OK_PASSWORD" ]; then
+            echo "✅ OK.ru credentials found - authentication enabled"
+            # Create cookies file for OK.ru
+            echo "🍪 Setting up OK.ru authentication..."
+            
+            # Use yt-dlp to generate cookies for OK.ru
+            yt-dlp --cookies-from-browser none --username "$OK_USERNAME" --password "$OK_PASSWORD" \
+              --cookies ok_cookies.txt "https://ok.ru/" 2>/dev/null || true
+            
+            if [ -f "ok_cookies.txt" ] && [ -s "ok_cookies.txt" ]; then
+              echo "✅ OK.ru cookies generated successfully"
+            else
+              echo "⚠️ Could not generate OK.ru cookies, will try authentication via --username/--password"
+            fi
+          else
+            echo "ℹ️ No OK.ru credentials found - skipping authentication"
+          fi
           
           TOTAL_SERIES=$(cat urls.txt | wc -l)
           SERIES_INDEX=1
@@ -154,26 +176,49 @@ jobs:
             
             echo "🎬 Using yt-dlp as primary downloader..."
             
-            yt-dlp -f "bestvideo+bestaudio/best" \
+            # Build yt-dlp command with OK.ru authentication
+            YTDLP_CMD="yt-dlp -f 'bestvideo+bestaudio/best' \
               --merge-output-format mp4 \
               --no-progress --no-warnings \
               --no-check-certificate \
-              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              -o "$OUT_FILE" \
-              "$URL" < /dev/null 2>&1
+              --user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'"
+            
+            # Add OK.ru authentication if available
+            if [ -n "$OK_USERNAME" ] && [ -n "$OK_PASSWORD" ]; then
+              if [ -f "ok_cookies.txt" ] && [ -s "ok_cookies.txt" ]; then
+                YTDLP_CMD="$YTDLP_CMD --cookies ok_cookies.txt"
+                echo "🔑 Using OK.ru cookies for authentication"
+              else
+                YTDLP_CMD="$YTDLP_CMD --username '$OK_USERNAME' --password '$OK_PASSWORD'"
+                echo "🔑 Using OK.ru username/password for authentication"
+              fi
+            fi
+            
+            YTDLP_CMD="$YTDLP_CMD -o '$OUT_FILE' '$URL'"
+            
+            eval $YTDLP_CMD < /dev/null 2>&1
             
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
               echo "⚠️ yt-dlp first attempt failed, trying with different options..."
               rm -f "$OUT_FILE"
               
-              yt-dlp -f "bestvideo+bestaudio/best" \
+              YTDLP_CMD="yt-dlp -f 'bestvideo+bestaudio/best' \
                 --merge-output-format mp4 \
                 --hls-prefer-native \
                 --no-progress --no-warnings \
                 --no-check-certificate \
-                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-                -o "$OUT_FILE" \
-                "$URL" < /dev/null 2>&1
+                --user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'"
+              
+              if [ -n "$OK_USERNAME" ] && [ -n "$OK_PASSWORD" ]; then
+                if [ -f "ok_cookies.txt" ] && [ -s "ok_cookies.txt" ]; then
+                  YTDLP_CMD="$YTDLP_CMD --cookies ok_cookies.txt"
+                else
+                  YTDLP_CMD="$YTDLP_CMD --username '$OK_USERNAME' --password '$OK_PASSWORD'"
+                fi
+              fi
+              
+              YTDLP_CMD="$YTDLP_CMD -o '$OUT_FILE' '$URL'"
+              eval $YTDLP_CMD < /dev/null 2>&1
             fi
             
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
@@ -182,36 +227,61 @@ jobs:
               
               DOMAIN=$(echo "$URL" | sed -E 's/(https?:\/\/[^\/]*).*/\1/')
               
-              yt-dlp -f "bestvideo+bestaudio/best" \
+              YTDLP_CMD="yt-dlp -f 'bestvideo+bestaudio/best' \
                 --merge-output-format mp4 \
                 --no-progress --no-warnings \
                 --no-check-certificate \
-                --referer "$DOMAIN" \
-                --add-header "Origin:$DOMAIN" \
-                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-                -o "$OUT_FILE" \
-                "$URL" < /dev/null 2>&1
+                --referer '$DOMAIN' \
+                --add-header 'Origin:$DOMAIN' \
+                --user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'"
+              
+              if [ -n "$OK_USERNAME" ] && [ -n "$OK_PASSWORD" ]; then
+                if [ -f "ok_cookies.txt" ] && [ -s "ok_cookies.txt" ]; then
+                  YTDLP_CMD="$YTDLP_CMD --cookies ok_cookies.txt"
+                else
+                  YTDLP_CMD="$YTDLP_CMD --username '$OK_USERNAME' --password '$OK_PASSWORD'"
+                fi
+              fi
+              
+              YTDLP_CMD="$YTDLP_CMD -o '$OUT_FILE' '$URL'"
+              eval $YTDLP_CMD < /dev/null 2>&1
             fi
             
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
               echo "⚠️ yt-dlp failed, trying aria2c as fallback..."
               rm -f "$OUT_FILE"
               
-              aria2c -x 16 -s 16 -k 1M --continue=true \
+              # Build aria2c command with OK.ru authentication (if available)
+              ARIA2_CMD="aria2c -x 16 -s 16 -k 1M --continue=true \
                 --console-log-level=error \
-                --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
+                --user-agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'"
+              
+              if [ -n "$OK_USERNAME" ] && [ -n "$OK_PASSWORD" ]; then
+                # aria2c doesn't support direct username/password, but we can add headers
+                ARIA2_CMD="$ARIA2_CMD --header='User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'"
+              fi
+              
+              ARIA2_CMD="$ARIA2_CMD -o '$OUT_FILE' '$URL'"
+              eval $ARIA2_CMD < /dev/null 2>/dev/null
             fi
             
             if [ ! -f "$OUT_FILE" ] || [ $(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0") -lt 100000 ]; then
               echo "⚠️ aria2c failed, trying curl as final fallback..."
               rm -f "$OUT_FILE"
               
-              curl -sSL \
-                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-                -H "Accept: */*" \
-                -H "Connection: keep-alive" \
-                "$URL" -o "$OUT_FILE" < /dev/null 2>/dev/null
+              CURL_CMD="curl -sSL \
+                -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' \
+                -H 'Accept: */*' \
+                -H 'Connection: keep-alive'"
+              
+              # Add OK.ru authentication headers if available
+              if [ -n "$OK_USERNAME" ] && [ -n "$OK_PASSWORD" ]; then
+                # Note: curl with basic auth might work for some sites
+                CURL_CMD="$CURL_CMD -u '$OK_USERNAME:$OK_PASSWORD'"
+              fi
+              
+              CURL_CMD="$CURL_CMD '$URL' -o '$OUT_FILE'"
+              eval $CURL_CMD < /dev/null 2>/dev/null
             fi
             
             if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
@@ -228,6 +298,9 @@ jobs:
             SERIES_INDEX=$((SERIES_INDEX + 1))
             echo ""
           done 3< urls.txt
+          
+          # Cleanup cookies file
+          rm -f ok_cookies.txt
           
           echo "========================================="
           echo "📊 DOWNLOAD SUMMARY"
