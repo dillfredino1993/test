@@ -224,17 +224,24 @@ jobs:
             
             DOWNLOAD_SUCCESS=false
             
+            # Extract domain for headers
+            DOMAIN=$(echo "$URL" | sed -E 's|https?://([^/]+).*|\1|')
+            
             # ------------------------------------------------------------
             # CHECK URL TYPE: HLS/m3u8 OR DIRECT VIDEO
             # ------------------------------------------------------------
             if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *".m3u"* ]] || [[ "$URL" == *"master.m3u8"* ]] || [[ "$URL" == *"index.m3u8"* ]]; then
               echo "📺 HLS STREAM DETECTED - Using yt-dlp with Cloudflare impersonation"
               
-              # Use yt-dlp for HLS streams with Cloudflare impersonation
+              # ------------------------------------------------------------
+              # ATTEMPT 1: Try to get the best video format
+              # ------------------------------------------------------------
+              echo "🔍 Attempt 1: Downloading best video+audio format..."
+              
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best" \
+                -f "bestvideo+bestaudio/best" \
                 --merge-output-format mp4 \
                 --hls-use-mpegts \
                 --no-progress \
@@ -244,6 +251,10 @@ jobs:
                 --socket-timeout 300 \
                 --retries 10 \
                 --fragment-retries 10 \
+                --allow-unplayable-formats \
+                --no-part \
+                --no-resize-buffer \
+                --buffer-size 16K \
                 --download-archive "/tmp/ep_${EP_NUM}_archive.txt" \
                 -o "$OUT_FILE" \
                 "$URL" < /dev/null 2>&1
@@ -255,24 +266,171 @@ jobs:
                   DOWNLOAD_SUCCESS=true
                   FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
                   FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-                  echo "✅ Downloaded HLS stream: $OUT_FILE (${FILE_SIZE_MB}MB)"
+                  echo "✅ Downloaded HLS stream with video: $OUT_FILE (${FILE_SIZE_MB}MB)"
                 else
-                  echo "⚠️ HLS download has NO video stream!"
+                  echo "⚠️ No video stream in download! (Only audio detected)"
+                  rm -f "$OUT_FILE" 2>/dev/null
                 fi
               fi
               
-              # If yt-dlp HLS download failed, try with aria2c fallback
+              # ------------------------------------------------------------
+              # ATTEMPT 2: Try with mp4 format selection
+              # ------------------------------------------------------------
               if [ "$DOWNLOAD_SUCCESS" != true ]; then
-                echo "⚠️ HLS download with yt-dlp failed. Trying aria2c fallback..."
+                echo "🔍 Attempt 2: Trying with mp4 format selection..."
+                
+                yt-dlp \
+                  --extractor-args "generic:impersonate" \
+                  --impersonate chrome \
+                  -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+                  --merge-output-format mp4 \
+                  --hls-use-mpegts \
+                  --no-progress \
+                  --no-warnings \
+                  --geo-bypass \
+                  --no-check-certificates \
+                  --socket-timeout 300 \
+                  --retries 10 \
+                  --fragment-retries 10 \
+                  --allow-unplayable-formats \
+                  --no-part \
+                  -o "$OUT_FILE" \
+                  "$URL" < /dev/null 2>&1
+                
+                if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                    DOWNLOAD_SUCCESS=true
+                    FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                    FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+                    echo "✅ Downloaded HLS with mp4 format: $OUT_FILE (${FILE_SIZE_MB}MB)"
+                  else
+                    echo "⚠️ No video stream in mp4 format download!"
+                    rm -f "$OUT_FILE" 2>/dev/null
+                  fi
+                fi
+              fi
+              
+              # ------------------------------------------------------------
+              # ATTEMPT 3: Try with cookies and more headers
+              # ------------------------------------------------------------
+              if [ "$DOWNLOAD_SUCCESS" != true ]; then
+                echo "🔍 Attempt 3: Trying with additional headers and cookies..."
+                
+                yt-dlp \
+                  --extractor-args "generic:impersonate" \
+                  --impersonate chrome \
+                  --add-header "Referer: https://$DOMAIN/" \
+                  --add-header "Origin: https://$DOMAIN" \
+                  --add-header "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                  -f "bestvideo+bestaudio/best" \
+                  --merge-output-format mp4 \
+                  --hls-use-mpegts \
+                  --no-progress \
+                  --no-warnings \
+                  --geo-bypass \
+                  --no-check-certificates \
+                  --socket-timeout 300 \
+                  --retries 10 \
+                  --fragment-retries 10 \
+                  --allow-unplayable-formats \
+                  --no-part \
+                  -o "$OUT_FILE" \
+                  "$URL" < /dev/null 2>&1
+                
+                if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                    DOWNLOAD_SUCCESS=true
+                    FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                    FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+                    echo "✅ Downloaded HLS with headers: $OUT_FILE (${FILE_SIZE_MB}MB)"
+                  else
+                    echo "⚠️ No video stream with headers!"
+                    rm -f "$OUT_FILE" 2>/dev/null
+                  fi
+                fi
+              fi
+              
+              # ------------------------------------------------------------
+              # ATTEMPT 4: Try to get the master playlist and find video stream
+              # ------------------------------------------------------------
+              if [ "$DOWNLOAD_SUCCESS" != true ]; then
+                echo "🔍 Attempt 4: Trying to extract master playlist and find video stream..."
+                
+                # First get the master playlist content
+                MASTER_PLAYLIST=$(curl -s -L -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                  -H "Referer: https://$DOMAIN/" \
+                  "$URL" 2>/dev/null)
+                
+                # Look for video streams in the playlist (usually have resolution or bandwidth)
+                VIDEO_STREAMS=$(echo "$MASTER_PLAYLIST" | grep -E "RESOLUTION|BANDWIDTH|height|width" | head -5)
+                
+                if [ -n "$VIDEO_STREAMS" ]; then
+                  echo "Found video streams in manifest. Trying to extract..."
+                  
+                  # Try with -F to list formats and select one with video
+                  FORMAT_LIST=$(yt-dlp \
+                    --extractor-args "generic:impersonate" \
+                    --impersonate chrome \
+                    -F "$URL" 2>/dev/null | grep -E "video|mp4|h264" | head -5)
+                  
+                  if [ -n "$FORMAT_LIST" ]; then
+                    echo "Available formats with video:"
+                    echo "$FORMAT_LIST"
+                    
+                    # Try format 0 (often the main video)
+                    yt-dlp \
+                      --extractor-args "generic:impersonate" \
+                      --impersonate chrome \
+                      -f "0" \
+                      --merge-output-format mp4 \
+                      --hls-use-mpegts \
+                      --no-progress \
+                      --no-warnings \
+                      --geo-bypass \
+                      --no-check-certificates \
+                      --socket-timeout 300 \
+                      --retries 10 \
+                      --fragment-retries 10 \
+                      --allow-unplayable-formats \
+                      --no-part \
+                      -o "$OUT_FILE" \
+                      "$URL" < /dev/null 2>&1
+                    
+                    if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                      HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                      if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                        DOWNLOAD_SUCCESS=true
+                        echo "✅ Downloaded with format 0: $OUT_FILE"
+                      else
+                        rm -f "$OUT_FILE" 2>/dev/null
+                      fi
+                    fi
+                  fi
+                fi
+              fi
+              
+              # ------------------------------------------------------------
+              # ATTEMPT 5: Try aria2c as fallback
+              # ------------------------------------------------------------
+              if [ "$DOWNLOAD_SUCCESS" != true ]; then
+                echo "⚠️ All yt-dlp attempts failed. Trying aria2c fallback..."
+                
                 aria2c -x 16 -s 16 -k 1M --continue=true \
                   --console-log-level=error \
+                  --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                  --header="Referer: https://$DOMAIN/" \
                   -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
                 
                 if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
                   HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
                   if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
                     DOWNLOAD_SUCCESS=true
-                    echo "✅ Downloaded HLS with aria2c fallback: $OUT_FILE"
+                    echo "✅ Downloaded HLS with aria2c: $OUT_FILE"
+                  else
+                    echo "⚠️ aria2c download has no video stream!"
+                    rm -f "$OUT_FILE" 2>/dev/null
                   fi
                 fi
               fi
@@ -303,10 +461,11 @@ jobs:
                   echo "✅ Downloaded with aria2c: $OUT_FILE (${FILE_SIZE_MB}MB)"
                 else
                   echo "⚠️ aria2c download has NO video stream!"
+                  rm -f "$OUT_FILE" 2>/dev/null
                 fi
               fi
               
-              # If aria2c failed, try yt-dlp as fallback (with Cloudflare impersonation)
+              # If aria2c failed, try yt-dlp as fallback
               if [ "$DOWNLOAD_SUCCESS" != true ]; then
                 echo "⚠️ aria2c failed. Trying yt-dlp fallback with Cloudflare impersonation..."
                 
@@ -327,13 +486,15 @@ jobs:
                   if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
                     DOWNLOAD_SUCCESS=true
                     echo "✅ Downloaded with yt-dlp fallback: $OUT_FILE"
+                  else
+                    rm -f "$OUT_FILE" 2>/dev/null
                   fi
                 fi
               fi
             fi
             
             # ------------------------------------------------------------
-            # ULTIMATE FALLBACK: Try yt-dlp with external downloader for any URL
+            # ATTEMPT 6: ULTIMATE FALLBACK - yt-dlp with aria2c external
             # ------------------------------------------------------------
             if [ "$DOWNLOAD_SUCCESS" != true ]; then
               echo "⚠️ Primary download methods failed. Trying yt-dlp with aria2c external..."
@@ -359,6 +520,8 @@ jobs:
                 if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
                   DOWNLOAD_SUCCESS=true
                   echo "✅ Downloaded with yt-dlp+aria2c: $OUT_FILE"
+                else
+                  rm -f "$OUT_FILE" 2>/dev/null
                 fi
               fi
             fi
@@ -392,9 +555,11 @@ jobs:
                     echo "✅ Created video from audio for Episode $EP_INDEX"
                   else
                     echo "❌ Failed to create video from audio!"
+                    rm -f "$OUT_FILE" 2>/dev/null
                   fi
                 else
                   echo "❌ File has neither video nor audio!"
+                  rm -f "$OUT_FILE" 2>/dev/null
                 fi
               else
                 echo "❌ No file downloaded at all!"
