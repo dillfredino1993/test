@@ -239,7 +239,7 @@ jobs:
             if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *".m3u"* ]] || [[ "$URL" == *"master.m3u8"* ]]; then
               echo "📺 HLS STREAM DETECTED - Using yt-dlp"
               
-              # Use yt-dlp for HLS streams with proper format selection
+              # Use yt-dlp for HLS streams
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
@@ -254,48 +254,10 @@ jobs:
                 --socket-timeout 300 \
                 --retries 10 \
                 --fragment-retries 10 \
-                --download-archive "/tmp/ep_${EP_NUM}_archive.txt" \
                 -o "$OUT_FILE" \
                 "$URL" 2>/dev/null
               
-              # Check if file was downloaded and has video
-              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
-                FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
-                if [ "$FILE_SIZE" -gt 100000 ]; then
-                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
-                    DOWNLOAD_SUCCESS=true
-                    FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-                    echo "✅ Downloaded HLS stream: $OUT_FILE (${FILE_SIZE_MB}MB)"
-                  else
-                    echo "⚠️ HLS download has NO video stream - will fixup"
-                  fi
-                else
-                  echo "⚠️ HLS download file too small (${FILE_SIZE} bytes) - likely corrupt"
-                  rm -f "$OUT_FILE" 2>/dev/null
-                fi
-              fi
-              
-              # If yt-dlp HLS download failed, try with aria2c fallback
-              if [ "$DOWNLOAD_SUCCESS" != true ]; then
-                echo "⚠️ HLS download with yt-dlp failed. Trying aria2c fallback..."
-                rm -f "$OUT_FILE" 2>/dev/null
-                
-                aria2c -x 16 -s 16 -k 1M --continue=true \
-                  --console-log-level=error \
-                  -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
-                
-                if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
-                  FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
-                  if [ "$FILE_SIZE" -gt 100000 ]; then
-                    HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                    if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
-                      DOWNLOAD_SUCCESS=true
-                      echo "✅ Downloaded HLS with aria2c fallback: $OUT_FILE"
-                    fi
-                  fi
-                fi
-              fi
+              echo "✅ yt-dlp download complete, checking file..."
               
             else
               # ------------------------------------------------------------
@@ -303,7 +265,6 @@ jobs:
               # ------------------------------------------------------------
               echo "🎬 DIRECT VIDEO DETECTED - Using aria2c for fast download"
               
-              # Try aria2c first (faster for direct downloads)
               aria2c -x 16 -s 16 -k 1M --continue=true \
                 --console-log-level=error \
                 --max-connection-per-server=16 \
@@ -313,92 +274,11 @@ jobs:
                 --max-download-limit=0 \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
               
-              # Verify aria2c download
-              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
-                FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
-                if [ "$FILE_SIZE" -gt 100000 ]; then
-                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
-                    DOWNLOAD_SUCCESS=true
-                    FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-                    echo "✅ Downloaded with aria2c: $OUT_FILE (${FILE_SIZE_MB}MB)"
-                  else
-                    echo "⚠️ aria2c download has NO video stream - will fixup"
-                  fi
-                else
-                  echo "⚠️ aria2c download file too small (${FILE_SIZE} bytes) - likely corrupt"
-                  rm -f "$OUT_FILE" 2>/dev/null
-                fi
-              fi
-              
-              # If aria2c failed, try yt-dlp as fallback
-              if [ "$DOWNLOAD_SUCCESS" != true ]; then
-                echo "⚠️ aria2c failed. Trying yt-dlp fallback..."
-                rm -f "$OUT_FILE" 2>/dev/null
-                
-                yt-dlp \
-                  --extractor-args "generic:impersonate" \
-                  --impersonate chrome \
-                  -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best" \
-                  --merge-output-format mp4 \
-                  --hls-use-mpegts \
-                  --no-progress \
-                  --no-warnings \
-                  --quiet \
-                  --geo-bypass \
-                  -o "$OUT_FILE" \
-                  "$URL" 2>/dev/null
-                
-                if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
-                  FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
-                  if [ "$FILE_SIZE" -gt 100000 ]; then
-                    HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                    if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
-                      DOWNLOAD_SUCCESS=true
-                      echo "✅ Downloaded with yt-dlp fallback: $OUT_FILE"
-                    fi
-                  fi
-                fi
-              fi
+              echo "✅ aria2c download complete, checking file..."
             fi
             
             # ------------------------------------------------------------
-            # ULTIMATE FALLBACK: Try yt-dlp with external downloader for any URL
-            # ------------------------------------------------------------
-            if [ "$DOWNLOAD_SUCCESS" != true ]; then
-              echo "⚠️ Primary download methods failed. Trying yt-dlp with aria2c external..."
-              
-              rm -f "$OUT_FILE" 2>/dev/null
-              
-              yt-dlp \
-                --extractor-args "generic:impersonate" \
-                --impersonate chrome \
-                -f "bestvideo+bestaudio/best" \
-                --merge-output-format mp4 \
-                --hls-use-mpegts \
-                --external-downloader aria2c \
-                --external-downloader-args "-x 16 -s 16 -k 1M" \
-                --no-progress \
-                --no-warnings \
-                --quiet \
-                --geo-bypass \
-                -o "$OUT_FILE" \
-                "$URL" 2>/dev/null
-              
-              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
-                FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
-                if [ "$FILE_SIZE" -gt 100000 ]; then
-                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
-                    DOWNLOAD_SUCCESS=true
-                    echo "✅ Downloaded with yt-dlp+aria2c: $OUT_FILE"
-                  fi
-                fi
-              fi
-            fi
-            
-            # ------------------------------------------------------------
-            # MPEG-TS FIXUP: Check and fix container if needed
+            # CHECK AND FIX MPEG-TS CONTAINER IMMEDIATELY
             # ------------------------------------------------------------
             if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
@@ -430,7 +310,7 @@ jobs:
                   fi
                 fi
                 
-                # Apply fixup if needed
+                # Apply fixup if needed - DO THIS BEFORE ANY OTHER RETRY
                 if [ "$NEEDS_FIXUP" = true ]; then
                   echo "🔧 Fixing MPEG-TS to MP4 container (re-encoding with veryfast preset)..."
                   
@@ -456,34 +336,111 @@ jobs:
                         DOWNLOAD_SUCCESS=true
                         FIXED_SIZE_MB=$((FIXED_SIZE / 1024 / 1024))
                         echo "✅ Fixup successful: $OUT_FILE (${FIXED_SIZE_MB}MB)"
+                        
+                        # Show video info
+                        W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                        H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                        echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FIXED_SIZE_MB}MB, ${W}x${H})"
                       else
                         echo "⚠️ Fixed file too small (${FIXED_SIZE} bytes), keeping original"
                         rm -f "$FIXED_FILE" 2>/dev/null
+                        # Try to use original file
+                        HAS_VIDEO_ORIG=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                        if [ -n "$HAS_VIDEO_ORIG" ] && [ "$HAS_VIDEO_ORIG" = "video" ]; then
+                          DOWNLOAD_SUCCESS=true
+                          echo "✅ Using original file: $OUT_FILE"
+                        fi
                       fi
                     else
                       echo "⚠️ Fixup produced file without video, keeping original"
                       rm -f "$FIXED_FILE" 2>/dev/null
+                      # Try to use original file
+                      HAS_VIDEO_ORIG=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                      if [ -n "$HAS_VIDEO_ORIG" ] && [ "$HAS_VIDEO_ORIG" = "video" ]; then
+                        DOWNLOAD_SUCCESS=true
+                        echo "✅ Using original file: $OUT_FILE"
+                      fi
                     fi
                   else
                     echo "⚠️ Fixup failed, using original file"
                     rm -f "$FIXED_FILE" 2>/dev/null
+                    # Try to use original file
+                    HAS_VIDEO_ORIG=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    if [ -n "$HAS_VIDEO_ORIG" ] && [ "$HAS_VIDEO_ORIG" = "video" ]; then
+                      DOWNLOAD_SUCCESS=true
+                      echo "✅ Using original file: $OUT_FILE"
+                    fi
+                  fi
+                else
+                  # No fixup needed, file is good
+                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                    DOWNLOAD_SUCCESS=true
+                    FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+                    W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FILE_SIZE_MB}MB, ${W}x${H})"
                   fi
                 fi
-                
-                # Final verification after potential fixup
-                if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
-                  FINAL_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
-                  if [ "$FINAL_SIZE" -gt 100000 ]; then
-                    HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                    if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
-                      DOWNLOAD_SUCCESS=true
-                      FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
-                      W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                      H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                      echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FINAL_SIZE_MB}MB, ${W}x${H})"
-                    else
-                      echo "⚠️ File still has NO video stream after fixup!"
+              else
+                echo "⚠️ File too small (${FILE_SIZE} bytes) - likely corrupt"
+                rm -f "$OUT_FILE" 2>/dev/null
+              fi
+            fi
+            
+            # ------------------------------------------------------------
+            # FALLBACK: If fixup didn't work or file is still bad, try yt-dlp with external downloader
+            # ------------------------------------------------------------
+            if [ "$DOWNLOAD_SUCCESS" != true ]; then
+              echo "⚠️ Primary download/fixup failed. Trying yt-dlp with aria2c external..."
+              
+              rm -f "$OUT_FILE" 2>/dev/null
+              
+              yt-dlp \
+                --extractor-args "generic:impersonate" \
+                --impersonate chrome \
+                -f "bestvideo+bestaudio/best" \
+                --merge-output-format mp4 \
+                --hls-use-mpegts \
+                --external-downloader aria2c \
+                --external-downloader-args "-x 16 -s 16 -k 1M" \
+                --no-progress \
+                --no-warnings \
+                --quiet \
+                --geo-bypass \
+                -o "$OUT_FILE" \
+                "$URL" 2>/dev/null
+              
+              # Check the fallback download
+              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                if [ "$FILE_SIZE" -gt 100000 ]; then
+                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                    DOWNLOAD_SUCCESS=true
+                    echo "✅ Downloaded with yt-dlp+aria2c: $OUT_FILE"
+                  else
+                    # Try one more fixup on the fallback download
+                    echo "🔄 Fallback download has no video, trying fixup..."
+                    ffmpeg -y -err_detect ignore_err -i "$OUT_FILE" \
+                      -c:v libx264 -preset veryfast -crf 23 \
+                      -c:a aac -b:a 128k -ar 44100 \
+                      -movflags +faststart \
+                      -metadata title="Episode $EP_INDEX - $SERIES_TITLE" \
+                      -metadata episode_id="$EP_INDEX" \
+                      -metadata series="$SERIES_TITLE" \
+                      -metadata label="$LABEL" \
+                      "$FIXED_FILE" 2>/dev/null
+                    
+                    if [ -f "$FIXED_FILE" ] && [ -s "$FIXED_FILE" ]; then
+                      HAS_VIDEO_FIXED=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FIXED_FILE" 2>/dev/null)
+                      if [ -n "$HAS_VIDEO_FIXED" ] && [ "$HAS_VIDEO_FIXED" = "video" ]; then
+                        mv "$FIXED_FILE" "$OUT_FILE"
+                        DOWNLOAD_SUCCESS=true
+                        echo "✅ Fallback fixup successful: $OUT_FILE"
+                      fi
                     fi
+                    rm -f "$FIXED_FILE" 2>/dev/null
                   fi
                 fi
               fi
