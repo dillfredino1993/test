@@ -858,7 +858,7 @@ jobs:
           done
           echo ""
 
-      - name: Smart Merge Episodes with mkvmerge
+      - name: Smart Merge Episodes with mkvmerge --append-to
         id: merge
         timeout-minutes: 120
         run: |
@@ -931,8 +931,18 @@ jobs:
           NEEDS_REDOWNLOAD=false
           REDOWNLOAD_LIST=""
           
+          # Calculate total duration first
+          TOTAL_DURATION=0
+          
           for f in "${SORTED_FILES[@]}"; do
             if [ ! -f "$f" ]; then continue; fi
+            
+            # Get duration for this file
+            DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "0")
+            DURATION_INT=${DURATION%.*}
+            if [ "$DURATION_INT" -gt 0 ]; then
+              TOTAL_DURATION=$((TOTAL_DURATION + DURATION_INT))
+            fi
             
             HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$f" 2>/dev/null)
             
@@ -957,6 +967,8 @@ jobs:
               fi
             fi
           done
+          
+          echo "📊 Total expected duration: ${TOTAL_DURATION} seconds ($((TOTAL_DURATION / 60)) minutes)"
           
           # Redownload episodes that need it
           if [ "$NEEDS_REDOWNLOAD" = true ]; then
@@ -1040,17 +1052,27 @@ jobs:
           
           echo ""
           echo "✅ All files validated!"
-          echo "📊 MERGING: Using mkvmerge..."
+          echo "📊 MERGING: Using mkvmerge with append..."
           
-          # Build mkvmerge command
-          MKVMERGE_CMD="mkvmerge -o \"$OUTPUT_FILE\""
-          for f in "${SORTED_FILES[@]}"; do
-            MKVMERGE_CMD="$MKVMERGE_CMD \"$f\""
+          # ------------------------------------------------------------
+          # Build mkvmerge command with proper --append-to
+          # ------------------------------------------------------------
+          
+          # Start with the first file
+          MKVMERGE_CMD="mkvmerge -o \"$OUTPUT_FILE\" \"${SORTED_FILES[0]}\""
+          
+          # For each subsequent file, append video and audio tracks
+          # Track IDs are typically 0 for video, 1 for audio in MP4 files
+          for ((i=1; i<${#SORTED_FILES[@]}; i++)); do
+            FILE="${SORTED_FILES[$i]}"
+            # Append video track (track 0) from current file to video track (track 0) of previous
+            # Append audio track (track 1) from current file to audio track (track 1) of previous
+            MKVMERGE_CMD="$MKVMERGE_CMD \"$FILE\" --append-to ${i}:0:0 ${i}:1:1"
           done
+          
           MKVMERGE_CMD="$MKVMERGE_CMD --title \"$TITLE\""
           
-          echo "🔄 Running mkvmerge..."
-          echo "Command: $MKVMERGE_CMD"
+          echo "🔄 Running mkvmerge with append..."
           
           # Execute mkvmerge
           eval $MKVMERGE_CMD 2>&1
@@ -1061,10 +1083,10 @@ jobs:
             if mediainfo "$OUTPUT_FILE" 2>/dev/null | grep -q "Video"; then
               echo "✅ mkvmerge merge successful!"
               
-              # Get duration
-              MERGED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
-              MERGED_DURATION_INT=${MERGED_DURATION%.*}
-              echo "📊 Merged file duration: ${MERGED_DURATION_INT} seconds"
+              # Get the actual merged file duration
+              ACTUAL_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
+              ACTUAL_DURATION_INT=${ACTUAL_DURATION%.*}
+              echo "📊 Merged file duration: ${ACTUAL_DURATION_INT} seconds ($((ACTUAL_DURATION_INT / 60)) minutes)"
               
               # Generate thumbnails
               echo "🖼️ Generating thumbnails..."
@@ -1086,6 +1108,7 @@ jobs:
               echo "========================================="
               echo "📺 Series: $SERIES_TITLE"
               echo "📁 File: $OUTPUT_FILE"
+              echo "⏱️  Duration: ${ACTUAL_DURATION_INT} seconds ($((ACTUAL_DURATION_INT / 60)) minutes)"
               ls -lh "$OUTPUT_FILE"
               echo "========================================="
             else
@@ -1131,7 +1154,7 @@ jobs:
                 
                 MERGED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
                 MERGED_DURATION_INT=${MERGED_DURATION%.*}
-                echo "📊 Merged file duration: ${MERGED_DURATION_INT} seconds"
+                echo "📊 Merged file duration: ${MERGED_DURATION_INT} seconds ($((MERGED_DURATION_INT / 60)) minutes)"
                 
                 # Generate thumbnails
                 echo "🖼️ Generating thumbnails..."
@@ -1153,6 +1176,7 @@ jobs:
                 echo "========================================="
                 echo "📺 Series: $SERIES_TITLE"
                 echo "📁 File: $OUTPUT_FILE"
+                echo "⏱️  Duration: ${MERGED_DURATION_INT} seconds ($((MERGED_DURATION_INT / 60)) minutes)"
                 ls -lh "$OUTPUT_FILE"
                 echo "========================================="
               else
@@ -1370,8 +1394,7 @@ jobs:
           
           if [ ! -f "${{ env.merged_file_path }}" ] && [ ! -f "${{ steps.fname.outputs.output_filename }}" ]; then
             echo "❌ Merged file not found!"
-            exit 1
-          fi
+            exit 1          fi
           
           if [ -f "${{ env.merged_file_path }}" ]; then
             export MERGED_PATH="${{ env.merged_file_path }}"
@@ -2252,8 +2275,7 @@ jobs:
             fi
             
             local percent=$(echo "scale=2; ($current / $total) * 100" | bc 2>/dev/null || echo "0")
-            if [ "$(echo "$percent > 0" | bc)" = "0" ]; then
-              echo "Calculating..."
+            if [ "$(echo "$percent > 0" | bc)" = "0" ]; then              echo "Calculating..."
               return
             fi
             
