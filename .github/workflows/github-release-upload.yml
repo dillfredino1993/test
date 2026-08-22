@@ -1056,18 +1056,19 @@ jobs:
           
           # ------------------------------------------------------------
           # Build mkvmerge command with proper --append-to
+          # Format: --append-to source_file_id:source_track_id:target_file_id:target_track_id
           # ------------------------------------------------------------
           
-          # Start with the first file
+          # Start with the first file (file ID 0)
           MKVMERGE_CMD="mkvmerge -o \"$OUTPUT_FILE\" \"${SORTED_FILES[0]}\""
           
           # For each subsequent file, append video and audio tracks
-          # Track IDs are typically 0 for video, 1 for audio in MP4 files
+          # File IDs start at 0 for the first file, 1 for the second, etc.
           for ((i=1; i<${#SORTED_FILES[@]}; i++)); do
             FILE="${SORTED_FILES[$i]}"
-            # Append video track (track 0) from current file to video track (track 0) of previous
-            # Append audio track (track 1) from current file to audio track (track 1) of previous
-            MKVMERGE_CMD="$MKVMERGE_CMD \"$FILE\" --append-to ${i}:0:0 ${i}:1:1"
+            # Append video track (track 0) from current file to video track (track 0) of the first file
+            # Target file ID is always 0 (the first file we're appending to)
+            MKVMERGE_CMD="$MKVMERGE_CMD \"$FILE\" --append-to ${i}:0:0:0 ${i}:1:0:1"
           done
           
           MKVMERGE_CMD="$MKVMERGE_CMD --title \"$TITLE\""
@@ -1394,7 +1395,8 @@ jobs:
           
           if [ ! -f "${{ env.merged_file_path }}" ] && [ ! -f "${{ steps.fname.outputs.output_filename }}" ]; then
             echo "❌ Merged file not found!"
-            exit 1          fi
+            exit 1
+          fi
           
           if [ -f "${{ env.merged_file_path }}" ]; then
             export MERGED_PATH="${{ env.merged_file_path }}"
@@ -2275,7 +2277,8 @@ jobs:
             fi
             
             local percent=$(echo "scale=2; ($current / $total) * 100" | bc 2>/dev/null || echo "0")
-            if [ "$(echo "$percent > 0" | bc)" = "0" ]; then              echo "Calculating..."
+            if [ "$(echo "$percent > 0" | bc)" = "0" ]; then
+              echo "Calculating..."
               return
             fi
             
