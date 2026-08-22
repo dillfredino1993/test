@@ -858,7 +858,7 @@ jobs:
           done
           echo ""
 
-          - name: Smart Merge Episodes with mkvmerge
+      - name: Smart Merge Episodes with mkvmerge
         id: merge
         timeout-minutes: 120
         run: |
@@ -1052,29 +1052,24 @@ jobs:
           
           echo ""
           echo "✅ All files validated!"
-          echo "📊 MERGING: Using mkvmerge with append..."
+          echo "📊 MERGING: Using mkvmerge with append mode..."
           
           # ------------------------------------------------------------
-          # Build mkvmerge command using the simple + operator approach
-          # This is more reliable than --append-to for many files
+          # Use mkvmerge with append-mode track - simple and reliable
+          # This automatically appends tracks from subsequent files to the first file
           # ------------------------------------------------------------
           
-          # Create a list file for mkvmerge
-          MERGE_LIST="merge_list.txt"
-          > $MERGE_LIST
+          # Build the command with all files in order
+          MKVMERGE_CMD="mkvmerge -o \"$OUTPUT_FILE\" --append-mode track --title \"$TITLE\""
           
           for f in "${SORTED_FILES[@]}"; do
-            echo "file '$f'" >> $MERGE_LIST
+            MKVMERGE_CMD="$MKVMERGE_CMD \"$f\""
           done
           
-          echo "🔄 Running mkvmerge with file list..."
+          echo "🔄 Running mkvmerge with append-mode..."
           
-          # Use mkvmerge with the list file
-          mkvmerge -o "$OUTPUT_FILE" \
-            --title "$TITLE" \
-            --append-mode track \
-            $(for f in "${SORTED_FILES[@]}"; do echo -n "\"$f\" "; done) \
-            2>&1
+          # Execute mkvmerge
+          eval $MKVMERGE_CMD 2>&1
           
           # Check if merge was successful
           if [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ]; then
