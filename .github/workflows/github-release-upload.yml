@@ -1057,6 +1057,7 @@ jobs:
           # ------------------------------------------------------------
           # Build mkvmerge command with proper --append-to
           # Format: --append-to source_file_id:source_track_id:target_file_id:target_track_id
+          # Note: Each --append-to must be a separate argument with the flag
           # ------------------------------------------------------------
           
           # Start with the first file (file ID 0)
@@ -1066,9 +1067,10 @@ jobs:
           # File IDs start at 0 for the first file, 1 for the second, etc.
           for ((i=1; i<${#SORTED_FILES[@]}; i++)); do
             FILE="${SORTED_FILES[$i]}"
+            # Add the file with its --append-to mappings
             # Append video track (track 0) from current file to video track (track 0) of the first file
-            # Target file ID is always 0 (the first file we're appending to)
-            MKVMERGE_CMD="$MKVMERGE_CMD \"$FILE\" --append-to ${i}:0:0:0 ${i}:1:0:1"
+            # Append audio track (track 1) from current file to audio track (track 1) of the first file
+            MKVMERGE_CMD="$MKVMERGE_CMD \"$FILE\" --append-to ${i}:0:0:0 --append-to ${i}:1:0:1"
           done
           
           MKVMERGE_CMD="$MKVMERGE_CMD --title \"$TITLE\""
