@@ -858,7 +858,7 @@ jobs:
           done
           echo ""
 
-      - name: Smart Merge Episodes with mkvmerge --append-to
+          - name: Smart Merge Episodes with mkvmerge
         id: merge
         timeout-minutes: 120
         run: |
@@ -1055,30 +1055,26 @@ jobs:
           echo "📊 MERGING: Using mkvmerge with append..."
           
           # ------------------------------------------------------------
-          # Build mkvmerge command with proper --append-to
-          # Format: --append-to source_file_id:source_track_id:target_file_id:target_track_id
-          # Note: Each --append-to must be a separate argument with the flag
+          # Build mkvmerge command using the simple + operator approach
+          # This is more reliable than --append-to for many files
           # ------------------------------------------------------------
           
-          # Start with the first file (file ID 0)
-          MKVMERGE_CMD="mkvmerge -o \"$OUTPUT_FILE\" \"${SORTED_FILES[0]}\""
+          # Create a list file for mkvmerge
+          MERGE_LIST="merge_list.txt"
+          > $MERGE_LIST
           
-          # For each subsequent file, append video and audio tracks
-          # File IDs start at 0 for the first file, 1 for the second, etc.
-          for ((i=1; i<${#SORTED_FILES[@]}; i++)); do
-            FILE="${SORTED_FILES[$i]}"
-            # Add the file with its --append-to mappings
-            # Append video track (track 0) from current file to video track (track 0) of the first file
-            # Append audio track (track 1) from current file to audio track (track 1) of the first file
-            MKVMERGE_CMD="$MKVMERGE_CMD \"$FILE\" --append-to ${i}:0:0:0 --append-to ${i}:1:0:1"
+          for f in "${SORTED_FILES[@]}"; do
+            echo "file '$f'" >> $MERGE_LIST
           done
           
-          MKVMERGE_CMD="$MKVMERGE_CMD --title \"$TITLE\""
+          echo "🔄 Running mkvmerge with file list..."
           
-          echo "🔄 Running mkvmerge with append..."
-          
-          # Execute mkvmerge
-          eval $MKVMERGE_CMD 2>&1
+          # Use mkvmerge with the list file
+          mkvmerge -o "$OUTPUT_FILE" \
+            --title "$TITLE" \
+            --append-mode track \
+            $(for f in "${SORTED_FILES[@]}"; do echo -n "\"$f\" "; done) \
+            2>&1
           
           # Check if merge was successful
           if [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ]; then
