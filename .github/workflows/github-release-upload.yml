@@ -74,7 +74,7 @@ jobs:
           echo "📦 Updating apt cache..."
           sudo apt-get update -qq -o Acquire::ForceIPv4=true -o Acquire::Retries=3 || true
           
-          echo "📦 Installing system packages (ffmpeg, aria2, mkvtoolnix, mediainfo, exiftool, bc)..."
+          echo "📦 Installing system packages (aria2, mkvtoolnix, mediainfo, exiftool, bc)..."
           sudo apt-get install $APT_FLAGS ffmpeg aria2 mkvtoolnix mediainfo libimage-exiftool-perl bc jq || {
             echo "⚠️ Retrying package install individually..."
             for pkg in ffmpeg aria2 mkvtoolnix mediainfo libimage-exiftool-perl bc jq; do
@@ -188,17 +188,17 @@ jobs:
           
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
-      - name: Download All Episodes First (Pure Download)
+      - name: Download All Episodes First
         timeout-minutes: 120
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
-          LABEL: ${{ steps.fname.outputs.clean_label }}
+          LABEL: ${{ github.event.client_payload.label || 'NONE' }}
         run: |
           cd downloads
           
           echo "========================================="
-          echo "📥 DOWNLOADING ALL EPISODES (FAST BATCH)"
+          echo "📥 DOWNLOADING ALL EPISODES"
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Total Episodes: $(cat urls.txt | wc -l)"
@@ -208,20 +208,38 @@ jobs:
           EP_INDEX=1
           FAILED_DOWNLOADS=""
           
+          # Store URLs in array for redownload if needed
+          declare -a URL_ARRAY
+          while IFS= read -r line; do
+            URL_ARRAY+=("$line")
+          done < urls.txt
+          
           while IFS= read -u 3 -r URL || [ -n "$URL" ]; do
             URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [ -z "$URL" ]; then continue; fi
             
             EP_NUM=$(printf "%02d" $EP_INDEX)
             OUT_FILE="EP${EP_NUM}.mp4"
+            FIXED_FILE="EP${EP_NUM}_fixed.mp4"
             
-            echo "📥 Downloading Episode $EP_INDEX/$TOTAL_EPISODES -> $OUT_FILE"
-            rm -f "$OUT_FILE" 2>/dev/null
+            echo "========================================="
+            echo "📥 Downloading Episode $EP_INDEX/$TOTAL_EPISODES"
+            echo "📎 URL: $URL"
+            echo "💾 Output: $OUT_FILE"
+            echo "========================================="
+            
+            # Clean up any existing files
+            rm -f "$OUT_FILE" "$FIXED_FILE" 2>/dev/null
             
             DOWNLOAD_SUCCESS=false
             
+            # ------------------------------------------------------------
+            # CHECK URL TYPE: HLS/m3u8 OR DIRECT VIDEO
+            # ------------------------------------------------------------
             if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *".m3u"* ]] || [[ "$URL" == *"master.m3u8"* ]]; then
-              # HLS Stream via yt-dlp
+              echo "📺 HLS STREAM DETECTED - Using yt-dlp"
+              
+              # Use yt-dlp for HLS streams
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
@@ -238,8 +256,15 @@ jobs:
                 --fragment-retries 10 \
                 -o "$OUT_FILE" \
                 "$URL" 2>/dev/null
+              
+              echo "✅ yt-dlp download complete, checking file..."
+              
             else
-              # Direct Video via aria2c
+              # ------------------------------------------------------------
+              # DIRECT VIDEO URL - Use aria2c for speed
+              # ------------------------------------------------------------
+              echo "🎬 DIRECT VIDEO DETECTED - Using aria2c for fast download"
+              
               aria2c -x 16 -s 16 -k 1M --continue=true \
                 --console-log-level=error \
                 --max-connection-per-server=16 \
@@ -248,21 +273,127 @@ jobs:
                 --max-overall-download-limit=0 \
                 --max-download-limit=0 \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
+              
+              echo "✅ aria2c download complete, checking file..."
             fi
             
-            # Check if file was created and is non-empty (>100KB)
+            # ------------------------------------------------------------
+            # CHECK AND FIX MPEG-TS CONTAINER IMMEDIATELY
+            # ------------------------------------------------------------
             if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+              
               if [ "$FILE_SIZE" -gt 100000 ]; then
-                DOWNLOAD_SUCCESS=true
-                FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-                echo "   ✅ Episode $EP_INDEX downloaded (${FILE_SIZE_MB}MB)"
+                # Check if file needs fixup (MPEG-TS container)
+                NEEDS_FIXUP=false
+                
+                # Check container format
+                CONTAINER=$(ffprobe -v error -show_entries format=format_name -of default=noprint_wrappers=1:nokey=1 "$OUT_FILE" 2>/dev/null | head -1)
+                if [[ "$CONTAINER" == *"mpegts"* ]] || [[ "$CONTAINER" == *"mpeg"* ]]; then
+                  NEEDS_FIXUP=true
+                  echo "🔄 Detected MPEG-TS container, applying fixup..."
+                fi
+                
+                # Check if file has video stream
+                HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
+                  NEEDS_FIXUP=true
+                  echo "🔄 File has no video stream, attempting fixup..."
+                fi
+                
+                # Also check for MPEG-TS in the file format string
+                if [ "$NEEDS_FIXUP" != true ]; then
+                  FORMAT_INFO=$(ffprobe -v error -show_entries format=format_long_name -of default=noprint_wrappers=1:nokey=1 "$OUT_FILE" 2>/dev/null | head -1)
+                  if [[ "$FORMAT_INFO" == *"MPEG-TS"* ]] || [[ "$FORMAT_INFO" == *"MPEGTS"* ]]; then
+                    NEEDS_FIXUP=true
+                    echo "🔄 Detected MPEG-TS format, applying fixup..."
+                  fi
+                fi
+                
+                # Apply fixup if needed - DO THIS BEFORE ANY OTHER RETRY
+                if [ "$NEEDS_FIXUP" = true ]; then
+                  echo "🔧 Fixing MPEG-TS to MP4 container (re-encoding with veryfast preset)..."
+                  
+                  # Use ffmpeg to fix the file
+                  ffmpeg -y -err_detect ignore_err -i "$OUT_FILE" \
+                    -c:v libx264 -preset veryfast -crf 23 \
+                    -c:a aac -b:a 128k -ar 44100 \
+                    -movflags +faststart \
+                    -metadata title="Episode $EP_INDEX - $SERIES_TITLE" \
+                    -metadata episode_id="$EP_INDEX" \
+                    -metadata series="$SERIES_TITLE" \
+                    -metadata label="$LABEL" \
+                    "$FIXED_FILE" 2>/dev/null
+                  
+                  if [ -f "$FIXED_FILE" ] && [ -s "$FIXED_FILE" ]; then
+                    # Verify the fixed file has video
+                    HAS_VIDEO_FIXED=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FIXED_FILE" 2>/dev/null)
+                    if [ -n "$HAS_VIDEO_FIXED" ] && [ "$HAS_VIDEO_FIXED" = "video" ]; then
+                      # Check fixed file size
+                      FIXED_SIZE=$(stat -c%s "$FIXED_FILE" 2>/dev/null || stat -f%z "$FIXED_FILE" 2>/dev/null || echo "0")
+                      if [ "$FIXED_SIZE" -gt 100000 ]; then
+                        mv "$FIXED_FILE" "$OUT_FILE"
+                        DOWNLOAD_SUCCESS=true
+                        FIXED_SIZE_MB=$((FIXED_SIZE / 1024 / 1024))
+                        echo "✅ Fixup successful: $OUT_FILE (${FIXED_SIZE_MB}MB)"
+                        
+                        # Show video info
+                        W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                        H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                        echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FIXED_SIZE_MB}MB, ${W}x${H})"
+                      else
+                        echo "⚠️ Fixed file too small (${FIXED_SIZE} bytes), keeping original"
+                        rm -f "$FIXED_FILE" 2>/dev/null
+                        # Try to use original file
+                        HAS_VIDEO_ORIG=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                        if [ -n "$HAS_VIDEO_ORIG" ] && [ "$HAS_VIDEO_ORIG" = "video" ]; then
+                          DOWNLOAD_SUCCESS=true
+                          echo "✅ Using original file: $OUT_FILE"
+                        fi
+                      fi
+                    else
+                      echo "⚠️ Fixup produced file without video, keeping original"
+                      rm -f "$FIXED_FILE" 2>/dev/null
+                      # Try to use original file
+                      HAS_VIDEO_ORIG=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                      if [ -n "$HAS_VIDEO_ORIG" ] && [ "$HAS_VIDEO_ORIG" = "video" ]; then
+                        DOWNLOAD_SUCCESS=true
+                        echo "✅ Using original file: $OUT_FILE"
+                      fi
+                    fi
+                  else
+                    echo "⚠️ Fixup failed, using original file"
+                    rm -f "$FIXED_FILE" 2>/dev/null
+                    # Try to use original file
+                    HAS_VIDEO_ORIG=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    if [ -n "$HAS_VIDEO_ORIG" ] && [ "$HAS_VIDEO_ORIG" = "video" ]; then
+                      DOWNLOAD_SUCCESS=true
+                      echo "✅ Using original file: $OUT_FILE"
+                    fi
+                  fi
+                else
+                  # No fixup needed, file is good
+                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                    DOWNLOAD_SUCCESS=true
+                    FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+                    W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FILE_SIZE_MB}MB, ${W}x${H})"
+                  fi
+                fi
+              else
+                echo "⚠️ File too small (${FILE_SIZE} bytes) - likely corrupt"
+                rm -f "$OUT_FILE" 2>/dev/null
               fi
             fi
             
-            # Fallback retry with yt-dlp + aria2c external if initial attempt failed
+            # ------------------------------------------------------------
+            # FALLBACK: If fixup didn't work or file is still bad, try yt-dlp with external downloader
+            # ------------------------------------------------------------
             if [ "$DOWNLOAD_SUCCESS" != true ]; then
-              echo "   ⚠️ Direct download failed, retrying with yt-dlp fallback..."
+              echo "⚠️ Primary download/fixup failed. Trying yt-dlp with aria2c external..."
+              
               rm -f "$OUT_FILE" 2>/dev/null
               
               yt-dlp \
@@ -280,116 +411,181 @@ jobs:
                 -o "$OUT_FILE" \
                 "$URL" 2>/dev/null
               
+              # Check the fallback download
               if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
                 FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
                 if [ "$FILE_SIZE" -gt 100000 ]; then
-                  DOWNLOAD_SUCCESS=true
-                  FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-                  echo "   ✅ Fallback download succeeded (${FILE_SIZE_MB}MB)"
+                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                    DOWNLOAD_SUCCESS=true
+                    echo "✅ Downloaded with yt-dlp+aria2c: $OUT_FILE"
+                  else
+                    # Try one more fixup on the fallback download
+                    echo "🔄 Fallback download has no video, trying fixup..."
+                    ffmpeg -y -err_detect ignore_err -i "$OUT_FILE" \
+                      -c:v libx264 -preset veryfast -crf 23 \
+                      -c:a aac -b:a 128k -ar 44100 \
+                      -movflags +faststart \
+                      -metadata title="Episode $EP_INDEX - $SERIES_TITLE" \
+                      -metadata episode_id="$EP_INDEX" \
+                      -metadata series="$SERIES_TITLE" \
+                      -metadata label="$LABEL" \
+                      "$FIXED_FILE" 2>/dev/null
+                    
+                    if [ -f "$FIXED_FILE" ] && [ -s "$FIXED_FILE" ]; then
+                      HAS_VIDEO_FIXED=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FIXED_FILE" 2>/dev/null)
+                      if [ -n "$HAS_VIDEO_FIXED" ] && [ "$HAS_VIDEO_FIXED" = "video" ]; then
+                        mv "$FIXED_FILE" "$OUT_FILE"
+                        DOWNLOAD_SUCCESS=true
+                        echo "✅ Fallback fixup successful: $OUT_FILE"
+                      fi
+                    fi
+                    rm -f "$FIXED_FILE" 2>/dev/null
+                  fi
                 fi
               fi
             fi
             
+            # ------------------------------------------------------------
+            # CREATE VIDEO FROM AUDIO IF ONLY AUDIO IS AVAILABLE (ULTIMATE FALLBACK)
+            # ------------------------------------------------------------
             if [ "$DOWNLOAD_SUCCESS" != true ]; then
-              echo "   ❌ Failed to download Episode $EP_INDEX"
-              FAILED_DOWNLOADS="$FAILED_DOWNLOADS $EP_NUM"
+              # Check if we have a file with audio but no video
+              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                if [ "$FILE_SIZE" -gt 100000 ]; then
+                  HAS_AUDIO=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                  
+                  if [ -n "$HAS_AUDIO" ] && [ "$HAS_AUDIO" = "audio" ]; then
+                    echo "🎵 File has audio but no video. Creating video with static image..."
+                    
+                    DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUT_FILE" 2>/dev/null || echo "30")
+                    
+                    # Create a video with black background and the audio
+                    TEMP_VIDEO="EP${EP_NUM}_video_temp.mp4"
+                    ffmpeg -y -f lavfi -i color=black:size=1280x720:duration="$DURATION" \
+                      -i "$OUT_FILE" \
+                      -c:v libx264 -preset veryfast -crf 23 \
+                      -c:a aac -b:a 128k -ar 44100 \
+                      -shortest \
+                      -movflags +faststart \
+                      "$TEMP_VIDEO" 2>/dev/null
+                    
+                    if [ -f "$TEMP_VIDEO" ] && [ -s "$TEMP_VIDEO" ]; then
+                      mv "$TEMP_VIDEO" "$OUT_FILE"
+                      DOWNLOAD_SUCCESS=true
+                      echo "✅ Created video from audio for Episode $EP_INDEX"
+                    else
+                      echo "❌ Failed to create video from audio!"
+                    fi
+                  else
+                    echo "❌ File has neither video nor audio!"
+                  fi
+                else
+                  echo "❌ File too small (${FILE_SIZE} bytes) - likely corrupt"
+                fi
+              else
+                echo "❌ No file downloaded at all!"
+              fi
             fi
             
+            # ------------------------------------------------------------
+            # FINAL VERIFICATION
+            # ------------------------------------------------------------
+            if [ "$DOWNLOAD_SUCCESS" = true ] && [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+              # Final verification
+              FINAL_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+              FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
+              
+              echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FINAL_SIZE_MB}MB)"
+              
+              # Quick verify with mediainfo
+              if mediainfo "$OUT_FILE" 2>/dev/null | grep -q "Video"; then
+                echo "   📹 Video track confirmed"
+              else
+                echo "   ⚠️ Video track not detected by mediainfo"
+              fi
+              
+              if mediainfo "$OUT_FILE" 2>/dev/null | grep -q "Audio"; then
+                echo "   🔊 Audio track confirmed"
+              else
+                echo "   ⚠️ Audio track not detected by mediainfo"
+              fi
+            else
+              echo "❌ Download failed for Episode $EP_INDEX"
+              FAILED_DOWNLOADS="$FAILED_DOWNLOADS $EP_NUM"
+              rm -f "$OUT_FILE" 2>/dev/null
+            fi
+            
+            # Clean up temp files
+            rm -f "$FIXED_FILE" 2>/dev/null
+            
             EP_INDEX=$((EP_INDEX + 1))
+            echo ""
           done 3< urls.txt
           
           echo "========================================="
           echo "📊 DOWNLOAD SUMMARY"
           echo "========================================="
+          echo "📺 Series: $SERIES_TITLE"
+          echo "📊 Expected: $TOTAL_EPISODES episodes"
+          
           TOTAL_FILES=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           echo "✅ Downloaded: $TOTAL_FILES/$TOTAL_EPISODES episodes"
           
-          if [ -n "$FAILED_DOWNLOADS" ] || [ "$TOTAL_FILES" -ne "$TOTAL_EPISODES" ]; then
-            echo "❌ Download failed for: $FAILED_DOWNLOADS"
+          if [ -n "$FAILED_DOWNLOADS" ]; then
+            echo "❌ FAILED DOWNLOADS: $FAILED_DOWNLOADS"
+            echo "❌ Not all episodes downloaded successfully!"
+            echo "   This is an all-or-nothing workflow. Exiting."
             exit 1
           fi
-          echo "✅ All episodes successfully downloaded to disk!"
-
-      - name: Standardize & Fix Container Formats (MPEG-TS to MP4)
-        timeout-minutes: 120
-        env:
-          TITLE: ${{ steps.fname.outputs.formatted_title }}
-          SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
-          LABEL: ${{ steps.fname.outputs.clean_label }}
-        run: |
-          cd downloads
           
-          echo "========================================="
-          echo "⚡ PARALLEL STANDARDIZING & FIXING CONTAINERS"
-          echo "========================================="
-          echo "💻 CPU Cores Detected on Runner: $(nproc)"
-          echo "📺 Series: $SERIES_TITLE"
-          echo "========================================="
+          if [ "$TOTAL_FILES" -ne "$TOTAL_EPISODES" ]; then
+            echo "❌ Expected $TOTAL_EPISODES episodes, but only $TOTAL_FILES downloaded!"
+            echo "❌ Exiting - all episodes required."
+            exit 1
+          fi
           
-          # Worker function executed in parallel across runner cores
-          process_episode() {
-            local f="$1"
-            local fname
-            fname=$(basename "$f")
-            local temp="temp_fixed_${fname}"
-            rm -f "$temp" 2>/dev/null
-            
-            # Probe container & video stream
-            local container
-            container=$(ffprobe -v error -show_entries format=format_name -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null | head -1)
-            local format_info
-            format_info=$(ffprobe -v error -show_entries format=format_long_name -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null | head -1)
-            local has_video
-            has_video=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$f" 2>/dev/null)
-            
-            local needs_fix=false
-            if [[ "$container" == *"mpegts"* ]] || [[ "$container" == *"mpeg"* ]] || [[ "$format_info" == *"MPEG-TS"* ]] || [[ "$format_info" == *"MPEGTS"* ]] || [ -z "$has_video" ]; then
-              needs_fix=true
-            fi
-            
-            if [ "$needs_fix" = true ]; then
-              # Attempt 1: Ultra-fast stream-copy remux with MPEG-TS AAC bitstream filter (0 re-encoding, ~0.05s)
-              ffmpeg -y -err_detect ignore_err -i "$f" -c:v copy -c:a copy -bsf:a aac_adtstoasc -movflags +faststart "$temp" >/dev/null 2>&1
+          # Final verification of all files
+          echo ""
+          echo "🔍 Final verification of all episodes..."
+          ALL_GOOD=true
+          for f in EP*.mp4; do
+            if [ -f "$f" ]; then
+              # Check file size first
+              FILE_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
+              if [ "$FILE_SIZE" -lt 100000 ]; then
+                echo "❌ $f is too small (${FILE_SIZE} bytes) - likely corrupt!"
+                ALL_GOOD=false
+                continue
+              fi
               
-              if [ -s "$temp" ]; then
-                local check_v
-                check_v=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$temp" 2>/dev/null)
-                if [ "$check_v" = "video" ]; then
-                  mv "$temp" "$f"
-                  echo "⚡ [Fixed Stream-Copy & Video Verified] $fname"
-                  return 0
+              HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$f" 2>/dev/null)
+              if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
+                echo "❌ $f has no video stream!"
+                ALL_GOOD=false
+              else
+                W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null)
+                H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null)
+                
+                # Check for invalid resolution
+                if [ -z "$W" ] || [ -z "$H" ] || [ "$W" = "0" ] || [ "$H" = "0" ]; then
+                  echo "❌ $f has invalid resolution!"
+                  ALL_GOOD=false
+                else
+                  echo "✅ $f: ${W}x${H}"
                 fi
               fi
-              
-              # Attempt 2: High-speed ultrafast re-encode if stream copy fails
-              rm -f "$temp" 2>/dev/null
-              if [ "$has_video" = "video" ]; then
-                ffmpeg -y -err_detect ignore_err -i "$f" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -b:a 128k -ar 44100 -movflags +faststart "$temp" >/dev/null 2>&1
-              else
-                local dur
-                dur=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "30")
-                ffmpeg -y -f lavfi -i color=black:size=1280x720:duration="$dur" -i "$f" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -b:a 128k -ar 44100 -shortest -movflags +faststart "$temp" >/dev/null 2>&1
-              fi
-              
-              if [ -s "$temp" ]; then
-                mv "$temp" "$f"
-                echo "🔧 [Re-encoded Fix & Video Verified] $fname"
-              else
-                rm -f "$temp" 2>/dev/null
-                echo "⚠️ [Failed to Remux] $fname"
-              fi
-            else
-              echo "✅ [Standard MP4] $fname"
             fi
-          }
+          done
           
-          export -f process_episode
+          if [ "$ALL_GOOD" != true ]; then
+            echo "❌ Some episodes are missing video streams or are corrupt!"
+            echo "❌ Exiting - all episodes must have valid video."
+            exit 1
+          fi
           
-          # Execute in parallel on all runner CPU cores
-          ls -1 EP*.mp4 2>/dev/null | sort -V | xargs -P $(nproc) -I {} bash -c 'process_episode "{}"'
-          
-          echo "========================================="
-          echo "✅ All episodes standardized across $(nproc) runner cores!"
+          echo "✅ All $TOTAL_EPISODES episodes downloaded and verified successfully!"
           echo "========================================="
 
       - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
@@ -662,1145 +858,15 @@ jobs:
           done
           echo ""
 
-      - name: ANALYZE EPISODES & DETERMINE MAJORITY STANDARD
-        id: analyze
-        timeout-minutes: 10
-        run: |
-          cd downloads
-          
-          echo "========================================="
-          echo "📊 ANALYZING EPISODE SPECS"
-          echo "========================================="
-          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
-          echo "========================================="
-          
-          # Create a Python script to analyze all episodes
-          cat > analyze_specs.py << 'EOFANALYZE'
-          import os
-          import json
-          import subprocess
-          from collections import Counter
-          import sys
-          
-          def get_episode_specs(file_path):
-              """Get video and audio specs for an episode using ffprobe"""
-              try:
-                  # Get all stream info with ffprobe
-                  cmd = [
-                      "ffprobe", "-v", "error",
-                      "-show_entries", 
-                      "stream=index,codec_type,width,height,codec_name,pix_fmt,sample_rate,channels,channel_layout,r_frame_rate",
-                      "-of", "json",
-                      file_path
-                  ]
-                  result = subprocess.check_output(cmd, text=True)
-                  data = json.loads(result)
-                  
-                  # Initialize values
-                  width, height = 0, 0
-                  vcodec, pix_fmt = "unknown", "unknown"
-                  sample_rate, channels = 0, 0
-                  acodec = "unknown"
-                  frame_rate = "0/0"
-                  
-                  # Find video and audio streams
-                  video_stream = None
-                  audio_stream = None
-                  
-                  for stream in data.get('streams', []):
-                      codec_type = stream.get('codec_type', '')
-                      if codec_type == 'video' and video_stream is None:
-                          video_stream = stream
-                      elif codec_type == 'audio' and audio_stream is None:
-                          audio_stream = stream
-                  
-                  # Extract video specs
-                  if video_stream:
-                      width = int(video_stream.get('width', 0))
-                      height = int(video_stream.get('height', 0))
-                      vcodec = video_stream.get('codec_name', 'unknown')
-                      pix_fmt = video_stream.get('pix_fmt', 'unknown')
-                      frame_rate = video_stream.get('r_frame_rate', '0/0')
-                  else:
-                      # Try to find any video stream (fallback)
-                      for stream in data.get('streams', []):
-                          if stream.get('codec_type') == 'video':
-                              width = int(stream.get('width', 0))
-                              height = int(stream.get('height', 0))
-                              vcodec = stream.get('codec_name', 'unknown')
-                              pix_fmt = stream.get('pix_fmt', 'unknown')
-                              frame_rate = stream.get('r_frame_rate', '0/0')
-                              break
-                  
-                  # Extract audio specs
-                  if audio_stream:
-                      sample_rate = int(audio_stream.get('sample_rate', 0))
-                      channels = int(audio_stream.get('channels', 0))
-                      acodec = audio_stream.get('codec_name', 'unknown')
-                  else:
-                      # Try to find any audio stream (fallback)
-                      for stream in data.get('streams', []):
-                          if stream.get('codec_type') == 'audio':
-                              sample_rate = int(stream.get('sample_rate', 0))
-                              channels = int(stream.get('channels', 0))
-                              acodec = stream.get('codec_name', 'unknown')
-                              break
-                  
-                  return {
-                      'width': width,
-                      'height': height,
-                      'vcodec': vcodec,
-                      'pix_fmt': pix_fmt,
-                      'sample_rate': sample_rate,
-                      'channels': channels,
-                      'acodec': acodec,
-                      'frame_rate': frame_rate,
-                      'resolution': f"{width}x{height}",
-                      'video_spec': f"{width}x{height}_{vcodec}_{pix_fmt}",
-                      'audio_spec': f"{sample_rate}Hz_{channels}ch_{acodec}"
-                  }
-              except Exception as e:
-                  print(f"⚠️ Error analyzing {file_path}: {e}")
-                  return None
-          
-          # Get all episode files
-          episode_files = sorted([f for f in os.listdir('.') if f.startswith('EP') and f.endswith('.mp4')])
-          
-          if not episode_files:
-              print("❌ No episode files found!")
-              sys.exit(1)
-          
-          print(f"📊 Found {len(episode_files)} episodes")
-          print("")
-          
-          # Analyze each episode
-          all_specs = []
-          resolutions = []
-          video_codecs = []
-          audio_codecs = []
-          sample_rates = []
-          channels_list = []
-          pix_formats = []
-          frame_rates = []
-          
-          for f in episode_files:
-              specs = get_episode_specs(f)
-              if specs:
-                  specs['file'] = f
-                  all_specs.append(specs)
-                  resolutions.append(specs['resolution'])
-                  video_codecs.append(specs['vcodec'])
-                  audio_codecs.append(specs['acodec'])
-                  sample_rates.append(specs['sample_rate'])
-                  channels_list.append(specs['channels'])
-                  pix_formats.append(specs['pix_fmt'])
-                  frame_rates.append(specs['frame_rate'])
-                  
-                  print(f"📹 {f}:")
-                  print(f"   Resolution: {specs['resolution']}")
-                  print(f"   Video Codec: {specs['vcodec']}")
-                  print(f"   Pixel Format: {specs['pix_fmt']}")
-                  print(f"   Frame Rate: {specs['frame_rate']}")
-                  print(f"   Audio Sample Rate: {specs['sample_rate']}Hz")
-                  print(f"   Audio Channels: {specs['channels']}ch")
-                  print(f"   Audio Codec: {specs['acodec']}")
-                  print("")
-              else:
-                  print(f"⚠️ Could not analyze {f}")
-          
-          if not all_specs:
-              print("❌ No valid episode specs found!")
-              sys.exit(1)
-          
-          # Find the most common specs
-          print("=========================================")
-          print("📊 MAJORITY ANALYSIS")
-          print("=========================================")
-          
-          # Video resolution majority
-          res_counter = Counter(resolutions)
-          most_common_res = res_counter.most_common(1)[0]
-          print(f"📐 Most common resolution: {most_common_res[0]} ({most_common_res[1]}/{len(episode_files)} episodes)")
-          
-          # Video codec majority
-          vcodec_counter = Counter(video_codecs)
-          most_common_vcodec = vcodec_counter.most_common(1)[0]
-          print(f"🎬 Most common video codec: {most_common_vcodec[0]} ({most_common_vcodec[1]}/{len(episode_files)} episodes)")
-          
-          # Pixel format majority
-          pix_counter = Counter(pix_formats)
-          most_common_pix = pix_counter.most_common(1)[0]
-          print(f"🖼️  Most common pixel format: {most_common_pix[0]} ({most_common_pix[1]}/{len(episode_files)} episodes)")
-          
-          # Audio sample rate majority
-          sr_counter = Counter(sample_rates)
-          most_common_sr = sr_counter.most_common(1)[0]
-          print(f"🎵 Most common sample rate: {most_common_sr[0]}Hz ({most_common_sr[1]}/{len(episode_files)} episodes)")
-          
-          # Audio channels majority
-          ch_counter = Counter(channels_list)
-          most_common_ch = ch_counter.most_common(1)[0]
-          print(f"🔊 Most common channels: {most_common_ch[0]}ch ({most_common_ch[1]}/{len(episode_files)} episodes)")
-          
-          # Audio codec majority
-          acodec_counter = Counter(audio_codecs)
-          most_common_acodec = acodec_counter.most_common(1)[0]
-          print(f"🎵 Most common audio codec: {most_common_acodec[0]} ({most_common_acodec[1]}/{len(episode_files)} episodes)")
-          
-          # Frame rate majority
-          fps_counter = Counter(frame_rates)
-          most_common_fps = fps_counter.most_common(1)[0]
-          print(f"🎞️  Most common frame rate: {most_common_fps[0]} fps ({most_common_fps[1]}/{len(episode_files)} episodes)")
-          
-          print("")
-          
-          # Determine standard based on majority
-          width = int(most_common_res[0].split('x')[0])
-          height = int(most_common_res[0].split('x')[1])
-          vcodec = most_common_vcodec[0]
-          pix_fmt = most_common_pix[0]
-          sample_rate = most_common_sr[0]
-          channels = most_common_ch[0]
-          acodec = most_common_acodec[0]
-          frame_rate = most_common_fps[0]
-          
-          print("=========================================")
-          print("✅ TARGET STANDARDS DETERMINED:")
-          print(f"   Resolution: {width}x{height}")
-          print(f"   Video Codec: {vcodec}")
-          print(f"   Pixel Format: {pix_fmt}")
-          print(f"   Audio Sample Rate: {sample_rate}Hz")
-          print(f"   Audio Channels: {channels}ch")
-          print(f"   Audio Codec: {acodec}")
-          print("=========================================")
-          
-          # Check which episodes need conversion
-          needs_conversion = []
-          already_standard = []
-          
-          for specs in all_specs:
-              if (specs['width'] == width and specs['height'] == height and 
-                  specs['vcodec'] == vcodec and specs['pix_fmt'] == pix_fmt and
-                  specs['sample_rate'] == sample_rate and specs['channels'] == channels and
-                  specs['acodec'] == acodec):
-                  already_standard.append(specs.get('file', 'unknown'))
-              else:
-                  needs_conversion.append(specs.get('file', 'unknown'))
-          
-          print(f"\n📊 Episodes already matching standard: {len(already_standard)}")
-          print(f"🔄 Episodes needing conversion: {len(needs_conversion)}")
-          
-          if len(needs_conversion) == 0:
-              print("✅ ALL episodes already match the majority standard!")
-          
-          # Write standards to file for next steps
-          with open('standard_specs.txt', 'w') as f:
-              f.write(f"WIDTH={width}\n")
-              f.write(f"HEIGHT={height}\n")
-              f.write(f"VIDEO_CODEC={vcodec}\n")
-              f.write(f"PIX_FMT={pix_fmt}\n")
-              f.write(f"AUDIO_SAMPLE_RATE={sample_rate}\n")
-              f.write(f"AUDIO_CHANNELS={channels}\n")
-              f.write(f"AUDIO_CODEC={acodec}\n")
-              f.write(f"RESOLUTION={width}x{height}\n")
-              f.write(f"FRAME_RATE={frame_rate}\n")
-          
-          # Write to GitHub outputs
-          github_output = os.environ.get('GITHUB_OUTPUT')
-          if github_output:
-              with open(github_output, 'a') as f:
-                  f.write(f"width={width}\n")
-                  f.write(f"height={height}\n")
-                  f.write(f"video_codec={vcodec}\n")
-                  f.write(f"pix_fmt={pix_fmt}\n")
-                  f.write(f"audio_sample_rate={sample_rate}\n")
-                  f.write(f"audio_channels={channels}\n")
-                  f.write(f"audio_codec={acodec}\n")
-                  f.write(f"resolution={width}x{height}\n")
-                  f.write(f"frame_rate={frame_rate}\n")
-          
-          # Also write a summary for debugging
-          with open('specs_summary.txt', 'w') as f:
-              f.write("EPISODE SPECS SUMMARY:\n")
-              f.write("=" * 50 + "\n")
-              for specs in all_specs:
-                  f.write(f"\n{specs['file']}:\n")
-                  f.write(f"  Resolution: {specs['resolution']}\n")
-                  f.write(f"  Video Codec: {specs['vcodec']}\n")
-                  f.write(f"  Pixel Format: {specs['pix_fmt']}\n")
-                  f.write(f"  Audio Sample Rate: {specs['sample_rate']}Hz\n")
-                  f.write(f"  Audio Channels: {specs['channels']}ch\n")
-                  f.write(f"  Audio Codec: {specs['acodec']}\n")
-          
-          sys.exit(0)
-          EOFANALYZE
-          
-          python3 analyze_specs.py
-          
-          # Display the specs summary for debugging
-          if [ -f "specs_summary.txt" ]; then
-            echo ""
-            echo "========================================="
-            echo "📋 EPISODE SPECS SUMMARY:"
-            echo "========================================="
-            cat specs_summary.txt
-            echo "========================================="
-          fi
-          
-          # Load the standard specs
-          if [ -f "standard_specs.txt" ]; then
-            echo ""
-            echo "📋 Standard specs file contents:"
-            cat standard_specs.txt
-            echo ""
-            
-            # Source the file to verify variables
-            source standard_specs.txt
-            echo "✅ Verified: WIDTH=$WIDTH, HEIGHT=$HEIGHT"
-            echo "✅ Verified: VIDEO_CODEC=$VIDEO_CODEC"
-            echo "✅ Verified: AUDIO_SAMPLE_RATE=$AUDIO_SAMPLE_RATE"
-            echo "✅ Verified: AUDIO_CHANNELS=$AUDIO_CHANNELS"
-            echo "✅ Verified: AUDIO_CODEC=$AUDIO_CODEC"
-          else
-            echo "❌ Failed to generate standard specs!"
-            exit 1
-          fi
-
-      - name: DETECT MAJORITY H.264 PARAMETERS
-        id: detect_h264
-        timeout-minutes: 10
-        run: |
-          cd downloads
-          
-          echo "========================================="
-          echo "🔍 DETECTING MAJORITY H.264 PARAMETERS"
-          echo "========================================="
-          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
-          echo "========================================="
-          
-          # Create Python script to detect H.264 parameters
-          cat > detect_h264_params.py << 'EOFDETECT'
-          import os
-          import json
-          import subprocess
-          from collections import Counter
-          import sys
-          import re
-          
-          def get_h264_params(file_path):
-              """Extract H.264 encoding parameters from a file"""
-              try:
-                  # Use ffprobe to get stream info
-                  cmd = [
-                      "ffprobe", "-v", "error",
-                      "-show_entries", "stream=codec_type,codec_name,profile,level,width,height,pix_fmt",
-                      "-show_entries", "format=format_name",
-                      "-of", "json",
-                      file_path
-                  ]
-                  result = subprocess.check_output(cmd, text=True)
-                  data = json.loads(result)
-                  
-                  params = {}
-                  
-                  # Get video stream info
-                  for stream in data.get('streams', []):
-                      if stream.get('codec_type') == 'video':
-                          params['codec'] = stream.get('codec_name', 'unknown')
-                          params['profile'] = stream.get('profile', 'unknown')
-                          params['level'] = stream.get('level', 'unknown')
-                          params['width'] = int(stream.get('width', 0))
-                          params['height'] = int(stream.get('height', 0))
-                          params['pix_fmt'] = stream.get('pix_fmt', 'unknown')
-                          break
-                  
-                  # Use mediainfo for more detailed H.264 params
-                  cmd = [
-                      "mediainfo",
-                      "--Inform=Video;%Format_Profile%|%Format_Level%|%Width%|%Height%|%ColorSpace%|%ChromaSubsampling%|%BitDepth%|%FrameRate%|%FrameRate_Mode%",
-                      file_path
-                  ]
-                  result = subprocess.check_output(cmd, text=True).strip()
-                  
-                  if result:
-                      parts = result.split('|')
-                      if len(parts) >= 5:
-                          params['profile_mediainfo'] = parts[0] if parts[0] else 'unknown'
-                          params['level_mediainfo'] = parts[1] if parts[1] else 'unknown'
-                  
-                  # Try to get x264 parameters from FFmpeg output
-                  cmd = [
-                      "ffmpeg", "-i", file_path,
-                      "-f", "null", "-"
-                  ]
-                  result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
-                  
-                  # Look for x264 encoding params in output
-                  x264_params = {}
-                  for line in result.stdout.split('\n'):
-                      if 'x264' in line.lower() and 'ref' in line.lower():
-                          # Parse ref frames
-                          match = re.search(r'ref=(\d+)', line)
-                          if match:
-                              x264_params['ref_frames'] = int(match.group(1))
-                          # Parse B-frames
-                          match = re.search(r'bframes?=(\d+)', line)
-                          if match:
-                              x264_params['b_frames'] = int(match.group(1))
-                          # Parse GOP size
-                          match = re.search(r'keyint=(\d+)', line)
-                          if match:
-                              x264_params['keyint'] = int(match.group(1))
-                          # Parse profile
-                          match = re.search(r'profile=([^\s,]+)', line)
-                          if match:
-                              x264_params['profile_x264'] = match.group(1)
-                  
-                  params['x264_params'] = x264_params
-                  
-                  # Also get audio params
-                  for stream in data.get('streams', []):
-                      if stream.get('codec_type') == 'audio':
-                          params['audio_codec'] = stream.get('codec_name', 'unknown')
-                          params['audio_sample_rate'] = int(stream.get('sample_rate', 0))
-                          params['audio_channels'] = int(stream.get('channels', 0))
-                          break
-                  
-                  return params
-              except Exception as e:
-                  print(f"⚠️ Error detecting params for {file_path}: {e}")
-                  return None
-          
-          # Get all episode files
-          episode_files = sorted([f for f in os.listdir('.') if f.startswith('EP') and f.endswith('.mp4')])
-          
-          if not episode_files:
-              print("❌ No episode files found!")
-              sys.exit(1)
-          
-          print(f"📊 Found {len(episode_files)} episodes")
-          print("")
-          
-          # Detect params for each episode
-          all_params = []
-          profiles = []
-          levels = []
-          resolutions = []
-          codecs = []
-          pix_formats = []
-          ref_frames = []
-          b_frames = []
-          keyints = []
-          
-          for f in episode_files:
-              params = get_h264_params(f)
-              if params:
-                  params['file'] = f
-                  all_params.append(params)
-                  
-                  profiles.append(params.get('profile', 'unknown'))
-                  levels.append(params.get('level', 'unknown'))
-                  resolutions.append(f"{params.get('width', 0)}x{params.get('height', 0)}")
-                  codecs.append(params.get('codec', 'unknown'))
-                  pix_formats.append(params.get('pix_fmt', 'unknown'))
-                  
-                  x264 = params.get('x264_params', {})
-                  if x264.get('ref_frames'):
-                      ref_frames.append(str(x264['ref_frames']))
-                  if x264.get('b_frames') is not None:
-                      b_frames.append(str(x264['b_frames']))
-                  if x264.get('keyint'):
-                      keyints.append(str(x264['keyint']))
-                  
-                  print(f"📹 {f}:")
-                  print(f"   Resolution: {params.get('width')}x{params.get('height')}")
-                  print(f"   Codec: {params.get('codec')}")
-                  print(f"   Profile: {params.get('profile')}")
-                  print(f"   Level: {params.get('level')}")
-                  print(f"   Pixel Format: {params.get('pix_fmt')}")
-                  print(f"   x264 Params: {params.get('x264_params', {})}")
-                  print("")
-          
-          if not all_params:
-              print("❌ No valid params detected!")
-              sys.exit(1)
-          
-          # Find majority values
-          print("=========================================")
-          print("📊 MAJORITY H.264 PARAMETERS")
-          print("=========================================")
-          
-          profile_counter = Counter(profiles)
-          most_common_profile = profile_counter.most_common(1)[0]
-          print(f"📐 Most common profile: {most_common_profile[0]} ({most_common_profile[1]}/{len(episode_files)} episodes)")
-          
-          level_counter = Counter(levels)
-          most_common_level = level_counter.most_common(1)[0]
-          print(f"📐 Most common level: {most_common_level[0]} ({most_common_level[1]}/{len(episode_files)} episodes)")
-          
-          res_counter = Counter(resolutions)
-          most_common_res = res_counter.most_common(1)[0]
-          print(f"📐 Most common resolution: {most_common_res[0]} ({most_common_res[1]}/{len(episode_files)} episodes)")
-          
-          codec_counter = Counter(codecs)
-          most_common_codec = codec_counter.most_common(1)[0]
-          print(f"📐 Most common codec: {most_common_codec[0]} ({most_common_codec[1]}/{len(episode_files)} episodes)")
-          
-          pix_counter = Counter(pix_formats)
-          most_common_pix = pix_counter.most_common(1)[0]
-          print(f"📐 Most common pixel format: {most_common_pix[0]} ({most_common_pix[1]}/{len(episode_files)} episodes)")
-          
-          # Get majority x264 params
-          if ref_frames:
-              ref_counter = Counter(ref_frames)
-              most_common_ref = ref_counter.most_common(1)[0]
-              print(f"📐 Most common ref frames: {most_common_ref[0]} ({most_common_ref[1]}/{len(episode_files)} episodes)")
-          else:
-              most_common_ref = ("3", 0)
-          
-          if b_frames:
-              b_counter = Counter(b_frames)
-              most_common_b = b_counter.most_common(1)[0]
-              print(f"📐 Most common B-frames: {most_common_b[0]} ({most_common_b[1]}/{len(episode_files)} episodes)")
-          else:
-              most_common_b = ("0", 0)
-          
-          if keyints:
-              keyint_counter = Counter(keyints)
-              most_common_keyint = keyint_counter.most_common(1)[0]
-              print(f"📐 Most common keyint: {most_common_keyint[0]} ({most_common_keyint[1]}/{len(episode_files)} episodes)")
-          else:
-              most_common_keyint = ("250", 0)
-          
-          print("")
-          
-          # Determine standard based on majority
-          width = int(most_common_res[0].split('x')[0])
-          height = int(most_common_res[0].split('x')[1])
-          codec = most_common_codec[0]
-          pix_fmt = most_common_pix[0]
-          profile = most_common_profile[0]
-          level = most_common_level[0]
-          ref = most_common_ref[0]
-          bframes = most_common_b[0]
-          keyint = most_common_keyint[0]
-          
-          # Map ffprobe profile names to x264 profile names
-          profile_map = {
-              'High': 'high',
-              'Main': 'main',
-              'Baseline': 'baseline',
-              'high': 'high',
-              'main': 'main',
-              'baseline': 'baseline'
-          }
-          x264_profile = profile_map.get(profile, 'baseline')
-          
-          print("=========================================")
-          print("✅ TARGET H.264 PARAMETERS DETERMINED:")
-          print(f"   Resolution: {width}x{height}")
-          print(f"   Codec: {codec}")
-          print(f"   Profile: {profile} (x264: {x264_profile})")
-          print(f"   Level: {level}")
-          print(f"   Pixel Format: {pix_fmt}")
-          print(f"   Ref Frames: {ref}")
-          print(f"   B-frames: {bframes}")
-          print(f"   Keyint: {keyint}")
-          print("=========================================")
-          
-          # Write to file for next steps
-          with open('h264_standard.txt', 'w') as f:
-              f.write(f"WIDTH={width}\n")
-              f.write(f"HEIGHT={height}\n")
-              f.write(f"VIDEO_CODEC={codec}\n")
-              f.write(f"PIX_FMT={pix_fmt}\n")
-              f.write(f"PROFILE={profile}\n")
-              f.write(f"X264_PROFILE={x264_profile}\n")
-              f.write(f"LEVEL={level}\n")
-              f.write(f"REF_FRAMES={ref}\n")
-              f.write(f"B_FRAMES={bframes}\n")
-              f.write(f"KEYINT={keyint}\n")
-              f.write(f"RESOLUTION={width}x{height}\n")
-          
-          # Write to GitHub outputs
-          github_output = os.environ.get('GITHUB_OUTPUT')
-          if github_output:
-              with open(github_output, 'a') as f:
-                  f.write(f"width={width}\n")
-                  f.write(f"height={height}\n")
-                  f.write(f"video_codec={codec}\n")
-                  f.write(f"pix_fmt={pix_fmt}\n")
-                  f.write(f"profile={profile}\n")
-                  f.write(f"x264_profile={x264_profile}\n")
-                  f.write(f"level={level}\n")
-                  f.write(f"ref_frames={ref}\n")
-                  f.write(f"b_frames={bframes}\n")
-                  f.write(f"keyint={keyint}\n")
-                  f.write(f"resolution={width}x{height}\n")
-          
-          sys.exit(0)
-          EOFDETECT
-          
-          python3 detect_h264_params.py
-          
-          # Load the H.264 standard
-          if [ -f "h264_standard.txt" ]; then
-            echo ""
-            echo "📋 H.264 standard loaded:"
-            cat h264_standard.txt
-            echo ""
-            source h264_standard.txt
-          else
-            echo "❌ Failed to detect H.264 parameters!"
-            exit 1
-          fi
-
-      - name: STANDARDIZE EPISODES WITH DETECTED H.264 PARAMETERS
+      - name: Smart Merge Episodes with mkvmerge --append-to
+        id: merge
         timeout-minutes: 120
-        env:
-          SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
         run: |
-          cd downloads
-          
-          # Get standards from the detect step outputs
-          TARGET_WIDTH="${{ steps.detect_h264.outputs.width }}"
-          TARGET_HEIGHT="${{ steps.detect_h264.outputs.height }}"
-          TARGET_VIDEO_CODEC="${{ steps.detect_h264.outputs.video_codec }}"
-          TARGET_PIX_FMT="${{ steps.detect_h264.outputs.pix_fmt }}"
-          TARGET_PROFILE="${{ steps.detect_h264.outputs.x264_profile }}"
-          TARGET_LEVEL="${{ steps.detect_h264.outputs.level }}"
-          TARGET_REF_FRAMES="${{ steps.detect_h264.outputs.ref_frames }}"
-          TARGET_B_FRAMES="${{ steps.detect_h264.outputs.b_frames }}"
-          TARGET_KEYINT="${{ steps.detect_h264.outputs.keyint }}"
-          TARGET_RESOLUTION="${{ steps.detect_h264.outputs.resolution }}"
-          TARGET_AUDIO_SAMPLE_RATE="${{ steps.analyze.outputs.audio_sample_rate }}"
-          TARGET_AUDIO_CHANNELS="${{ steps.analyze.outputs.audio_channels }}"
-          TARGET_AUDIO_CODEC="${{ steps.analyze.outputs.audio_codec }}"
-          TARGET_FPS="${{ steps.analyze.outputs.frame_rate }}"
-          
-          echo "========================================="
-          echo "📐 STANDARDIZING EPISODES WITH DETECTED H.264 PARAMETERS"
-          echo "========================================="
-          echo "📺 Series: $SERIES_TITLE"
-          echo "🎯 Target Standard:"
-          echo "   Resolution: ${TARGET_RESOLUTION}"
-          echo "   Video Codec: ${TARGET_VIDEO_CODEC}"
-          echo "   Pixel Format: ${TARGET_PIX_FMT}"
-          echo "   H.264 Profile: ${TARGET_PROFILE}"
-          echo "   H.264 Level: ${TARGET_LEVEL}"
-          echo "   Ref Frames: ${TARGET_REF_FRAMES}"
-          echo "   B-frames: ${TARGET_B_FRAMES}"
-          echo "   Keyint: ${TARGET_KEYINT}"
-          echo "   Audio Sample Rate: ${TARGET_AUDIO_SAMPLE_RATE}"
-          echo "   Audio Channels: ${TARGET_AUDIO_CHANNELS}"
-          echo "   Audio Codec: ${TARGET_AUDIO_CODEC}"
-          echo "   Frame Rate: ${TARGET_FPS}"
-          echo "========================================="
-          
-          # Check if we have valid targets
-          if [ "$TARGET_WIDTH" = "0" ] || [ "$TARGET_HEIGHT" = "0" ] || [ -z "$TARGET_WIDTH" ] || [ -z "$TARGET_HEIGHT" ]; then
-            echo "❌ Invalid target standards detected!"
-            exit 1
-          fi
-          
-          # Set defaults if needed
-          [ -z "$TARGET_VIDEO_CODEC" ] || [ "$TARGET_VIDEO_CODEC" = "unknown" ] && TARGET_VIDEO_CODEC="libx264"
-          [ -z "$TARGET_PROFILE" ] || [ "$TARGET_PROFILE" = "unknown" ] && TARGET_PROFILE="baseline"
-          [ -z "$TARGET_LEVEL" ] || [ "$TARGET_LEVEL" = "unknown" ] && TARGET_LEVEL="3.0"
-          [ -z "$TARGET_REF_FRAMES" ] || [ "$TARGET_REF_FRAMES" = "unknown" ] && TARGET_REF_FRAMES="3"
-          [ -z "$TARGET_B_FRAMES" ] || [ "$TARGET_B_FRAMES" = "unknown" ] && TARGET_B_FRAMES="0"
-          [ -z "$TARGET_KEYINT" ] || [ "$TARGET_KEYINT" = "unknown" ] && TARGET_KEYINT="250"
-          [ -z "$TARGET_PIX_FMT" ] || [ "$TARGET_PIX_FMT" = "unknown" ] && TARGET_PIX_FMT="yuv420p"
-          [ -z "$TARGET_AUDIO_SAMPLE_RATE" ] || [ "$TARGET_AUDIO_SAMPLE_RATE" = "unknown" ] && TARGET_AUDIO_SAMPLE_RATE="44100"
-          [ -z "$TARGET_AUDIO_CHANNELS" ] || [ "$TARGET_AUDIO_CHANNELS" = "unknown" ] && TARGET_AUDIO_CHANNELS="2"
-          [ -z "$TARGET_AUDIO_CODEC" ] || [ "$TARGET_AUDIO_CODEC" = "unknown" ] && TARGET_AUDIO_CODEC="aac"
-          [ -z "$TARGET_FPS" ] || [ "$TARGET_FPS" = "unknown" ] || [ "$TARGET_FPS" = "0/0" ] && TARGET_FPS="30"
-          
-          # Reference codec private data — the SPS/PPS bytes, fingerprinted via
-          # ffprobe's extradata_hash (SHA-256). mkvmerge warns (and exits 1) when these
-          # differ between appended files even if width/height/codec look identical.
-          # 
-          # ffprobe 7.x: use `-show_data_hash sha256`. Older ffprobe: use
-          # `-show_entries stream=extradata -of default=noprint_wrappers=1:nokey=1`.
-          get_extradata() {
-            # $1 = file; prints extradata hash (or raw extradata fallback for old ffprobe)
-            local out
-            out=$(ffprobe -v error -select_streams v:0 -show_entries stream=extradata_hash -show_data_hash sha256 -of json "$1" 2>/dev/null)
-            if echo "$out" | grep -q 'extradata_hash'; then
-              echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['streams'][0].get('extradata_hash',''))"
-            else
-              ffprobe -v error -select_streams v:0 -show_entries stream=extradata -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | head -c 100
-            fi
-          }
-          
-          # Determine whether ALL episodes already share identical codec private data
-          # (SPS/PPS). If they do, mkvmerge appends cleanly and NOTHING needs recoding.
-          # Only when hashes differ do we re-encode — and since a re-encode with the
-          # standard command yields a NEW hash that can't match an untouched original,
-          # a mixed set is re-encoded entirely with the same command so all outputs
-          # share one identical SPS/PPS.
-          get_extradata() {
-            # $1 = file; prints extradata hash (or raw extradata fallback for old ffprobe)
-            local out
-            out=$(ffprobe -v error -select_streams v:0 -show_entries stream=extradata_hash -show_data_hash sha256 -of json "$1" 2>/dev/null)
-            if echo "$out" | grep -q 'extradata_hash'; then
-              echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['streams'][0].get('extradata_hash',''))"
-            else
-              ffprobe -v error -select_streams v:0 -show_entries stream=extradata -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | head -c 100
-            fi
-          }
-          
-          # Re-encode one episode into $2 using the exact standard command.
-          # Returns 0 on success (file exists and non-empty), 1 on failure.
-          recode_episode() {
-            local src="$1" dst="$2"
-            rm -f "$dst" 2>/dev/null
-            ffmpeg -y -i "$src" \
-              -vf "fps=${TARGET_FPS},scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad=${TARGET_WIDTH}:${TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,format=${TARGET_PIX_FMT}" \
-              -c:v "${TARGET_VIDEO_CODEC}" \
-              -preset veryfast \
-              -crf 23 \
-              -profile:v "${TARGET_PROFILE}" \
-              -level "${TARGET_LEVEL}" \
-              -x264-params "keyint=${TARGET_KEYINT}:min-keyint=$((TARGET_KEYINT / 10)):scenecut=40:ref=${TARGET_REF_FRAMES}:bframes=${TARGET_B_FRAMES}" \
-              -c:a "${TARGET_AUDIO_CODEC}" \
-              -b:a 128k \
-              -ar "${TARGET_AUDIO_SAMPLE_RATE}" \
-              -ac "${TARGET_AUDIO_CHANNELS}" \
-              -movflags +faststart \
-              -map_metadata 0 \
-              "$dst" 2>/dev/null
-            [ -f "$dst" ] && [ -s "$dst" ]
-          }
-          
-          # Collect every episode's SPS/PPS hash
-          unset EP_HASHES
-          declare -A EP_HASHES
-          for ref in EP*.mp4; do
-            [ -f "$ref" ] || continue
-            EP_HASHES["$ref"]=$(get_extradata "$ref")
-          done
-          
-          # Distinct hashes present
-          DISTINCT_HASHES=$(printf '%s\n' "${EP_HASHES[@]}" | grep -v '^$' | sort -u | wc -l)
-          echo "📊 Found $DISTINCT_HASHES distinct codec private data sets across episodes"
-          
-          if [ "$DISTINCT_HASHES" -le 1 ]; then
-            # Single identical SPS/PPS everywhere (or unreadable) — nothing to re-encode
-            ALL_IDENTICAL=true
-            TARGET_EXTRADATA="$(printf '%s\n' "${EP_HASHES[@]}" | grep -v '^$' | head -1)"
-            echo "✅ All episodes share identical codec parameters — no recoding needed"
-          else
-            # Mixed SPS/PPS. Try to preserve the majority's codec config: recode just
-            # one divergent episode to a probe; if it reproduces the majority's SPS/PPS
-            # exactly, only the divergent episodes need recoding. Otherwise our encoder
-            # can't match the majority's bytes, so standardize everything with one
-            # command to guarantee mkvmerge-clean output.
-            MAJORITY_HASH=$(printf '%s\n' "${EP_HASHES[@]}" | grep -v '^$' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
-            echo "⚠️ Episodes have different SPS/PPS — majority ${MAJORITY_HASH:-<none>}"
-            
-            PRESERVE_MAJORITY=false
-            DIVERGENT_FILE=""
-            for ref in EP*.mp4; do
-              [ -f "$ref" ] || continue
-              if [ -n "${EP_HASHES[$ref]}" ] && [ "${EP_HASHES[$ref]}" != "$MAJORITY_HASH" ]; then
-                DIVERGENT_FILE="$ref"
-                break
-              fi
-            done
-            
-            if [ -n "$DIVERGENT_FILE" ] && [ -n "$MAJORITY_HASH" ]; then
-              PROBE_TMP="temp_probe_${DIVERGENT_FILE}"
-              echo "            🔬 Probing: can our encoder reproduce majority SPS/PPS? (encoding $DIVERGENT_FILE...)"
-              if recode_episode "$DIVERGENT_FILE" "$PROBE_TMP"; then
-                PROBE_HASH=$(get_extradata "$PROBE_TMP")
-                if [ "$PROBE_HASH" = "$MAJORITY_HASH" ]; then
-                  PRESERVE_MAJORITY=true
-                  echo "            ✅ Recode reproduces majority SPS/PPS — will recode only divergent episodes"
-                else
-                  PRESERVE_MAJORITY=false
-                  echo "            ⚠️ Recode does NOT reproduce majority SPS/PPS ($(echo "$PROBE_HASH" | head -c 12)…) — will standardize ALL episodes"
-                fi
-              fi
-              rm -f "$PROBE_TMP" 2>/dev/null
-            fi
-            
-            ALL_IDENTICAL=false
-            TARGET_EXTRADATA=""
-          fi
-          echo "Reference codec extradata: ${TARGET_EXTRADATA:-<none>}"
-          
-          echo ""
-          echo "📋 Final Encoding Parameters:"
-          echo "   Resolution: ${TARGET_WIDTH}x${TARGET_HEIGHT}"
-          echo "   Video Codec: ${TARGET_VIDEO_CODEC}"
-          echo "   Pixel Format: ${TARGET_PIX_FMT}"
-          echo "   Profile: ${TARGET_PROFILE}"
-          echo "   Level: ${TARGET_LEVEL}"
-          echo "   Ref Frames: ${TARGET_REF_FRAMES}"
-          echo "   B-frames: ${TARGET_B_FRAMES}"
-          echo "   Keyint: ${TARGET_KEYINT}"
-          echo "   Audio: ${TARGET_AUDIO_SAMPLE_RATE}Hz ${TARGET_AUDIO_CHANNELS}ch ${TARGET_AUDIO_CODEC}"
-          echo "========================================="
-          
-          # Get list of all episodes sorted numerically
-          EPISODE_FILES=()
-          for f in EP*.mp4; do
-            if [ -f "$f" ]; then
-              EP_NUM=$(echo "$f" | grep -oE '[0-9]+' | head -1)
-              if [ -n "$EP_NUM" ]; then
-                EPISODE_FILES+=("$EP_NUM:$f")
-              fi
-            fi
-          done
-          
-          IFS=$'\n' SORTED_EPISODES=($(sort -t: -k1 -n <<<"${EPISODE_FILES[*]}"))
-          
-          TOTAL=${#SORTED_EPISODES[@]}
-          PROCESSED=0
-          FAILED=""
-          
-          echo "📊 Found $TOTAL episodes to standardize"
-          echo ""
-          
-          for entry in "${SORTED_EPISODES[@]}"; do
-            f="${entry#*:}"
-            EP_NUM="${entry%:*}"
-            
-            if [ ! -f "$f" ]; then continue; fi
-            
-            # Check if episode already matches the target standard — skip recode if so
-            CUR_W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null || echo "0")
-            CUR_H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null || echo "0")
-            CUR_VCODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
-            CUR_PIXFMT=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
-            CUR_ACODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
-            CUR_SR=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
-            CUR_CH=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
-            CUR_FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$f" 2>/dev/null || echo "0/0")
-            
-            # Normalize compare codec name (libx264 in ffmpeg output is h264 in ffprobe)
-            TARGET_VCODEC_COMPARE="$TARGET_VIDEO_CODEC"
-            [ "$TARGET_VCODEC_COMPARE" = "libx264" ] && TARGET_VCODEC_COMPARE="h264"
-            
-            # Compare codec private data (SPS/PPS) via extradata hash — mkvmerge warns and
-            # exits 1 if these differ between appended files even when width/height/codec
-            # look identical. Raw extradata isn't exposed by ffprobe 7.x, so use the hash.
-            REF_EXTRADATA="$TARGET_EXTRADATA"
-            CUR_EXTRADATA=$(get_extradata "$f")
-            
-            MATCHES=true
-            if [ "$PRESERVE_MAJORITY" = true ]; then
-              # Recode only divergent episodes; skip files whose SPS/PPS equals the majority
-              [ -n "$CUR_EXTRADATA" ] && [ "$CUR_EXTRADATA" != "$MAJORITY_HASH" ] && MATCHES=false
-            else
-              # Can't preserve majority bytes — force uniformity (recode all)
-              [ "$ALL_IDENTICAL" = true ] || MATCHES=false
-            fi
-            [ "$CUR_W" != "$TARGET_WIDTH" ] && MATCHES=false
-            [ "$CUR_H" != "$TARGET_HEIGHT" ] && MATCHES=false
-            [ "$CUR_VCODEC" != "$TARGET_VCODEC_COMPARE" ] && MATCHES=false
-            [ "$CUR_PIXFMT" != "$TARGET_PIX_FMT" ] && MATCHES=false
-            [ "$CUR_SR" != "$TARGET_AUDIO_SAMPLE_RATE" ] && MATCHES=false
-            [ "$CUR_CH" != "$TARGET_AUDIO_CHANNELS" ] && MATCHES=false
-            [ "$CUR_ACODEC" != "$TARGET_AUDIO_CODEC" ] && MATCHES=false
-            [ -n "$CUR_EXTRADATA" ] && [ -n "$REF_EXTRADATA" ] && [ "$CUR_EXTRADATA" != "$REF_EXTRADATA" ] && MATCHES=false
-            [ -n "$CUR_FPS" ] && [ -n "$TARGET_FPS" ] && [ "$CUR_FPS" != "$TARGET_FPS" ] && MATCHES=false
-            
-            if [ "$MATCHES" = true ]; then
-              echo "✅ Episode $EP_NUM: Already matches standard — skipping recode"
-              echo ""
-              continue
-            fi
-            
-            echo "📹 Episode $EP_NUM: Standardizing with detected H.264 parameters..."
-            
-            # Create temporary file
-            TEMP_FILE="temp_${f}"
-            rm -f "$TEMP_FILE" 2>/dev/null
-            
-            # Build FFmpeg command with detected parameters
-            if recode_episode "$f" "$TEMP_FILE"; then
-            if [ -f "$TEMP_FILE" ] && [ -s "$TEMP_FILE" ]; then
-              HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$TEMP_FILE" 2>/dev/null)
-              HAS_AUDIO=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "$TEMP_FILE" 2>/dev/null)
-              
-              if [ "$HAS_VIDEO" = "video" ] && [ "$HAS_AUDIO" = "audio" ]; then
-                NEW_W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$TEMP_FILE" 2>/dev/null || echo "0")
-                NEW_H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$TEMP_FILE" 2>/dev/null || echo "0")
-                echo "   ✅ Standardized: ${NEW_W}x${NEW_H}"
-                mv "$TEMP_FILE" "$f"
-                PROCESSED=$((PROCESSED + 1))
-              else
-                echo "   ❌ Standardized file missing video or audio!"
-                rm -f "$TEMP_FILE" 2>/dev/null
-                FAILED="$FAILED $f"
-              fi
-            else
-              echo "   ❌ Standardization failed!"
-              rm -f "$TEMP_FILE" 2>/dev/null
-              FAILED="$FAILED $f"
-            fi
-            fi
-            
-            echo ""
-          done
-          
-          echo "========================================="
-          echo "📊 STANDARDIZATION SUMMARY"
-          echo "========================================="
-          echo "📺 Series: $SERIES_TITLE"
-          echo "📊 Total Episodes: $TOTAL"
-          echo "✅ Standardized: $PROCESSED"
-          
-          if [ -n "$FAILED" ]; then
-            echo "❌ Failed episodes: $FAILED"
-            exit 1
-          fi
-          
-          echo "✅ All episodes standardized with detected H.264 parameters!"
-          echo "========================================="
-          
-          # FINAL VERIFICATION - Check codec private data consistency
-          echo ""
-          echo "🔍 VERIFYING CONSISTENT CODEC PARAMETERS..."
-          
-          REF_FILE=$(ls -1 EP*.mp4 | sort -V | head -1)
-          REF_EXTRADATA=$(get_extradata "$REF_FILE")
-          
-          echo "Reference: $REF_FILE"
-          echo "Reference codec extradata: $REF_EXTRADATA"
-          echo ""
-          
-          ALL_MATCH=true
-          for f in $(ls -1 EP*.mp4 | sort -V); do
-            if [ "$f" = "$REF_FILE" ]; then continue; fi
-            
-            EXTRADATA=$(get_extradata "$f")
-            
-            if [ "$EXTRADATA" != "$REF_EXTRADATA" ]; then
-              echo "❌ $f: Codec private data MISMATCH!"
-              ALL_MATCH=false
-            else
-              echo "✅ $f: Codec data matches reference"
-            fi
-          done
-          
-          if [ "$ALL_MATCH" = false ]; then
-            echo ""
-            echo "❌ NOT ALL EPISODES HAVE IDENTICAL CODEC PARAMETERS!"
-            exit 1
-          fi
-          
-          echo ""
-          echo "✅ ALL EPISODES HAVE IDENTICAL CODEC PARAMETERS!"
-          echo "   mkvmerge will be able to append them successfully."
-          echo "========================================="
-
-      - name: Merge Episodes with mkvmerge (Primary)
-        id: merge_mkvmerge
-        timeout-minutes: 120
-        env:
-          TITLE: ${{ steps.fname.outputs.formatted_title }}
-          SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
-          LABEL: ${{ steps.fname.outputs.clean_label }}
-        run: |
-          set -euo pipefail
           cd downloads
           
           echo "========================================="
           echo "🔗 MERGING EPISODES WITH MKVMERGE"
           echo "========================================="
-          echo "📺 Series: $SERIES_TITLE"
-          echo "========================================="
-          
-          # Sort episodes numerically
-          EPISODE_FILES=()
-          for f in EP*.mp4; do
-            if [ -f "$f" ]; then
-              EP_NUM=$(echo "$f" | grep -oE '[0-9]+' | head -1)
-              if [ -n "$EP_NUM" ]; then
-                EPISODE_FILES+=("$EP_NUM:$f")
-              fi
-            fi
-          done
-          
-          IFS=$'\n' SORTED_EPISODES=($(sort -t: -k1 -n <<<"${EPISODE_FILES[*]}"))
-          
-          SORTED_FILES=()
-          for entry in "${SORTED_EPISODES[@]}"; do
-            filename="${entry#*:}"
-            SORTED_FILES+=("$filename")
-          done
-          
-          EP_COUNT=${#SORTED_FILES[@]}
-          OUTPUT_FILE="${{ steps.fname.outputs.output_filename }}"
-          
-          echo "📊 Found $EP_COUNT episodes to merge"
-          if [ "$EP_COUNT" -le 3 ]; then
-            echo "📋 Episodes: ${SORTED_FILES[*]}"
-          else
-            echo "📋 First 3: ${SORTED_FILES[0]}, ${SORTED_FILES[1]}, ${SORTED_FILES[2]}"
-            echo "📋 Last 3: ${SORTED_FILES[$((EP_COUNT-3))]}, ${SORTED_FILES[$((EP_COUNT-2))]}, ${SORTED_FILES[$((EP_COUNT-1))]}"
-          fi
-          
-          if [ "$EP_COUNT" -eq 0 ]; then
-            echo "❌ No episodes to merge!"
-            exit 1
-          fi
-          
-          if [ "$EP_COUNT" -eq 1 ]; then
-            echo "📦 Only 1 episode - copying to output"
-            cp -f "${SORTED_FILES[0]}" "$OUTPUT_FILE"
-            echo "merged_file_path=$(pwd)/$OUTPUT_FILE" >> $GITHUB_ENV
-            echo "has_merged=true" >> $GITHUB_ENV
-            echo "merge_success=true" >> $GITHUB_OUTPUT
-            echo "merge_method=mkvmerge_single" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          # Shared post-merge logic: remux MKV -> MP4, verify output, generate thumbnails
-          finalize_merge() {
-            local src="$1" method="$2"
-            rm -f "$OUTPUT_FILE" "thumb.jpg" "square_thumb.jpg"
-            
-            echo ""
-            echo "✅ mkvmerge successful ($method)! Remuxing to MP4..."
-            if ! ffmpeg -y -i "$src" \
-              -c copy \
-              -movflags +faststart \
-              -map_chapters 0 \
-              -metadata title="$TITLE" \
-              -metadata series="$SERIES_TITLE" \
-              -metadata label="$LABEL" \
-              "$OUTPUT_FILE" 2>ffmpeg_remux.log; then
-              echo "❌ ffmpeg remux failed (ffmpeg_remux.log):"
-              tail -5 ffmpeg_remux.log
-              rm -f "$OUTPUT_FILE"
-              return 1
-            fi
-            
-            if [ ! -s "$OUTPUT_FILE" ]; then
-              echo "❌ Remux produced an empty file"
-              rm -f "$OUTPUT_FILE"
-              return 1
-            fi
-            
-            HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUTPUT_FILE" 2>/dev/null || true)
-            DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
-            
-            if [ "$HAS_VIDEO" != "video" ]; then
-              echo "❌ Output has no valid video stream"
-              rm -f "$OUTPUT_FILE"
-              return 1
-            fi
-            if ! awk -v d="$DURATION" 'BEGIN{exit !(d+0 > 0)}'; then
-              echo "❌ Output duration is invalid: '$DURATION'"
-              rm -f "$OUTPUT_FILE"
-              return 1
-            fi
-            
-            echo ""
-            echo "✅ mkvmerge merge successful ($method)!"
-            echo "merged_file_path=$(pwd)/$OUTPUT_FILE" >> $GITHUB_ENV
-            echo "has_merged=true" >> $GITHUB_ENV
-            echo "merge_success=true" >> $GITHUB_OUTPUT
-            echo "merge_method=$method" >> $GITHUB_OUTPUT
-            
-            echo "⏱️  Duration: ${DURATION%.*} seconds"
-            ls -lh "$OUTPUT_FILE"
-            
-            # Thumbnails are best-effort - don't fail the merge on thumb errors
-            echo "🖼️ Generating thumbnails..."
-            ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
-              -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
-              -q:v 2 "thumb.jpg" 2>/dev/null || true
-            ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
-              -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
-              -q:v 2 "square_thumb.jpg" 2>/dev/null || true
-            
-            rm -f "$src"
-            return 0
-          }
-          
-          # --- ATTEMPT 1: default append mapping (suffices when track layout is identical) ---
-          echo "📊 MERGING: Using mkvmerge with default append mapping..."
-          echo "🔄 Running mkvmerge with + appending (auto-mapping)..."
-          
-          rm -f temp_merged.mkv
-          MKVMERGE_ARGS=(-o temp_merged.mkv --title "$TITLE" \
-              "${SORTED_FILES[0]}")
-          for ((i=1; i<${#SORTED_FILES[@]}; i++)); do
-            MKVMERGE_ARGS+=("+" "${SORTED_FILES[$i]}")
-          done
-          
-          echo "Command: mkvmerge ${MKVMERGE_ARGS[*]}"
-          echo ""
-          
-          set +e
-          mkvmerge "${MKVMERGE_ARGS[@]}" 2>&1
-          MKX_RC=$?
-          set -e
-          echo "(mkvmerge exit code: $MKX_RC — a non-zero code here is often just appendability warnings)"
-          
-          if finalize_merge temp_merged.mkv "mkvmerge"; then
-            exit 0
-          fi
-          echo "⚠️ Auto-mapping merge produced an invalid file, trying explicit mapping..."
-          
-          # --- ATTEMPT 2: explicit chained track mapping (single comma-joined --append-to) ---
-          echo ""
-          echo "⚠️ mkvmerge auto-mapping failed. Trying with explicit track mapping..."
-          
-          rm -f temp_merged2.mkv
-          
-          APPEND_OPTS=""
-          for ((i=1; i<${#SORTED_FILES[@]}; i++)); do
-            if [ -n "$APPEND_OPTS" ]; then
-              APPEND_OPTS+=","
-            fi
-            APPEND_OPTS+="$i:0:$((i-1)):0,$i:1:$((i-1)):1"
-          done
-          
-          MKVMERGE_ARGS2=(-o temp_merged2.mkv --title "$TITLE")
-          if [ -n "$APPEND_OPTS" ]; then
-            MKVMERGE_ARGS2+=(--append-to "$APPEND_OPTS")
-          fi
-          MKVMERGE_ARGS2+=("${SORTED_FILES[0]}")
-          for ((i=1; i<${#SORTED_FILES[@]}; i++)); do
-            MKVMERGE_ARGS2+=("+" "${SORTED_FILES[$i]}")
-          done
-          
-          echo "Command: mkvmerge ${MKVMERGE_ARGS2[*]}"
-          echo ""
-          
-          set +e
-          mkvmerge "${MKVMERGE_ARGS2[@]}" 2>&1
-          MKX_RC2=$?
-          set -e
-          echo "(mkvmerge exit code: $MKX_RC2 — a non-zero code here is likely just appendability warnings)"
-          
-          if finalize_merge temp_merged2.mkv "mkvmerge_explicit"; then
-            exit 0
-          fi
-          echo "❌ mkvmerge merge failed!"
-          echo "merge_success=false" >> $GITHUB_OUTPUT
-          exit 1
-
-      - name: Merge Episodes with FFmpeg Concat (Fallback)
-        if: steps.merge_mkvmerge.outputs.merge_success == 'false'
-        id: merge_ffmpeg
-        timeout-minutes: 120
-        env:
-          TITLE: ${{ steps.fname.outputs.formatted_title }}
-          SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
-          LABEL: ${{ steps.fname.outputs.clean_label }}
-        run: |
-          cd downloads
-          
-          echo "========================================="
-          echo "🔗 MERGING EPISODES WITH FFMPEG (FALLBACK)"
-          echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "========================================="
           
@@ -1815,8 +881,10 @@ jobs:
             fi
           done
           
+          # Sort by episode number numerically
           IFS=$'\n' SORTED_EPISODES=($(sort -t: -k1 -n <<<"${EPISODE_FILES[*]}"))
           
+          # Extract just filenames in correct order
           SORTED_FILES=()
           for entry in "${SORTED_EPISODES[@]}"; do
             filename="${entry#*:}"
@@ -1825,65 +893,200 @@ jobs:
           
           EP_COUNT=${#SORTED_FILES[@]}
           
-          echo "📊 Found $EP_COUNT episodes to merge"
+          echo "📊 Found $EP_COUNT episodes to merge (sorted numerically)"
           
-          OUTPUT_FILE="${{ steps.fname.outputs.output_filename }}"
+          # Show first 5 and last 5 for verification
+          echo "📋 First 5 episodes:"
+          for i in 0 1 2 3 4; do
+            if [ $i -lt $EP_COUNT ]; then
+              echo "   ${SORTED_FILES[$i]}"
+            fi
+          done
+          echo "📋 Last 5 episodes:"
+          for i in $(seq $((EP_COUNT - 5)) $((EP_COUNT - 1))); do
+            if [ $i -ge 0 ] && [ $i -lt $EP_COUNT ]; then
+              echo "   ${SORTED_FILES[$i]}"
+            fi
+          done
           
           if [ "$EP_COUNT" -eq 0 ]; then
             echo "❌ No episodes to merge!"
             exit 1
           fi
           
+          OUTPUT_FILE="${{ steps.fname.outputs.output_filename }}"
+          
           if [ "$EP_COUNT" -eq 1 ]; then
             echo "📦 Only 1 episode - copying to output"
-            cp "${SORTED_FILES[0]}" "$OUTPUT_FILE"
+            SINGLE_FILE="${SORTED_FILES[0]}"
+            cp "$SINGLE_FILE" "$OUTPUT_FILE"
             echo "merged_file_path=$(pwd)/$OUTPUT_FILE" >> $GITHUB_ENV
             echo "has_merged=true" >> $GITHUB_ENV
             echo "merge_success=true" >> $GITHUB_OUTPUT
-            echo "merge_method=ffmpeg_single" >> $GITHUB_OUTPUT
             exit 0
           fi
           
-          # Create concat list
-          CONCAT_FILE="concat_list.txt"
-          > "$CONCAT_FILE"
+          # Verify all files have video streams
+          echo "🔍 Checking all files for video streams..."
+          NEEDS_REDOWNLOAD=false
+          REDOWNLOAD_LIST=""
+          
+          # Calculate total duration first
+          TOTAL_DURATION=0
           
           for f in "${SORTED_FILES[@]}"; do
-            if [ -f "$f" ] && [ -s "$f" ]; then
-              echo "file '$f'" >> "$CONCAT_FILE"
-              echo "✅ Added: $f"
+            if [ ! -f "$f" ]; then continue; fi
+            
+            # Get duration for this file
+            DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "0")
+            DURATION_INT=${DURATION%.*}
+            if [ "$DURATION_INT" -gt 0 ]; then
+              TOTAL_DURATION=$((TOTAL_DURATION + DURATION_INT))
+            fi
+            
+            HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$f" 2>/dev/null)
+            
+            if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
+              echo "⚠️ $f has no video stream!"
+              EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
+              EP_NUM_CLEAN=$(echo "$EP_NUM" | sed 's/^0*//')
+              REDOWNLOAD_LIST="$REDOWNLOAD_LIST $EP_NUM_CLEAN"
+              NEEDS_REDOWNLOAD=true
             else
-              echo "⚠️ Skipping invalid file: $f"
+              WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null)
+              HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null)
+              
+              if [ -z "$WIDTH" ] || [ "$WIDTH" = "0" ] || [ -z "$HEIGHT" ] || [ "$HEIGHT" = "0" ]; then
+                echo "⚠️ $f has video but invalid resolution (${WIDTH}x${HEIGHT})!"
+                EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
+                EP_NUM_CLEAN=$(echo "$EP_NUM" | sed 's/^0*//')
+                REDOWNLOAD_LIST="$REDOWNLOAD_LIST $EP_NUM_CLEAN"
+                NEEDS_REDOWNLOAD=true
+              else
+                echo "✅ $f: ${WIDTH}x${HEIGHT} video stream OK"
+              fi
             fi
           done
           
+          echo "📊 Total expected duration: ${TOTAL_DURATION} seconds ($((TOTAL_DURATION / 60)) minutes)"
+          
+          # Redownload episodes that need it
+          if [ "$NEEDS_REDOWNLOAD" = true ]; then
+            echo ""
+            echo "🔄 Redownloading episodes with yt-dlp to ensure proper video..."
+            
+            mapfile -t URL_ARRAY < urls.txt
+            
+            for EP_NUM_CLEAN in $REDOWNLOAD_LIST; do
+              EP_NUM_FORMATTED=$(printf "%02d" "$EP_NUM_CLEAN" 2>/dev/null || echo "$EP_NUM_CLEAN")
+              FILE="EP${EP_NUM_FORMATTED}.mp4"
+              URL_INDEX=$((EP_NUM_CLEAN - 1))
+              
+              if [ $URL_INDEX -ge 0 ] && [ $URL_INDEX -lt ${#URL_ARRAY[@]} ]; then
+                URL="${URL_ARRAY[$URL_INDEX]}"
+                echo ""
+                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED..."
+                
+                rm -f "$FILE"
+                
+                yt-dlp --extractor-args "generic:impersonate" --impersonate chrome \
+                  -f "bestvideo+bestaudio/best" \
+                  --no-progress --no-warnings \
+                  -o "$FILE" "$URL" < /dev/null 2>&1
+                
+                if [ -f "$FILE" ] && [ -s "$FILE" ]; then
+                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FILE" 2>/dev/null)
+                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                    echo "✅ Episode $EP_NUM_FORMATTED redownloaded successfully!"
+                  else
+                    echo "❌ Redownloaded file still has no video!"
+                  fi
+                fi
+              fi
+            done
+            echo "✅ Redownload complete!"
+          fi
+          
           echo ""
-          echo "📊 Attempting FFmpeg concat with stream copy (fast)..."
+          echo "🔍 Analyzing file properties..."
           
-          # First attempt: stream copy (fastest)
-          ffmpeg -f concat -safe 0 -i "$CONCAT_FILE" \
-            -c copy \
-            -movflags +faststart \
-            -metadata title="$TITLE" \
-            -metadata series="$SERIES_TITLE" \
-            -metadata label="$LABEL" \
-            -metadata year="$(date +%Y)" \
-            -metadata date="$(date +%Y-%m-%d)" \
-            "$OUTPUT_FILE" 2>/dev/null
+          declare -A resolutions
+          declare -A has_video
           
-          # Check if stream copy succeeded
-          if [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ]; then
-            HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUTPUT_FILE" 2>/dev/null)
-            if [ "$HAS_VIDEO" = "video" ]; then
-              echo "✅ FFmpeg merge successful with stream copy!"
-              echo "merged_file_path=$(pwd)/$OUTPUT_FILE" >> $GITHUB_ENV
-              echo "has_merged=true" >> $GITHUB_ENV
-              echo "merge_success=true" >> $GITHUB_OUTPUT
-              echo "merge_method=ffmpeg_streamcopy" >> $GITHUB_OUTPUT
+          for f in "${SORTED_FILES[@]}"; do
+            if [ -f "$f" ]; then
+              res=$(mediainfo --Inform="Video;%Width%x%Height%" "$f" 2>/dev/null || echo "")
               
-              FINAL_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
-              echo "⏱️  Duration: ${FINAL_DURATION%.*} seconds"
-              ls -lh "$OUTPUT_FILE"
+              if [ -z "$res" ] || [ "$res" = "0x0" ] || [ "$res" = "x" ]; then
+                width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null || echo "0")
+                height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null || echo "0")
+                
+                if [ "$width" != "0" ] && [ "$height" != "0" ]; then
+                  res="${width}x${height}"
+                  has_video["$f"]="true"
+                else
+                  res="0x0"
+                  has_video["$f"]="false"
+                fi
+              else
+                has_video["$f"]="true"
+              fi
+              resolutions["$f"]="$res"
+              echo "$f: $res"
+            fi
+          done
+          
+          # Verify all files have valid video
+          ALL_VALID=true
+          for f in "${SORTED_FILES[@]}"; do
+            if [ "${has_video[$f]}" != "true" ] || [ "${resolutions[$f]}" = "0x0" ]; then
+              echo "❌ $f has no valid video stream!"
+              ALL_VALID=false
+            fi
+          done
+          
+          if [ "$ALL_VALID" != true ]; then
+            echo "❌ Some episodes have no video - cannot merge!"
+            exit 1
+          fi
+          
+          echo ""
+          echo "✅ All files validated!"
+          echo "📊 MERGING: Using mkvmerge with append..."
+          
+          # ------------------------------------------------------------
+          # Build mkvmerge command with proper --append-to
+          # ------------------------------------------------------------
+          
+          # Start with the first file
+          MKVMERGE_CMD="mkvmerge -o \"$OUTPUT_FILE\" \"${SORTED_FILES[0]}\""
+          
+          # For each subsequent file, append video and audio tracks
+          # Track IDs are typically 0 for video, 1 for audio in MP4 files
+          for ((i=1; i<${#SORTED_FILES[@]}; i++)); do
+            FILE="${SORTED_FILES[$i]}"
+            # Append video track (track 0) from current file to video track (track 0) of previous
+            # Append audio track (track 1) from current file to audio track (track 1) of previous
+            MKVMERGE_CMD="$MKVMERGE_CMD \"$FILE\" --append-to ${i}:0:0 ${i}:1:1"
+          done
+          
+          MKVMERGE_CMD="$MKVMERGE_CMD --title \"$TITLE\""
+          
+          echo "🔄 Running mkvmerge with append..."
+          
+          # Execute mkvmerge
+          eval $MKVMERGE_CMD 2>&1
+          
+          # Check if merge was successful
+          if [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ]; then
+            # Verify the merged file has video
+            if mediainfo "$OUTPUT_FILE" 2>/dev/null | grep -q "Video"; then
+              echo "✅ mkvmerge merge successful!"
+              
+              # Get the actual merged file duration
+              ACTUAL_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
+              ACTUAL_DURATION_INT=${ACTUAL_DURATION%.*}
+              echo "📊 Merged file duration: ${ACTUAL_DURATION_INT} seconds ($((ACTUAL_DURATION_INT / 60)) minutes)"
               
               # Generate thumbnails
               echo "🖼️ Generating thumbnails..."
@@ -1895,66 +1098,101 @@ jobs:
                 -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
                 -q:v 2 "square_thumb.jpg" 2>/dev/null
               
-              rm -f "$CONCAT_FILE" 2>/dev/null
-              exit 0
-            fi
-          fi
-          
-          echo "⚠️ Stream copy failed, trying re-encode concat..."
-          
-          # Second attempt: re-encode (slower but more reliable)
-          ffmpeg -f concat -safe 0 -i "$CONCAT_FILE" \
-            -c:v libx264 -preset veryfast -crf 23 \
-            -profile:v baseline -level 3.0 \
-            -c:a aac -b:a 128k -ar 44100 \
-            -movflags +faststart \
-            -metadata title="$TITLE" \
-            -metadata series="$SERIES_TITLE" \
-            -metadata label="$LABEL" \
-            -metadata year="$(date +%Y)" \
-            -metadata date="$(date +%Y-%m-%d)" \
-            "$OUTPUT_FILE" 2>/dev/null
-          
-          rm -f "$CONCAT_FILE" 2>/dev/null
-          
-          if [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ]; then
-            HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUTPUT_FILE" 2>/dev/null)
-            if [ "$HAS_VIDEO" = "video" ]; then
-              echo "✅ FFmpeg merge successful with re-encode!"
               echo "merged_file_path=$(pwd)/$OUTPUT_FILE" >> $GITHUB_ENV
               echo "has_merged=true" >> $GITHUB_ENV
               echo "merge_success=true" >> $GITHUB_OUTPUT
-              echo "merge_method=ffmpeg_reencode" >> $GITHUB_OUTPUT
               
-              FINAL_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
-              echo "⏱️  Duration: ${FINAL_DURATION%.*} seconds"
+              echo ""
+              echo "========================================="
+              echo "📊 FINAL MERGED FILE"
+              echo "========================================="
+              echo "📺 Series: $SERIES_TITLE"
+              echo "📁 File: $OUTPUT_FILE"
+              echo "⏱️  Duration: ${ACTUAL_DURATION_INT} seconds ($((ACTUAL_DURATION_INT / 60)) minutes)"
               ls -lh "$OUTPUT_FILE"
-              
-              # Generate thumbnails
-              echo "🖼️ Generating thumbnails..."
-              ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
-                -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
-                -q:v 2 "thumb.jpg" 2>/dev/null
-              
-              ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
-                -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
-                -q:v 2 "square_thumb.jpg" 2>/dev/null
-              
-              exit 0
+              echo "========================================="
+            else
+              echo "❌ mkvmerge output has no video stream!"
+              exit 1
+            fi
+          else
+            echo "❌ mkvmerge merge failed!"
+            
+            # ------------------------------------------------------------
+            # FALLBACK: Try FFmpeg concat
+            # ------------------------------------------------------------
+            echo ""
+            echo "🔄 Falling back to FFmpeg concat demuxer..."
+            
+            CONCAT_LIST="concat_list.txt"
+            > $CONCAT_LIST
+            
+            for f in "${SORTED_FILES[@]}"; do
+              if [ -f "$f" ] && [ -s "$f" ]; then
+                if ffprobe -v error "$f" 2>/dev/null; then
+                  echo "file '$f'" >> $CONCAT_LIST
+                  echo "✅ Added: $f"
+                else
+                  echo "⚠️ Skipping invalid file: $f"
+                fi
+              fi
+            done
+            
+            ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
+              -c copy \
+              -movflags +faststart \
+              -metadata title="$TITLE" \
+              -metadata series="$SERIES_TITLE" \
+              -metadata label="$LABEL" \
+              -metadata year="$(date +%Y)" \
+              -metadata date="$(date +%Y-%m-%d)" \
+              "$OUTPUT_FILE" 2>/dev/null
+            
+            if [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ]; then
+              if mediainfo "$OUTPUT_FILE" 2>/dev/null | grep -q "Video"; then
+                echo "✅ FFmpeg merge successful!"
+                
+                MERGED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
+                MERGED_DURATION_INT=${MERGED_DURATION%.*}
+                echo "📊 Merged file duration: ${MERGED_DURATION_INT} seconds ($((MERGED_DURATION_INT / 60)) minutes)"
+                
+                # Generate thumbnails
+                echo "🖼️ Generating thumbnails..."
+                ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
+                  -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
+                  -q:v 2 "thumb.jpg" 2>/dev/null
+                
+                ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
+                  -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
+                  -q:v 2 "square_thumb.jpg" 2>/dev/null
+                
+                echo "merged_file_path=$(pwd)/$OUTPUT_FILE" >> $GITHUB_ENV
+                echo "has_merged=true" >> $GITHUB_ENV
+                echo "merge_success=true" >> $GITHUB_OUTPUT
+                
+                echo ""
+                echo "========================================="
+                echo "📊 FINAL MERGED FILE (FFmpeg Fallback)"
+                echo "========================================="
+                echo "📺 Series: $SERIES_TITLE"
+                echo "📁 File: $OUTPUT_FILE"
+                echo "⏱️  Duration: ${MERGED_DURATION_INT} seconds ($((MERGED_DURATION_INT / 60)) minutes)"
+                ls -lh "$OUTPUT_FILE"
+                echo "========================================="
+              else
+                echo "❌ FFmpeg fallback also failed!"
+                exit 1
+              fi
+            else
+              echo "❌ FFmpeg fallback failed!"
+              exit 1
             fi
           fi
-          
-          echo "❌ FFmpeg merge failed!"
-          exit 1
 
-      - name: Verify Merged File
-        if: steps.merge_mkvmerge.outputs.merge_success == 'true' || steps.merge_ffmpeg.outputs.merge_success == 'true'
+      - name: Verify, Compress if Needed, and Fix Duration
+        if: steps.merge.outputs.merge_success == 'true'
         id: verify
         timeout-minutes: 120
-        env:
-          TITLE: ${{ steps.fname.outputs.formatted_title }}
-          SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
-          LABEL: ${{ steps.fname.outputs.clean_label }}
         run: |
           cd downloads
           
@@ -2156,8 +1394,7 @@ jobs:
           
           if [ ! -f "${{ env.merged_file_path }}" ] && [ ! -f "${{ steps.fname.outputs.output_filename }}" ]; then
             echo "❌ Merged file not found!"
-            exit 1
-          fi
+            exit 1          fi
           
           if [ -f "${{ env.merged_file_path }}" ]; then
             export MERGED_PATH="${{ env.merged_file_path }}"
@@ -3038,8 +2275,7 @@ jobs:
             fi
             
             local percent=$(echo "scale=2; ($current / $total) * 100" | bc 2>/dev/null || echo "0")
-            if [ "$(echo "$percent > 0" | bc)" = "0" ]; then
-              echo "Calculating..."
+            if [ "$(echo "$percent > 0" | bc)" = "0" ]; then              echo "Calculating..."
               return
             fi
             
