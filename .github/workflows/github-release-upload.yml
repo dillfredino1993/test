@@ -951,7 +951,7 @@ jobs:
             exit 1
           fi
 
-      - name: STANDARDIZE EPISODES TO MAJORITY STANDARD
+      - name: FORCE CONSISTENT ENCODING FOR ALL EPISODES (FIX CODEC PRIVATE DATA)
         timeout-minutes: 120
         env:
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
@@ -969,7 +969,7 @@ jobs:
           TARGET_RESOLUTION="${{ steps.analyze.outputs.resolution }}"
           
           echo "========================================="
-          echo "📐 STANDARDIZING EPISODES TO MAJORITY STANDARD"
+          echo "🔧 FORCE CONSISTENT ENCODING FOR ALL EPISODES"
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "🎯 Target Standard:"
@@ -983,45 +983,28 @@ jobs:
             echo "❌ Invalid target standards detected!"
             echo "   Width: '$TARGET_WIDTH'"
             echo "   Height: '$TARGET_HEIGHT'"
-            echo "   This usually means the analyze step failed to detect video streams."
-            echo "   Please check the episode files for corruption."
             exit 1
           fi
           
-          # Also check if the codec is valid
-          if [ "$TARGET_VIDEO_CODEC" = "unknown" ] || [ -z "$TARGET_VIDEO_CODEC" ]; then
-            echo "⚠️ Warning: Unknown video codec detected. Defaulting to libx264."
-            TARGET_VIDEO_CODEC="libx264"
-          fi
-          
-          if [ "$TARGET_AUDIO_CODEC" = "unknown" ] || [ -z "$TARGET_AUDIO_CODEC" ]; then
-            echo "⚠️ Warning: Unknown audio codec detected. Defaulting to aac."
-            TARGET_AUDIO_CODEC="aac"
-          fi
-          
-          if [ "$TARGET_AUDIO_SAMPLE_RATE" = "0" ] || [ -z "$TARGET_AUDIO_SAMPLE_RATE" ]; then
-            echo "⚠️ Warning: Unknown audio sample rate detected. Defaulting to 44100."
-            TARGET_AUDIO_SAMPLE_RATE="44100"
-          fi
-          
-          if [ "$TARGET_AUDIO_CHANNELS" = "0" ] || [ -z "$TARGET_AUDIO_CHANNELS" ]; then
-            echo "⚠️ Warning: Unknown audio channels detected. Defaulting to 2."
-            TARGET_AUDIO_CHANNELS="2"
-          fi
-          
-          if [ "$TARGET_PIX_FMT" = "unknown" ] || [ -z "$TARGET_PIX_FMT" ]; then
-            echo "⚠️ Warning: Unknown pixel format detected. Defaulting to yuv420p."
-            TARGET_PIX_FMT="yuv420p"
-          fi
+          # Set defaults if needed
+          [ "$TARGET_VIDEO_CODEC" = "unknown" ] || [ -z "$TARGET_VIDEO_CODEC" ] && TARGET_VIDEO_CODEC="libx264"
+          [ "$TARGET_AUDIO_CODEC" = "unknown" ] || [ -z "$TARGET_AUDIO_CODEC" ] && TARGET_AUDIO_CODEC="aac"
+          [ "$TARGET_AUDIO_SAMPLE_RATE" = "0" ] || [ -z "$TARGET_AUDIO_SAMPLE_RATE" ] && TARGET_AUDIO_SAMPLE_RATE="44100"
+          [ "$TARGET_AUDIO_CHANNELS" = "0" ] || [ -z "$TARGET_AUDIO_CHANNELS" ] && TARGET_AUDIO_CHANNELS="2"
+          [ "$TARGET_PIX_FMT" = "unknown" ] || [ -z "$TARGET_PIX_FMT" ] && TARGET_PIX_FMT="yuv420p"
           
           echo ""
-          echo "📋 Final Target Standards:"
-          echo "   Resolution: ${TARGET_WIDTH}x${TARGET_HEIGHT}"
+          echo "📋 Final Encoding Parameters:"
           echo "   Video Codec: ${TARGET_VIDEO_CODEC}"
           echo "   Pixel Format: ${TARGET_PIX_FMT}"
           echo "   Audio Sample Rate: ${TARGET_AUDIO_SAMPLE_RATE}Hz"
           echo "   Audio Channels: ${TARGET_AUDIO_CHANNELS}ch"
           echo "   Audio Codec: ${TARGET_AUDIO_CODEC}"
+          echo "   H.264 Profile: baseline"
+          echo "   H.264 Level: 3.0"
+          echo "   Keyframe Interval: 250 (GOP size)"
+          echo "   Reference Frames: 3"
+          echo "   B-frames: 0 (for compatibility)"
           echo "========================================="
           
           # Get list of all episodes sorted numerically
@@ -1039,10 +1022,9 @@ jobs:
           
           TOTAL=${#SORTED_EPISODES[@]}
           PROCESSED=0
-          SKIPPED=0
           FAILED=""
           
-          echo "📊 Found $TOTAL episodes to standardize"
+          echo "📊 Found $TOTAL episodes to re-encode with consistent parameters"
           echo ""
           
           for entry in "${SORTED_EPISODES[@]}"; do
@@ -1051,40 +1033,24 @@ jobs:
             
             if [ ! -f "$f" ]; then continue; fi
             
-            # Get current specs
-            WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null || echo "0")
-            HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null || echo "0")
-            VIDEO_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
-            PIX_FMT=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
-            AUDIO_RATE=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$f" 2>/dev/null || echo "0")
-            AUDIO_CHANNELS=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$f" 2>/dev/null || echo "0")
-            AUDIO_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
-            
-            echo "📹 Episode $EP_NUM: ${WIDTH}x${HEIGHT} ${VIDEO_CODEC} ${PIX_FMT} | ${AUDIO_RATE}Hz ${AUDIO_CHANNELS}ch ${AUDIO_CODEC}"
-            
-            # Check if already matches target
-            if [ "$WIDTH" = "$TARGET_WIDTH" ] && [ "$HEIGHT" = "$TARGET_HEIGHT" ] && \
-               [ "$VIDEO_CODEC" = "$TARGET_VIDEO_CODEC" ] && [ "$PIX_FMT" = "$TARGET_PIX_FMT" ] && \
-               [ "$AUDIO_RATE" = "$TARGET_AUDIO_SAMPLE_RATE" ] && [ "$AUDIO_CHANNELS" = "$TARGET_AUDIO_CHANNELS" ] && \
-               [ "$AUDIO_CODEC" = "$TARGET_AUDIO_CODEC" ]; then
-              echo "   ✅ Already matches standard, skipping"
-              SKIPPED=$((SKIPPED + 1))
-              PROCESSED=$((PROCESSED + 1))
-              echo ""
-              continue
-            fi
-            
-            echo "   🔄 Converting to match majority standard..."
+            echo "📹 Episode $EP_NUM: Re-encoding with consistent parameters..."
             
             # Create temporary file
             TEMP_FILE="temp_${f}"
             rm -f "$TEMP_FILE" 2>/dev/null
             
-            # Build FFmpeg command with all target specs
+            # FORCE CONSISTENT ENCODING PARAMETERS
+            # This ensures ALL episodes have identical codec private data (SPS/PPS)
             ffmpeg -y -i "$f" \
               -vf "scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad=${TARGET_WIDTH}:${TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,format=${TARGET_PIX_FMT}" \
-              -c:v "${TARGET_VIDEO_CODEC}" -preset veryfast -crf 23 \
-              -c:a "${TARGET_AUDIO_CODEC}" -b:a 128k \
+              -c:v "${TARGET_VIDEO_CODEC}" \
+              -preset veryfast \
+              -crf 23 \
+              -profile:v baseline \
+              -level 3.0 \
+              -x264-params "keyint=250:min-keyint=25:scenecut=40:ref=3:bframes=0" \
+              -c:a "${TARGET_AUDIO_CODEC}" \
+              -b:a 128k \
               -ar "${TARGET_AUDIO_SAMPLE_RATE}" \
               -ac "${TARGET_AUDIO_CHANNELS}" \
               -movflags +faststart \
@@ -1097,22 +1063,18 @@ jobs:
               HAS_AUDIO=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "$TEMP_FILE" 2>/dev/null)
               
               if [ "$HAS_VIDEO" = "video" ] && [ "$HAS_AUDIO" = "audio" ]; then
-                # Verify the new specs
                 NEW_W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$TEMP_FILE" 2>/dev/null || echo "0")
                 NEW_H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$TEMP_FILE" 2>/dev/null || echo "0")
-                NEW_RATE=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$TEMP_FILE" 2>/dev/null || echo "0")
-                NEW_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$TEMP_FILE" 2>/dev/null || echo "unknown")
-                
-                echo "   ✅ Standardized to ${NEW_W}x${NEW_H} ${NEW_CODEC}, ${NEW_RATE}Hz"
+                echo "   ✅ Re-encoded: ${NEW_W}x${NEW_H}"
                 mv "$TEMP_FILE" "$f"
                 PROCESSED=$((PROCESSED + 1))
               else
-                echo "   ❌ Standardized file missing video or audio!"
+                echo "   ❌ Re-encoded file missing video or audio!"
                 rm -f "$TEMP_FILE" 2>/dev/null
                 FAILED="$FAILED $f"
               fi
             else
-              echo "   ❌ Standardization failed!"
+              echo "   ❌ Re-encoding failed!"
               rm -f "$TEMP_FILE" 2>/dev/null
               FAILED="$FAILED $f"
             fi
@@ -1121,74 +1083,61 @@ jobs:
           done
           
           echo "========================================="
-          echo "📊 STANDARDIZATION SUMMARY"
+          echo "📊 RE-ENCODING SUMMARY"
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Total Episodes: $TOTAL"
-          echo "✅ Processed (converted): $((PROCESSED - SKIPPED))"
-          echo "⏭️  Skipped (already standard): $SKIPPED"
+          echo "✅ Re-encoded: $PROCESSED"
           
           if [ -n "$FAILED" ]; then
             echo "❌ Failed episodes: $FAILED"
-            echo ""
-            echo "🔴 STANDARDIZATION FAILED - Cannot proceed with merge"
             exit 1
           fi
           
-          echo "✅ All episodes standardized to majority standard!"
+          echo "✅ All episodes re-encoded with consistent parameters!"
           echo "========================================="
           
-          # FINAL VERIFICATION - Ensure ALL episodes have IDENTICAL specs
+          # FINAL VERIFICATION - Check codec private data consistency
           echo ""
-          echo "🔍 FINAL VERIFICATION: Checking all episodes have identical specs..."
+          echo "🔍 VERIFYING CONSISTENT CODEC PARAMETERS..."
           
-          VIDEO_SPEC=""
-          AUDIO_SPEC=""
+          # Get codec private data from first file as reference
+          REF_FILE=$(ls -1 EP*.mp4 | sort -V | head -1)
+          REF_EXTRADATA=$(ffprobe -v error -select_streams v:0 -show_entries stream=extradata -of default=noprint_wrappers=1:nokey=1 "$REF_FILE" 2>/dev/null | head -c 100)
+          REF_SAMPLE=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of default=noprint_wrappers=1:nokey=1 "$REF_FILE" 2>/dev/null)
+          
+          echo "Reference: $REF_FILE"
+          echo "Reference extradata (first 100 chars): $REF_EXTRADATA"
+          echo "Reference sample rate: $REF_SAMPLE"
+          echo ""
+          
           ALL_MATCH=true
-          
-          for entry in "${SORTED_EPISODES[@]}"; do
-            f="${entry#*:}"
-            EP_NUM="${entry%:*}"
+          for f in $(ls -1 EP*.mp4 | sort -V); do
+            if [ "$f" = "$REF_FILE" ]; then continue; fi
             
-            if [ ! -f "$f" ]; then continue; fi
+            EXTRADATA=$(ffprobe -v error -select_streams v:0 -show_entries stream=extradata -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null | head -c 100)
+            SAMPLE=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null)
             
-            W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null || echo "0")
-            H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null || echo "0")
-            VC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
-            PF=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
-            AR=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$f" 2>/dev/null || echo "0")
-            AC=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$f" 2>/dev/null || echo "0")
-            ACODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
-            
-            CURRENT_VIDEO="${W}x${H} ${VC} ${PF}"
-            CURRENT_AUDIO="${AR}Hz ${AC}ch ${ACODEC}"
-            
-            if [ -z "$VIDEO_SPEC" ]; then
-              VIDEO_SPEC="$CURRENT_VIDEO"
-              AUDIO_SPEC="$CURRENT_AUDIO"
-              echo "   Reference: $f -> Video: $VIDEO_SPEC, Audio: $AUDIO_SPEC"
-            elif [ "$CURRENT_VIDEO" != "$VIDEO_SPEC" ]; then
-              echo "   ❌ Episode $EP_NUM video mismatch: $CURRENT_VIDEO (expected $VIDEO_SPEC)"
+            if [ "$EXTRADATA" != "$REF_EXTRADATA" ]; then
+              echo "❌ $f: Codec private data MISMATCH!"
               ALL_MATCH=false
-            elif [ "$CURRENT_AUDIO" != "$AUDIO_SPEC" ]; then
-              echo "   ❌ Episode $EP_NUM audio mismatch: $CURRENT_AUDIO (expected $AUDIO_SPEC)"
+            elif [ "$SAMPLE" != "$REF_SAMPLE" ]; then
+              echo "❌ $f: Sample rate MISMATCH!"
               ALL_MATCH=false
             else
-              echo "   ✅ Episode $EP_NUM: $CURRENT_VIDEO, $CURRENT_AUDIO"
+              echo "✅ $f: Codec data matches reference"
             fi
           done
           
           if [ "$ALL_MATCH" = false ]; then
             echo ""
-            echo "❌ NOT ALL EPISODES HAVE IDENTICAL SPECS!"
-            echo "   This will cause mkvmerge to fail. Please check the logs."
+            echo "❌ NOT ALL EPISODES HAVE IDENTICAL CODEC PARAMETERS!"
             exit 1
           fi
           
           echo ""
-          echo "✅ ALL EPISODES HAVE IDENTICAL SPECS:"
-          echo "   Video: $VIDEO_SPEC"
-          echo "   Audio: $AUDIO_SPEC"
+          echo "✅ ALL EPISODES HAVE IDENTICAL CODEC PARAMETERS!"
+          echo "   mkvmerge will be able to append them successfully."
           echo "========================================="
 
       - name: Merge Episodes with mkvmerge (Primary)
@@ -1311,10 +1260,6 @@ jobs:
           echo ""
           echo "⚠️ mkvmerge with auto-mapping failed. Trying with explicit track mapping..."
           
-          # Use a different approach: Use file numbers with --append-to
-          # Format: --append-to source_file_id:source_track_id:target_file_id:target_track_id
-          # File IDs start from 0 for the first file
-          
           MKVMERGE_CMD2="mkvmerge -o temp_merged2.mkv --title \"$TITLE\" \"${SORTED_FILES[0]}\""
           
           # Add all files with + for appending
@@ -1325,8 +1270,6 @@ jobs:
           # Build append-to options for all files after the first
           APPEND_OPTS=""
           for ((i=1; i<${#SORTED_FILES[@]}; i++)); do
-            # Each file has 2 tracks: video (0) and audio (1)
-            # Append to the previous file's tracks
             APPEND_OPTS="$APPEND_OPTS --append-to $i:0:$((i-1)):0"
             APPEND_OPTS="$APPEND_OPTS --append-to $i:1:$((i-1)):1"
           done
@@ -1393,7 +1336,8 @@ jobs:
         run: |
           cd downloads
           
-          echo "========================================="          echo "🔗 MERGING EPISODES WITH FFMPEG (FALLBACK)"
+          echo "========================================="
+          echo "🔗 MERGING EPISODES WITH FFMPEG (FALLBACK)"
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "========================================="
@@ -1499,6 +1443,7 @@ jobs:
           # Second attempt: re-encode (slower but more reliable)
           ffmpeg -f concat -safe 0 -i "$CONCAT_FILE" \
             -c:v libx264 -preset veryfast -crf 23 \
+            -profile:v baseline -level 3.0 \
             -c:a aac -b:a 128k -ar 44100 \
             -movflags +faststart \
             -metadata title="$TITLE" \
