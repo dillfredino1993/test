@@ -689,7 +689,7 @@ jobs:
                   cmd = [
                       "ffprobe", "-v", "error",
                       "-show_entries", 
-                      "stream=index,codec_type,width,height,codec_name,pix_fmt,sample_rate,channels,channel_layout",
+                      "stream=index,codec_type,width,height,codec_name,pix_fmt,sample_rate,channels,channel_layout,r_frame_rate",
                       "-of", "json",
                       file_path
                   ]
@@ -701,6 +701,7 @@ jobs:
                   vcodec, pix_fmt = "unknown", "unknown"
                   sample_rate, channels = 0, 0
                   acodec = "unknown"
+                  frame_rate = "0/0"
                   
                   # Find video and audio streams
                   video_stream = None
@@ -719,6 +720,7 @@ jobs:
                       height = int(video_stream.get('height', 0))
                       vcodec = video_stream.get('codec_name', 'unknown')
                       pix_fmt = video_stream.get('pix_fmt', 'unknown')
+                      frame_rate = video_stream.get('r_frame_rate', '0/0')
                   else:
                       # Try to find any video stream (fallback)
                       for stream in data.get('streams', []):
@@ -727,6 +729,7 @@ jobs:
                               height = int(stream.get('height', 0))
                               vcodec = stream.get('codec_name', 'unknown')
                               pix_fmt = stream.get('pix_fmt', 'unknown')
+                              frame_rate = stream.get('r_frame_rate', '0/0')
                               break
                   
                   # Extract audio specs
@@ -751,6 +754,7 @@ jobs:
                       'sample_rate': sample_rate,
                       'channels': channels,
                       'acodec': acodec,
+                      'frame_rate': frame_rate,
                       'resolution': f"{width}x{height}",
                       'video_spec': f"{width}x{height}_{vcodec}_{pix_fmt}",
                       'audio_spec': f"{sample_rate}Hz_{channels}ch_{acodec}"
@@ -777,6 +781,7 @@ jobs:
           sample_rates = []
           channels_list = []
           pix_formats = []
+          frame_rates = []
           
           for f in episode_files:
               specs = get_episode_specs(f)
@@ -789,11 +794,13 @@ jobs:
                   sample_rates.append(specs['sample_rate'])
                   channels_list.append(specs['channels'])
                   pix_formats.append(specs['pix_fmt'])
+                  frame_rates.append(specs['frame_rate'])
                   
                   print(f"📹 {f}:")
                   print(f"   Resolution: {specs['resolution']}")
                   print(f"   Video Codec: {specs['vcodec']}")
                   print(f"   Pixel Format: {specs['pix_fmt']}")
+                  print(f"   Frame Rate: {specs['frame_rate']}")
                   print(f"   Audio Sample Rate: {specs['sample_rate']}Hz")
                   print(f"   Audio Channels: {specs['channels']}ch")
                   print(f"   Audio Codec: {specs['acodec']}")
@@ -840,6 +847,11 @@ jobs:
           most_common_acodec = acodec_counter.most_common(1)[0]
           print(f"🎵 Most common audio codec: {most_common_acodec[0]} ({most_common_acodec[1]}/{len(episode_files)} episodes)")
           
+          # Frame rate majority
+          fps_counter = Counter(frame_rates)
+          most_common_fps = fps_counter.most_common(1)[0]
+          print(f"🎞️  Most common frame rate: {most_common_fps[0]} fps ({most_common_fps[1]}/{len(episode_files)} episodes)")
+          
           print("")
           
           # Determine standard based on majority
@@ -850,6 +862,7 @@ jobs:
           sample_rate = most_common_sr[0]
           channels = most_common_ch[0]
           acodec = most_common_acodec[0]
+          frame_rate = most_common_fps[0]
           
           print("=========================================")
           print("✅ TARGET STANDARDS DETERMINED:")
@@ -890,6 +903,7 @@ jobs:
               f.write(f"AUDIO_CHANNELS={channels}\n")
               f.write(f"AUDIO_CODEC={acodec}\n")
               f.write(f"RESOLUTION={width}x{height}\n")
+              f.write(f"FRAME_RATE={frame_rate}\n")
           
           # Write to GitHub outputs
           github_output = os.environ.get('GITHUB_OUTPUT')
@@ -903,6 +917,7 @@ jobs:
                   f.write(f"audio_channels={channels}\n")
                   f.write(f"audio_codec={acodec}\n")
                   f.write(f"resolution={width}x{height}\n")
+                  f.write(f"frame_rate={frame_rate}\n")
           
           # Also write a summary for debugging
           with open('specs_summary.txt', 'w') as f:
@@ -1261,6 +1276,7 @@ jobs:
           TARGET_AUDIO_SAMPLE_RATE="${{ steps.analyze.outputs.audio_sample_rate }}"
           TARGET_AUDIO_CHANNELS="${{ steps.analyze.outputs.audio_channels }}"
           TARGET_AUDIO_CODEC="${{ steps.analyze.outputs.audio_codec }}"
+          TARGET_FPS="${{ steps.analyze.outputs.frame_rate }}"
           
           echo "========================================="
           echo "📐 STANDARDIZING EPISODES WITH DETECTED H.264 PARAMETERS"
@@ -1278,6 +1294,7 @@ jobs:
           echo "   Audio Sample Rate: ${TARGET_AUDIO_SAMPLE_RATE}"
           echo "   Audio Channels: ${TARGET_AUDIO_CHANNELS}"
           echo "   Audio Codec: ${TARGET_AUDIO_CODEC}"
+          echo "   Frame Rate: ${TARGET_FPS}"
           echo "========================================="
           
           # Check if we have valid targets
@@ -1297,6 +1314,7 @@ jobs:
           [ -z "$TARGET_AUDIO_SAMPLE_RATE" ] || [ "$TARGET_AUDIO_SAMPLE_RATE" = "unknown" ] && TARGET_AUDIO_SAMPLE_RATE="44100"
           [ -z "$TARGET_AUDIO_CHANNELS" ] || [ "$TARGET_AUDIO_CHANNELS" = "unknown" ] && TARGET_AUDIO_CHANNELS="2"
           [ -z "$TARGET_AUDIO_CODEC" ] || [ "$TARGET_AUDIO_CODEC" = "unknown" ] && TARGET_AUDIO_CODEC="aac"
+          [ -z "$TARGET_FPS" ] || [ "$TARGET_FPS" = "unknown" ] || [ "$TARGET_FPS" = "0/0" ] && TARGET_FPS="30"
           
           # Reference codec private data — the SPS/PPS bytes, fingerprinted via
           # ffprobe's extradata_hash (SHA-256). mkvmerge warns (and exits 1) when these
@@ -1338,7 +1356,7 @@ jobs:
             local src="$1" dst="$2"
             rm -f "$dst" 2>/dev/null
             ffmpeg -y -i "$src" \
-              -vf "scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad=${TARGET_WIDTH}:${TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,format=${TARGET_PIX_FMT}" \
+              -vf "fps=${TARGET_FPS},scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad=${TARGET_WIDTH}:${TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,format=${TARGET_PIX_FMT}" \
               -c:v "${TARGET_VIDEO_CODEC}" \
               -preset veryfast \
               -crf 23 \
@@ -1459,6 +1477,7 @@ jobs:
             CUR_ACODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
             CUR_SR=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
             CUR_CH=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
+            CUR_FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$f" 2>/dev/null || echo "0/0")
             
             # Normalize compare codec name (libx264 in ffmpeg output is h264 in ffprobe)
             TARGET_VCODEC_COMPARE="$TARGET_VIDEO_CODEC"
@@ -1486,6 +1505,7 @@ jobs:
             [ "$CUR_CH" != "$TARGET_AUDIO_CHANNELS" ] && MATCHES=false
             [ "$CUR_ACODEC" != "$TARGET_AUDIO_CODEC" ] && MATCHES=false
             [ -n "$CUR_EXTRADATA" ] && [ -n "$REF_EXTRADATA" ] && [ "$CUR_EXTRADATA" != "$REF_EXTRADATA" ] && MATCHES=false
+            [ -n "$CUR_FPS" ] && [ -n "$TARGET_FPS" ] && [ "$CUR_FPS" != "$TARGET_FPS" ] && MATCHES=false
             
             if [ "$MATCHES" = true ]; then
               echo "✅ Episode $EP_NUM: Already matches standard — skipping recode"
