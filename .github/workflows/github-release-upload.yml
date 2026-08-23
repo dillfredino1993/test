@@ -858,7 +858,7 @@ jobs:
           done
           echo ""
 
-      - name: Smart Merge Episodes with mkvmerge
+      - name: Smart Merge Episodes with mkvmerge (MKVToolNix)
         id: merge
         timeout-minutes: 120
         run: |
@@ -1052,12 +1052,13 @@ jobs:
           
           echo ""
           echo "✅ All files validated!"
-          echo "📊 MERGING: Using mkvmerge with append mode..."
           
           # ------------------------------------------------------------
-          # Use mkvmerge with append-mode track - simple and reliable
+          # Use mkvmerge (MKVToolNix) with --append-mode track
           # This automatically appends tracks from subsequent files to the first file
           # ------------------------------------------------------------
+          
+          echo "📊 MERGING: Using mkvmerge (MKVToolNix) with append mode..."
           
           # Build the command with all files in order
           MKVMERGE_CMD="mkvmerge -o \"$OUTPUT_FILE\" --append-mode track --title \"$TITLE\""
@@ -1077,12 +1078,119 @@ jobs:
             if mediainfo "$OUTPUT_FILE" 2>/dev/null | grep -q "Video"; then
               echo "✅ mkvmerge merge successful!"
               
-              # Get the actual merged file duration
-              ACTUAL_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
-              ACTUAL_DURATION_INT=${ACTUAL_DURATION%.*}
-              echo "📊 Merged file duration: ${ACTUAL_DURATION_INT} seconds ($((ACTUAL_DURATION_INT / 60)) minutes)"
+              # ------------------------------------------------------------
+              # FIX: Correct the duration using ffmpeg
+              # ------------------------------------------------------------
+              echo ""
+              echo "🔧 Fixing duration metadata..."
+              
+              # Get the current (incorrect) duration
+              CURRENT_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
+              CURRENT_DURATION_INT=${CURRENT_DURATION%.*}
+              
+              if [ "$CURRENT_DURATION_INT" -gt 0 ]; then
+                echo "📊 Current duration: ${CURRENT_DURATION_INT} seconds ($((CURRENT_DURATION_INT / 60)) minutes)"
+                echo "📊 Expected duration: ${TOTAL_DURATION} seconds ($((TOTAL_DURATION / 60)) minutes)"
+              fi
+              
+              # If duration is incorrect, fix it
+              if [ "$CURRENT_DURATION_INT" -lt 100 ] && [ "$TOTAL_DURATION" -gt 1000 ]; then
+                echo "⚠️ Duration mismatch detected! Fixing..."
+                
+                TEMP_FIXED="temp_fixed.mp4"
+                
+                # Method 1: Try re-mux with ffmpeg (fastest)
+                echo "🔄 Attempt 1: Re-mux with ffmpeg..."
+                ffmpeg -y -i "$OUTPUT_FILE" \
+                  -c copy \
+                  -movflags +faststart \
+                  -metadata title="$TITLE" \
+                  -metadata series="$SERIES_TITLE" \
+                  -metadata label="$LABEL" \
+                  -metadata year="$(date +%Y)" \
+                  -metadata date="$(date +%Y-%m-%d)" \
+                  "$TEMP_FIXED" 2>/dev/null
+                
+                if [ -f "$TEMP_FIXED" ] && [ -s "$TEMP_FIXED" ]; then
+                  FIXED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$TEMP_FIXED" 2>/dev/null || echo "0")
+                  FIXED_DURATION_INT=${FIXED_DURATION%.*}
+                  
+                  if [ "$FIXED_DURATION_INT" -gt "$CURRENT_DURATION_INT" ] && [ "$FIXED_DURATION_INT" -gt 100 ]; then
+                    mv "$TEMP_FIXED" "$OUTPUT_FILE"
+                    echo "✅ Duration fixed via re-mux! New duration: ${FIXED_DURATION_INT} seconds ($((FIXED_DURATION_INT / 60)) minutes)"
+                    DURATION_FIXED=true
+                  else
+                    echo "⚠️ Re-mux didn't fix duration (got ${FIXED_DURATION_INT}s)"
+                    rm -f "$TEMP_FIXED" 2>/dev/null
+                  fi
+                fi
+                
+                # Method 2: If re-mux didn't work, try re-encode
+                if [ "$DURATION_FIXED" != true ]; then
+                  echo "🔄 Attempt 2: Re-encode with ffmpeg (slower but reliable)..."
+                  ffmpeg -y -i "$OUTPUT_FILE" \
+                    -c:v libx264 -preset veryfast -crf 23 \
+                    -c:a aac -b:a 128k -ar 44100 \
+                    -movflags +faststart \
+                    -metadata title="$TITLE" \
+                    -metadata series="$SERIES_TITLE" \
+                    -metadata label="$LABEL" \
+                    -metadata year="$(date +%Y)" \
+                    -metadata date="$(date +%Y-%m-%d)" \
+                    "$TEMP_FIXED" 2>/dev/null
+                  
+                  if [ -f "$TEMP_FIXED" ] && [ -s "$TEMP_FIXED" ]; then
+                    FIXED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$TEMP_FIXED" 2>/dev/null || echo "0")
+                    FIXED_DURATION_INT=${FIXED_DURATION%.*}
+                    
+                    if [ "$FIXED_DURATION_INT" -gt 100 ]; then
+                      mv "$TEMP_FIXED" "$OUTPUT_FILE"
+                      echo "✅ Duration fixed via re-encode! New duration: ${FIXED_DURATION_INT} seconds ($((FIXED_DURATION_INT / 60)) minutes)"
+                      DURATION_FIXED=true
+                    else
+                      echo "⚠️ Re-encode didn't fix duration (got ${FIXED_DURATION_INT}s)"
+                      rm -f "$TEMP_FIXED" 2>/dev/null
+                    fi
+                  fi
+                fi
+                
+                # Method 3: If both failed, use FFmpeg concat on the merged file
+                if [ "$DURATION_FIXED" != true ]; then
+                  echo "🔄 Attempt 3: Using FFmpeg concat on merged file..."
+                  CONCAT_FIX="concat_fix.txt"
+                  echo "file '$OUTPUT_FILE'" > $CONCAT_FIX
+                  
+                  ffmpeg -y -f concat -safe 0 -i $CONCAT_FIX \
+                    -c copy \
+                    -movflags +faststart \
+                    -metadata title="$TITLE" \
+                    -metadata series="$SERIES_TITLE" \
+                    -metadata label="$LABEL" \
+                    -metadata year="$(date +%Y)" \
+                    -metadata date="$(date +%Y-%m-%d)" \
+                    "$TEMP_FIXED" 2>/dev/null
+                  
+                  if [ -f "$TEMP_FIXED" ] && [ -s "$TEMP_FIXED" ]; then
+                    FIXED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$TEMP_FIXED" 2>/dev/null || echo "0")
+                    FIXED_DURATION_INT=${FIXED_DURATION%.*}
+                    if [ "$FIXED_DURATION_INT" -gt 100 ]; then
+                      mv "$TEMP_FIXED" "$OUTPUT_FILE"
+                      echo "✅ Duration fixed via concat re-mux! New duration: ${FIXED_DURATION_INT} seconds ($((FIXED_DURATION_INT / 60)) minutes)"
+                      DURATION_FIXED=true
+                    fi
+                  fi
+                  rm -f "$CONCAT_FIX" 2>/dev/null
+                fi
+              else
+                echo "✅ Duration is correct: ${CURRENT_DURATION_INT} seconds"
+              fi
+              
+              # Final duration check
+              FINAL_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
+              FINAL_DURATION_INT=${FINAL_DURATION%.*}
               
               # Generate thumbnails
+              echo ""
               echo "🖼️ Generating thumbnails..."
               ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
                 -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
@@ -1102,7 +1210,7 @@ jobs:
               echo "========================================="
               echo "📺 Series: $SERIES_TITLE"
               echo "📁 File: $OUTPUT_FILE"
-              echo "⏱️  Duration: ${ACTUAL_DURATION_INT} seconds ($((ACTUAL_DURATION_INT / 60)) minutes)"
+              echo "⏱️  Duration: ${FINAL_DURATION_INT} seconds ($((FINAL_DURATION_INT / 60)) minutes)"
               ls -lh "$OUTPUT_FILE"
               echo "========================================="
             else
