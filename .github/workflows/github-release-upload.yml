@@ -108,7 +108,6 @@ jobs:
           echo "📊 Tool versions:"
           ffmpeg -version | head -1 || echo "⚠️ ffmpeg not found"
           aria2c --version | head -1 || echo "⚠️ aria2 not found"
-          mkvmerge --version | head -1 || echo "⚠️ mkvmerge not found"
           python3 --version || echo "⚠️ python3 not found"
           python3 -c "import telethon; print(f'Telethon {telethon.__version__}')" 2>/dev/null || echo "⚠️ Telethon not found"
           echo "========================================="
@@ -137,21 +136,14 @@ jobs:
           TAG_NAME="${DATE_STR}-${CLEAN_LABEL}-${CLEAN_SERIES_TAG}"
           FORMATTED_TITLE="[${DATE_STR}]-[${CLEAN_LABEL}]-${CLEAN_SERIES_TITLE}"
           
-          # Create a safe output filename for GitHub: {date}_{label}_{series_title}.mp4
-          SAFE_SERIES_NAME=$(echo "$CLEAN_SERIES_TITLE" | tr ' ' '_' | tr -d '[:punct:]' | tr '[:upper:]' '[:lower:]')
-          SAFE_LABEL=$(echo "$CLEAN_LABEL" | tr '[:upper:]' '[:lower:]')
-          OUTPUT_FILENAME="${DATE_STR}_${SAFE_LABEL}_${SAFE_SERIES_NAME}.mp4"
-          
           echo "📄 Formatted Title: $FORMATTED_TITLE"
           echo "🏷️  Tag Name: $TAG_NAME"
-          echo "📁 Output Filename: $OUTPUT_FILENAME"
           echo "========================================="
           
           echo "formatted_title=${FORMATTED_TITLE}" >> $GITHUB_OUTPUT
           echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
           echo "series_title=${CLEAN_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "clean_label=${CLEAN_LABEL}" >> $GITHUB_OUTPUT
-          echo "output_filename=${OUTPUT_FILENAME}" >> $GITHUB_OUTPUT
 
       - name: Parse URLs with jq (Clean & Uncorrupted)
         env:
@@ -239,7 +231,7 @@ jobs:
             if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *".m3u"* ]] || [[ "$URL" == *"master.m3u8"* ]]; then
               echo "📺 HLS STREAM DETECTED - Using yt-dlp"
               
-              # Use yt-dlp for HLS streams
+              # Use yt-dlp for HLS streams with proper format selection
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
@@ -254,10 +246,48 @@ jobs:
                 --socket-timeout 300 \
                 --retries 10 \
                 --fragment-retries 10 \
+                --download-archive "/tmp/ep_${EP_NUM}_archive.txt" \
                 -o "$OUT_FILE" \
                 "$URL" 2>/dev/null
               
-              echo "✅ yt-dlp download complete, checking file..."
+              # Check if file was downloaded and has video
+              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                if [ "$FILE_SIZE" -gt 100000 ]; then
+                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                    DOWNLOAD_SUCCESS=true
+                    FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+                    echo "✅ Downloaded HLS stream: $OUT_FILE (${FILE_SIZE_MB}MB)"
+                  else
+                    echo "⚠️ HLS download has NO video stream - will fixup"
+                  fi
+                else
+                  echo "⚠️ HLS download file too small (${FILE_SIZE} bytes) - likely corrupt"
+                  rm -f "$OUT_FILE" 2>/dev/null
+                fi
+              fi
+              
+              # If yt-dlp HLS download failed, try with aria2c fallback
+              if [ "$DOWNLOAD_SUCCESS" != true ]; then
+                echo "⚠️ HLS download with yt-dlp failed. Trying aria2c fallback..."
+                rm -f "$OUT_FILE" 2>/dev/null
+                
+                aria2c -x 16 -s 16 -k 1M --continue=true \
+                  --console-log-level=error \
+                  -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
+                
+                if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                  FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                  if [ "$FILE_SIZE" -gt 100000 ]; then
+                    HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                      DOWNLOAD_SUCCESS=true
+                      echo "✅ Downloaded HLS with aria2c fallback: $OUT_FILE"
+                    fi
+                  fi
+                fi
+              fi
               
             else
               # ------------------------------------------------------------
@@ -265,6 +295,7 @@ jobs:
               # ------------------------------------------------------------
               echo "🎬 DIRECT VIDEO DETECTED - Using aria2c for fast download"
               
+              # Try aria2c first (faster for direct downloads)
               aria2c -x 16 -s 16 -k 1M --continue=true \
                 --console-log-level=error \
                 --max-connection-per-server=16 \
@@ -274,11 +305,92 @@ jobs:
                 --max-download-limit=0 \
                 -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
               
-              echo "✅ aria2c download complete, checking file..."
+              # Verify aria2c download
+              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                if [ "$FILE_SIZE" -gt 100000 ]; then
+                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                    DOWNLOAD_SUCCESS=true
+                    FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+                    echo "✅ Downloaded with aria2c: $OUT_FILE (${FILE_SIZE_MB}MB)"
+                  else
+                    echo "⚠️ aria2c download has NO video stream - will fixup"
+                  fi
+                else
+                  echo "⚠️ aria2c download file too small (${FILE_SIZE} bytes) - likely corrupt"
+                  rm -f "$OUT_FILE" 2>/dev/null
+                fi
+              fi
+              
+              # If aria2c failed, try yt-dlp as fallback
+              if [ "$DOWNLOAD_SUCCESS" != true ]; then
+                echo "⚠️ aria2c failed. Trying yt-dlp fallback..."
+                rm -f "$OUT_FILE" 2>/dev/null
+                
+                yt-dlp \
+                  --extractor-args "generic:impersonate" \
+                  --impersonate chrome \
+                  -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best" \
+                  --merge-output-format mp4 \
+                  --hls-use-mpegts \
+                  --no-progress \
+                  --no-warnings \
+                  --quiet \
+                  --geo-bypass \
+                  -o "$OUT_FILE" \
+                  "$URL" 2>/dev/null
+                
+                if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                  FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                  if [ "$FILE_SIZE" -gt 100000 ]; then
+                    HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                      DOWNLOAD_SUCCESS=true
+                      echo "✅ Downloaded with yt-dlp fallback: $OUT_FILE"
+                    fi
+                  fi
+                fi
+              fi
             fi
             
             # ------------------------------------------------------------
-            # CHECK AND FIX MPEG-TS CONTAINER IMMEDIATELY
+            # ULTIMATE FALLBACK: Try yt-dlp with external downloader for any URL
+            # ------------------------------------------------------------
+            if [ "$DOWNLOAD_SUCCESS" != true ]; then
+              echo "⚠️ Primary download methods failed. Trying yt-dlp with aria2c external..."
+              
+              rm -f "$OUT_FILE" 2>/dev/null
+              
+              yt-dlp \
+                --extractor-args "generic:impersonate" \
+                --impersonate chrome \
+                -f "bestvideo+bestaudio/best" \
+                --merge-output-format mp4 \
+                --hls-use-mpegts \
+                --external-downloader aria2c \
+                --external-downloader-args "-x 16 -s 16 -k 1M" \
+                --no-progress \
+                --no-warnings \
+                --quiet \
+                --geo-bypass \
+                -o "$OUT_FILE" \
+                "$URL" 2>/dev/null
+              
+              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                if [ "$FILE_SIZE" -gt 100000 ]; then
+                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                    DOWNLOAD_SUCCESS=true
+                    echo "✅ Downloaded with yt-dlp+aria2c: $OUT_FILE"
+                  fi
+                fi
+              fi
+            fi
+            
+            # ------------------------------------------------------------
+            # MPEG-TS FIXUP: Check and fix container if needed
             # ------------------------------------------------------------
             if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
@@ -310,7 +422,7 @@ jobs:
                   fi
                 fi
                 
-                # Apply fixup if needed - DO THIS BEFORE ANY OTHER RETRY
+                # Apply fixup if needed
                 if [ "$NEEDS_FIXUP" = true ]; then
                   echo "🔧 Fixing MPEG-TS to MP4 container (re-encoding with veryfast preset)..."
                   
@@ -336,111 +448,34 @@ jobs:
                         DOWNLOAD_SUCCESS=true
                         FIXED_SIZE_MB=$((FIXED_SIZE / 1024 / 1024))
                         echo "✅ Fixup successful: $OUT_FILE (${FIXED_SIZE_MB}MB)"
-                        
-                        # Show video info
-                        W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                        H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                        echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FIXED_SIZE_MB}MB, ${W}x${H})"
                       else
                         echo "⚠️ Fixed file too small (${FIXED_SIZE} bytes), keeping original"
                         rm -f "$FIXED_FILE" 2>/dev/null
-                        # Try to use original file
-                        HAS_VIDEO_ORIG=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                        if [ -n "$HAS_VIDEO_ORIG" ] && [ "$HAS_VIDEO_ORIG" = "video" ]; then
-                          DOWNLOAD_SUCCESS=true
-                          echo "✅ Using original file: $OUT_FILE"
-                        fi
                       fi
                     else
                       echo "⚠️ Fixup produced file without video, keeping original"
                       rm -f "$FIXED_FILE" 2>/dev/null
-                      # Try to use original file
-                      HAS_VIDEO_ORIG=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                      if [ -n "$HAS_VIDEO_ORIG" ] && [ "$HAS_VIDEO_ORIG" = "video" ]; then
-                        DOWNLOAD_SUCCESS=true
-                        echo "✅ Using original file: $OUT_FILE"
-                      fi
                     fi
                   else
                     echo "⚠️ Fixup failed, using original file"
                     rm -f "$FIXED_FILE" 2>/dev/null
-                    # Try to use original file
-                    HAS_VIDEO_ORIG=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                    if [ -n "$HAS_VIDEO_ORIG" ] && [ "$HAS_VIDEO_ORIG" = "video" ]; then
-                      DOWNLOAD_SUCCESS=true
-                      echo "✅ Using original file: $OUT_FILE"
-                    fi
-                  fi
-                else
-                  # No fixup needed, file is good
-                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
-                    DOWNLOAD_SUCCESS=true
-                    FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-                    W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                    H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                    echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FILE_SIZE_MB}MB, ${W}x${H})"
                   fi
                 fi
-              else
-                echo "⚠️ File too small (${FILE_SIZE} bytes) - likely corrupt"
-                rm -f "$OUT_FILE" 2>/dev/null
-              fi
-            fi
-            
-            # ------------------------------------------------------------
-            # FALLBACK: If fixup didn't work or file is still bad, try yt-dlp with external downloader
-            # ------------------------------------------------------------
-            if [ "$DOWNLOAD_SUCCESS" != true ]; then
-              echo "⚠️ Primary download/fixup failed. Trying yt-dlp with aria2c external..."
-              
-              rm -f "$OUT_FILE" 2>/dev/null
-              
-              yt-dlp \
-                --extractor-args "generic:impersonate" \
-                --impersonate chrome \
-                -f "bestvideo+bestaudio/best" \
-                --merge-output-format mp4 \
-                --hls-use-mpegts \
-                --external-downloader aria2c \
-                --external-downloader-args "-x 16 -s 16 -k 1M" \
-                --no-progress \
-                --no-warnings \
-                --quiet \
-                --geo-bypass \
-                -o "$OUT_FILE" \
-                "$URL" 2>/dev/null
-              
-              # Check the fallback download
-              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
-                FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
-                if [ "$FILE_SIZE" -gt 100000 ]; then
-                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
-                    DOWNLOAD_SUCCESS=true
-                    echo "✅ Downloaded with yt-dlp+aria2c: $OUT_FILE"
-                  else
-                    # Try one more fixup on the fallback download
-                    echo "🔄 Fallback download has no video, trying fixup..."
-                    ffmpeg -y -err_detect ignore_err -i "$OUT_FILE" \
-                      -c:v libx264 -preset veryfast -crf 23 \
-                      -c:a aac -b:a 128k -ar 44100 \
-                      -movflags +faststart \
-                      -metadata title="Episode $EP_INDEX - $SERIES_TITLE" \
-                      -metadata episode_id="$EP_INDEX" \
-                      -metadata series="$SERIES_TITLE" \
-                      -metadata label="$LABEL" \
-                      "$FIXED_FILE" 2>/dev/null
-                    
-                    if [ -f "$FIXED_FILE" ] && [ -s "$FIXED_FILE" ]; then
-                      HAS_VIDEO_FIXED=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FIXED_FILE" 2>/dev/null)
-                      if [ -n "$HAS_VIDEO_FIXED" ] && [ "$HAS_VIDEO_FIXED" = "video" ]; then
-                        mv "$FIXED_FILE" "$OUT_FILE"
-                        DOWNLOAD_SUCCESS=true
-                        echo "✅ Fallback fixup successful: $OUT_FILE"
-                      fi
+                
+                # Final verification after potential fixup
+                if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                  FINAL_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                  if [ "$FINAL_SIZE" -gt 100000 ]; then
+                    HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                      DOWNLOAD_SUCCESS=true
+                      FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
+                      W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                      H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                      echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FINAL_SIZE_MB}MB, ${W}x${H})"
+                    else
+                      echo "⚠️ File still has NO video stream after fixup!"
                     fi
-                    rm -f "$FIXED_FILE" 2>/dev/null
                   fi
                 fi
               fi
@@ -858,22 +893,24 @@ jobs:
           done
           echo ""
 
-      - name: Smart Merge Episodes with mkvmerge --append-to
+      - name: Smart Merge Episodes
         id: merge
         timeout-minutes: 120
         run: |
           cd downloads
           
           echo "========================================="
-          echo "🔗 MERGING EPISODES WITH MKVMERGE"
+          echo "🔗 MERGING EPISODES"
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "========================================="
           
-          # Sort episodes numerically
+          # FIX: Sort episodes numerically instead of alphabetically
+          # Get list of episodes and sort by episode number properly
           EPISODE_FILES=()
           for f in EP*.mp4; do
             if [ -f "$f" ]; then
+              # Extract episode number
               EP_NUM=$(echo "$f" | grep -oE '[0-9]+' | head -1)
               if [ -n "$EP_NUM" ]; then
                 EPISODE_FILES+=("$EP_NUM:$f")
@@ -914,45 +951,42 @@ jobs:
             exit 1
           fi
           
-          OUTPUT_FILE="${{ steps.fname.outputs.output_filename }}"
-          
           if [ "$EP_COUNT" -eq 1 ]; then
-            echo "📦 Only 1 episode - copying to output"
+            echo "📦 Only 1 episode - skipping merge"
             SINGLE_FILE="${SORTED_FILES[0]}"
-            cp "$SINGLE_FILE" "$OUTPUT_FILE"
-            echo "merged_file_path=$(pwd)/$OUTPUT_FILE" >> $GITHUB_ENV
+            ffmpeg -i "$SINGLE_FILE" -c copy -movflags +faststart \
+              -metadata title="$TITLE" \
+              -metadata series="$SERIES_TITLE" \
+              -metadata label="$LABEL" \
+              -metadata year="$(date +%Y)" \
+              -metadata date="$(date +%Y-%m-%d)" \
+              "output.mp4" 2>/dev/null
+            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
             echo "has_merged=true" >> $GITHUB_ENV
             echo "merge_success=true" >> $GITHUB_OUTPUT
             exit 0
           fi
           
-          # Verify all files have video streams
+          # First, verify all files have video streams
           echo "🔍 Checking all files for video streams..."
           NEEDS_REDOWNLOAD=false
           REDOWNLOAD_LIST=""
           
-          # Calculate total duration first
-          TOTAL_DURATION=0
-          
           for f in "${SORTED_FILES[@]}"; do
             if [ ! -f "$f" ]; then continue; fi
             
-            # Get duration for this file
-            DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "0")
-            DURATION_INT=${DURATION%.*}
-            if [ "$DURATION_INT" -gt 0 ]; then
-              TOTAL_DURATION=$((TOTAL_DURATION + DURATION_INT))
-            fi
-            
+            # Check if file has video stream
             HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$f" 2>/dev/null)
             
             if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
               echo "⚠️ $f has no video stream!"
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
+              # Remove leading zeros for the list
               EP_NUM_CLEAN=$(echo "$EP_NUM" | sed 's/^0*//')
               REDOWNLOAD_LIST="$REDOWNLOAD_LIST $EP_NUM_CLEAN"
               NEEDS_REDOWNLOAD=true
             else
+              # Also check resolution
               WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null)
               HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null)
               
@@ -968,13 +1002,12 @@ jobs:
             fi
           done
           
-          echo "📊 Total expected duration: ${TOTAL_DURATION} seconds ($((TOTAL_DURATION / 60)) minutes)"
-          
           # Redownload episodes that need it
           if [ "$NEEDS_REDOWNLOAD" = true ]; then
             echo ""
             echo "🔄 Redownloading episodes with yt-dlp to ensure proper video..."
             
+            # Read URLs into array
             mapfile -t URL_ARRAY < urls.txt
             
             for EP_NUM_CLEAN in $REDOWNLOAD_LIST; do
@@ -985,38 +1018,88 @@ jobs:
               if [ $URL_INDEX -ge 0 ] && [ $URL_INDEX -lt ${#URL_ARRAY[@]} ]; then
                 URL="${URL_ARRAY[$URL_INDEX]}"
                 echo ""
-                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED..."
+                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp..."
+                echo "📎 URL: $URL"
                 
+                # Remove the bad file
                 rm -f "$FILE"
                 
+                # Redownload with yt-dlp specifically to ensure video+audio
                 yt-dlp --extractor-args "generic:impersonate" --impersonate chrome \
                   -f "bestvideo+bestaudio/best" \
                   --no-progress --no-warnings \
                   -o "$FILE" "$URL" < /dev/null 2>&1
                 
                 if [ -f "$FILE" ] && [ -s "$FILE" ]; then
+                  # Verify the new file has video
                   HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FILE" 2>/dev/null)
                   if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
-                    echo "✅ Episode $EP_NUM_FORMATTED redownloaded successfully!"
+                    echo "✅ Episode $EP_NUM_FORMATTED redownloaded successfully with video!"
                   else
-                    echo "❌ Redownloaded file still has no video!"
+                    echo "❌ Redownloaded file still has no video for Episode $EP_NUM_FORMATTED"
+                    echo "   Creating a blank video with audio instead..."
+                    
+                    # Create a blank video with the audio from the file
+                    DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FILE" 2>/dev/null || echo "30")
+                    TEMP_FILE="EP${EP_NUM_FORMATTED}_temp.mp4"
+                    
+                    ffmpeg -f lavfi -i color=black:size=720x1280:duration="$DURATION" \
+                      -i "$FILE" \
+                      -c:v libx264 -preset veryfast -crf 23 \
+                      -c:a aac -b:a 128k -ar 44100 \
+                      -shortest \
+                      -movflags +faststart \
+                      "$TEMP_FILE" 2>/dev/null
+                    
+                    if [ -f "$TEMP_FILE" ] && [ -s "$TEMP_FILE" ]; then
+                      mv "$TEMP_FILE" "$FILE"
+                      echo "✅ Created video from audio for Episode $EP_NUM_FORMATTED"
+                    fi
+                  fi
+                else
+                  echo "❌ Redownload failed for Episode $EP_NUM_FORMATTED"
+                  # Try to create a video from what we have
+                  DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FILE" 2>/dev/null || echo "30")
+                  TEMP_FILE="EP${EP_NUM_FORMATTED}_temp.mp4"
+                  
+                  ffmpeg -f lavfi -i color=black:size=720x1280:duration="$DURATION" \
+                    -i "$FILE" \
+                    -c:v libx264 -preset veryfast -crf 23 \
+                    -c:a aac -b:a 128k -ar 44100 \
+                    -shortest \
+                    -movflags +faststart \
+                    "$TEMP_FILE" 2>/dev/null
+                  
+                  if [ -f "$TEMP_FILE" ] && [ -s "$TEMP_FILE" ]; then
+                    mv "$TEMP_FILE" "$FILE"
+                    echo "✅ Created video from audio for Episode $EP_NUM_FORMATTED"
                   fi
                 fi
+              else
+                echo "⚠️ Could not find URL for Episode $EP_NUM_FORMATTED"
               fi
             done
+            
+            echo ""
             echo "✅ Redownload complete!"
           fi
           
           echo ""
-          echo "🔍 Analyzing file properties..."
+          echo "🔍 Analyzing file properties with MediaInfo and ffprobe..."
           
+          # Use a more robust approach with ffprobe as fallback
           declare -A resolutions
+          declare -A audio_sample_rates
+          declare -A video_codecs
+          declare -A audio_codecs
           declare -A has_video
           
           for f in "${SORTED_FILES[@]}"; do
             if [ -f "$f" ]; then
+              # Try MediaInfo first
               res=$(mediainfo --Inform="Video;%Width%x%Height%" "$f" 2>/dev/null || echo "")
               
+              # If MediaInfo returns empty, try ffprobe
               if [ -z "$res" ] || [ "$res" = "0x0" ] || [ "$res" = "x" ]; then
                 width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null || echo "0")
                 height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null || echo "0")
@@ -1025,6 +1108,7 @@ jobs:
                   res="${width}x${height}"
                   has_video["$f"]="true"
                 else
+                  # No video stream, use default resolution
                   res="0x0"
                   has_video["$f"]="false"
                 fi
@@ -1032,161 +1116,297 @@ jobs:
                 has_video["$f"]="true"
               fi
               resolutions["$f"]="$res"
-              echo "$f: $res"
+              
+              # Get audio sample rate
+              sample_rate=$(mediainfo --Inform="Audio;%SamplingRate%" "$f" 2>/dev/null | tr -d ' ' | cut -d'/' -f1 | cut -d' ' -f1)
+              if [ -z "$sample_rate" ] || [ "$sample_rate" = "0" ]; then
+                sample_rate=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$f" 2>/dev/null || echo "44100")
+              fi
+              audio_sample_rates["$f"]="$sample_rate"
+              
+              # Get video codec
+              video_codec=$(mediainfo --Inform="Video;%CodecID%" "$f" 2>/dev/null || echo "")
+              if [ -z "$video_codec" ] || [ "$video_codec" = "unknown" ]; then
+                video_codec=$(mediainfo --Inform="Video;%Format%" "$f" 2>/dev/null || echo "")
+              fi
+              if [ -z "$video_codec" ] || [ "$video_codec" = "unknown" ]; then
+                video_codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "avc1")
+                # Convert codec name to codec ID format
+                if [ "$video_codec" = "h264" ]; then
+                  video_codec="avc1"
+                elif [ "$video_codec" = "hevc" ]; then
+                  video_codec="hev1"
+                fi
+              fi
+              video_codecs["$f"]="$video_codec"
+              
+              # Get audio codec
+              audio_codec=$(mediainfo --Inform="Audio;%Format%" "$f" 2>/dev/null || echo "")
+              if [ -z "$audio_codec" ] || [ "$audio_codec" = "unknown" ]; then
+                audio_codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "AAC")
+              fi
+              audio_codecs["$f"]="$audio_codec"
+              
+              echo "$f: ${resolutions[$f]}, ${audio_sample_rates[$f]}Hz, ${video_codecs[$f]}, ${audio_codecs[$f]}"
             fi
           done
           
-          # Verify all files have valid video
-          ALL_VALID=true
-          for f in "${SORTED_FILES[@]}"; do
-            if [ "${has_video[$f]}" != "true" ] || [ "${resolutions[$f]}" = "0x0" ]; then
-              echo "❌ $f has no valid video stream!"
-              ALL_VALID=false
-            fi
-          done
-          
-          if [ "$ALL_VALID" != true ]; then
-            echo "❌ Some episodes have no video - cannot merge!"
+          if [ ${#resolutions[@]} -eq 0 ]; then
+            echo "❌ No valid files to merge!"
             exit 1
+          fi
+          
+          # Determine target resolution from files with valid video
+          VALID_RESOLUTIONS=""
+          for f in "${!resolutions[@]}"; do
+            res="${resolutions[$f]}"
+            if [ "$res" != "0x0" ] && [ "$res" != "x" ] && [ -n "$res" ]; then
+              VALID_RESOLUTIONS="$VALID_RESOLUTIONS $res"
+            fi
+          done
+          
+          if [ -n "$VALID_RESOLUTIONS" ]; then
+            TARGET_RES=$(echo "$VALID_RESOLUTIONS" | tr ' ' '\n' | grep -v "0x0" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+          else
+            # No valid resolutions found, use default
+            TARGET_RES="720x1280"
+          fi
+          
+          if [ -z "$TARGET_RES" ] || [ "$TARGET_RES" = "0x0" ] || [ "$TARGET_RES" = "x" ]; then
+            TARGET_RES="720x1280"
+          fi
+          
+          # Determine target audio sample rate
+          TARGET_SAMPLE_RATE=$(printf '%s\n' "${audio_sample_rates[@]}" | grep -v "^$" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+          if [ -z "$TARGET_SAMPLE_RATE" ]; then
+            TARGET_SAMPLE_RATE="44100"
+          fi
+          
+          # Determine target video codec
+          TARGET_VIDEO_CODEC=$(printf '%s\n' "${video_codecs[@]}" | grep -v "^$" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+          if [ -z "$TARGET_VIDEO_CODEC" ]; then
+            TARGET_VIDEO_CODEC="avc1"
+          fi
+          
+          # Determine target audio codec
+          TARGET_AUDIO_CODEC=$(printf '%s\n' "${audio_codecs[@]}" | grep -v "^$" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+          if [ -z "$TARGET_AUDIO_CODEC" ]; then
+            TARGET_AUDIO_CODEC="AAC"
+          fi
+          
+          TARGET_W=$(echo "$TARGET_RES" | cut -d'x' -f1)
+          TARGET_H=$(echo "$TARGET_RES" | cut -d'x' -f2)
+          
+          echo ""
+          echo "🎯 TARGET PROPERTIES:"
+          echo "   Resolution: ${TARGET_W}x${TARGET_H}"
+          echo "   Audio Sample Rate: ${TARGET_SAMPLE_RATE} Hz"
+          echo "   Video Codec: ${TARGET_VIDEO_CODEC}"
+          echo "   Audio Codec: ${TARGET_AUDIO_CODEC}"
+          echo ""
+          
+          NORMALIZED_FILES=""
+          NEEDS_NORMALIZE=false
+          
+          for f in "${SORTED_FILES[@]}"; do
+            if [ ! -f "$f" ]; then continue; fi
+            
+            CURRENT_RES="${resolutions[$f]:-0x0}"
+            CURRENT_SAMPLE_RATE="${audio_sample_rates[$f]:-44100}"
+            CURRENT_VIDEO_CODEC="${video_codecs[$f]:-}"
+            CURRENT_AUDIO_CODEC="${audio_codecs[$f]:-AAC}"
+            
+            # Check if file has video
+            HAS_VIDEO="${has_video[$f]:-false}"
+            
+            # If file has no video or resolution is invalid, we need to normalize
+            if [ "$HAS_VIDEO" = "false" ] || [ "$CURRENT_RES" = "0x0" ] || [ "$CURRENT_RES" = "x" ] || [ -z "$CURRENT_RES" ]; then
+              echo "⚠️ $f has no video or invalid resolution, will normalize"
+              NEEDS_NORMALIZE=true
+              
+              EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
+              EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
+              
+              # For files without video, create a blank video with audio
+              echo "  🎵 $f is audio-only, creating video with audio..."
+              DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "30")
+              ffmpeg -f lavfi -i color=black:size=${TARGET_W}x${TARGET_H}:duration="$DURATION" \
+                -i "$f" \
+                -c:v libx264 -preset veryfast -crf 23 \
+                -c:a aac -b:a 128k -ar ${TARGET_SAMPLE_RATE} \
+                -shortest \
+                -metadata title="$EPISODE_TITLE" \
+                -metadata episode_id="$EP_NUM" \
+                -metadata series="$SERIES_TITLE" \
+                -metadata label="$LABEL" \
+                -movflags +faststart \
+                "normalized_$f" 2>/dev/null
+              
+              if [ -f "normalized_$f" ] && [ -s "normalized_$f" ]; then
+                echo "✅ Normalized: $f -> normalized_$f"
+                NORMALIZED_FILES="$NORMALIZED_FILES normalized_$f"
+              else
+                echo "⚠️ Normalization failed, using original $f"
+                NORMALIZED_FILES="$NORMALIZED_FILES $f"
+              fi
+            elif [ "$CURRENT_RES" == "$TARGET_RES" ] && \
+                 [ "$CURRENT_SAMPLE_RATE" == "$TARGET_SAMPLE_RATE" ]; then
+              echo "✅ Keeping: $f (matches all targets)"
+              NORMALIZED_FILES="$NORMALIZED_FILES $f"
+            else
+              echo "⚠️ Normalizing: $f"
+              echo "   Current: ${CURRENT_RES}, ${CURRENT_SAMPLE_RATE}Hz, ${CURRENT_VIDEO_CODEC}, ${CURRENT_AUDIO_CODEC}"
+              echo "   Target:  ${TARGET_RES}, ${TARGET_SAMPLE_RATE}Hz, ${TARGET_VIDEO_CODEC}, ${TARGET_AUDIO_CODEC}"
+              NEEDS_NORMALIZE=true
+              
+              EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
+              EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
+              
+              ffmpeg -i "$f" \
+                -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black" \
+                -c:v libx264 -preset veryfast -crf 23 \
+                -c:a aac -b:a 128k -ar ${TARGET_SAMPLE_RATE} \
+                -metadata title="$EPISODE_TITLE" \
+                -metadata episode_id="$EP_NUM" \
+                -metadata series="$SERIES_TITLE" \
+                -metadata label="$LABEL" \
+                -movflags +faststart \
+                "normalized_$f" 2>/dev/null
+              
+              if [ -f "normalized_$f" ] && [ -s "normalized_$f" ]; then
+                echo "✅ Normalized successfully: $f -> normalized_$f"
+                NORMALIZED_FILES="$NORMALIZED_FILES normalized_$f"
+              else
+                echo "⚠️ Normalization failed, using original"
+                NORMALIZED_FILES="$NORMALIZED_FILES $f"
+              fi
+            fi
+          done
+          
+          FILE_COUNT=$(echo "$NORMALIZED_FILES" | wc -w)
+          echo ""
+          echo "📊 Files to merge: $FILE_COUNT"
+          
+          if [ $FILE_COUNT -eq 0 ]; then
+            echo "❌ No files to merge!"
+            exit 1
+          fi
+          
+          echo "🔍 Verifying all files..."
+          VERIFIED_FILES=""
+          
+          for f in $NORMALIZED_FILES; do
+            if [ ! -f "$f" ] || [ ! -s "$f" ]; then
+              echo "⚠️ File missing or empty: $f"
+              continue
+            fi
+            
+            # Check if file is valid
+            if ffprobe -v error "$f" 2>/dev/null; then
+              echo "✅ Valid: $f"
+              VERIFIED_FILES="$VERIFIED_FILES $f"
+            else
+              echo "⚠️ Invalid file: $f, skipping"
+            fi
+          done
+          
+          if [ -z "$VERIFIED_FILES" ]; then
+            echo "❌ No valid files to merge!"
+            exit 1
+          fi
+          
+          MERGE_FILES_ARRAY=($VERIFIED_FILES)
+          FILE_COUNT=${#MERGE_FILES_ARRAY[@]}
+          
+          if [ $FILE_COUNT -lt 2 ]; then
+            echo "📦 Less than 2 valid files, copying single file..."
+            cp "${MERGE_FILES_ARRAY[0]}" "output.mp4"
+            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
+            echo "has_merged=true" >> $GITHUB_ENV
+            echo "merge_success=true" >> $GITHUB_OUTPUT
+            exit 0
           fi
           
           echo ""
           echo "✅ All files validated!"
-          echo "📊 MERGING: Using mkvmerge with append..."
+          echo "📊 MERGING: Using FFmpeg concat demuxer"
           
-          # ------------------------------------------------------------
-          # Build mkvmerge command with proper --append-to
-          # ------------------------------------------------------------
+          TOTAL_DURATION=0
+          for f in "${MERGE_FILES_ARRAY[@]}"; do
+            if [ -f "$f" ] && [ -s "$f" ]; then
+              DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "0")
+              DURATION_INT=${DURATION%.*}
+              if [ "$DURATION_INT" -gt 0 ]; then
+                TOTAL_DURATION=$((TOTAL_DURATION + DURATION_INT))
+                echo "   $f: ${DURATION_INT}s"
+              fi
+            fi
+          done
+          echo "📊 Total expected duration: ${TOTAL_DURATION} seconds ($((TOTAL_DURATION / 60)) minutes)"
           
-          # Start with the first file
-          MKVMERGE_CMD="mkvmerge -o \"$OUTPUT_FILE\" \"${SORTED_FILES[0]}\""
+          CONCAT_LIST="concat_list.txt"
+          > $CONCAT_LIST
           
-          # For each subsequent file, append video and audio tracks
-          # Track IDs are typically 0 for video, 1 for audio in MP4 files
-          for ((i=1; i<${#SORTED_FILES[@]}; i++)); do
-            FILE="${SORTED_FILES[$i]}"
-            # Append video track (track 0) from current file to video track (track 0) of previous
-            # Append audio track (track 1) from current file to audio track (track 1) of previous
-            MKVMERGE_CMD="$MKVMERGE_CMD \"$FILE\" --append-to ${i}:0:0 ${i}:1:1"
+          for f in "${MERGE_FILES_ARRAY[@]}"; do
+            if [ -f "$f" ] && [ -s "$f" ]; then
+              if ffprobe -v error "$f" 2>/dev/null; then
+                echo "file '$f'" >> $CONCAT_LIST
+                echo "✅ Added: $f ($(du -h $f | cut -f1))"
+              else
+                echo "⚠️ Skipping invalid file: $f"
+              fi
+            else
+              echo "⚠️ File missing or empty: $f"
+            fi
           done
           
-          MKVMERGE_CMD="$MKVMERGE_CMD --title \"$TITLE\""
+          echo "🔄 Concatenating files..."
+          ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
+            -c copy \
+            -movflags +faststart \
+            -metadata title="$TITLE" \
+            -metadata series="$SERIES_TITLE" \
+            -metadata label="$LABEL" \
+            -metadata year="$(date +%Y)" \
+            -metadata date="$(date +%Y-%m-%d)" \
+            "output.mp4" 2>/dev/null
           
-          echo "🔄 Running mkvmerge with append..."
-          
-          # Execute mkvmerge
-          eval $MKVMERGE_CMD 2>&1
-          
-          # Check if merge was successful
-          if [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ]; then
-            # Verify the merged file has video
-            if mediainfo "$OUTPUT_FILE" 2>/dev/null | grep -q "Video"; then
-              echo "✅ mkvmerge merge successful!"
-              
-              # Get the actual merged file duration
-              ACTUAL_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
-              ACTUAL_DURATION_INT=${ACTUAL_DURATION%.*}
-              echo "📊 Merged file duration: ${ACTUAL_DURATION_INT} seconds ($((ACTUAL_DURATION_INT / 60)) minutes)"
-              
-              # Generate thumbnails
-              echo "🖼️ Generating thumbnails..."
-              ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
-                -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
-                -q:v 2 "thumb.jpg" 2>/dev/null
-              
-              ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
-                -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
-                -q:v 2 "square_thumb.jpg" 2>/dev/null
-              
-              echo "merged_file_path=$(pwd)/$OUTPUT_FILE" >> $GITHUB_ENV
-              echo "has_merged=true" >> $GITHUB_ENV
-              echo "merge_success=true" >> $GITHUB_OUTPUT
-              
-              echo ""
-              echo "========================================="
-              echo "📊 FINAL MERGED FILE"
-              echo "========================================="
-              echo "📺 Series: $SERIES_TITLE"
-              echo "📁 File: $OUTPUT_FILE"
-              echo "⏱️  Duration: ${ACTUAL_DURATION_INT} seconds ($((ACTUAL_DURATION_INT / 60)) minutes)"
-              ls -lh "$OUTPUT_FILE"
-              echo "========================================="
-            else
-              echo "❌ mkvmerge output has no video stream!"
-              exit 1
-            fi
-          else
-            echo "❌ mkvmerge merge failed!"
+          if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
+            echo "✅ Merge successful!"
             
-            # ------------------------------------------------------------
-            # FALLBACK: Try FFmpeg concat
-            # ------------------------------------------------------------
+            # Verify duration
+            MERGED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
+            MERGED_DURATION_INT=${MERGED_DURATION%.*}
+            echo "📊 Merged file duration: ${MERGED_DURATION_INT} seconds"
+            
+            # Generate thumbnails
+            echo "🖼️ Generating thumbnails..."
+            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
+              -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
+              -q:v 2 "thumb.jpg" 2>/dev/null
+            
+            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
+              -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
+              -q:v 2 "square_thumb.jpg" 2>/dev/null
+            
+            # Cleanup
+            rm -f normalized_*.mp4 concat_list.txt
+            
+            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
+            echo "has_merged=true" >> $GITHUB_ENV
+            echo "merge_success=true" >> $GITHUB_OUTPUT
+            
             echo ""
-            echo "🔄 Falling back to FFmpeg concat demuxer..."
-            
-            CONCAT_LIST="concat_list.txt"
-            > $CONCAT_LIST
-            
-            for f in "${SORTED_FILES[@]}"; do
-              if [ -f "$f" ] && [ -s "$f" ]; then
-                if ffprobe -v error "$f" 2>/dev/null; then
-                  echo "file '$f'" >> $CONCAT_LIST
-                  echo "✅ Added: $f"
-                else
-                  echo "⚠️ Skipping invalid file: $f"
-                fi
-              fi
-            done
-            
-            ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
-              -c copy \
-              -movflags +faststart \
-              -metadata title="$TITLE" \
-              -metadata series="$SERIES_TITLE" \
-              -metadata label="$LABEL" \
-              -metadata year="$(date +%Y)" \
-              -metadata date="$(date +%Y-%m-%d)" \
-              "$OUTPUT_FILE" 2>/dev/null
-            
-            if [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ]; then
-              if mediainfo "$OUTPUT_FILE" 2>/dev/null | grep -q "Video"; then
-                echo "✅ FFmpeg merge successful!"
-                
-                MERGED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
-                MERGED_DURATION_INT=${MERGED_DURATION%.*}
-                echo "📊 Merged file duration: ${MERGED_DURATION_INT} seconds ($((MERGED_DURATION_INT / 60)) minutes)"
-                
-                # Generate thumbnails
-                echo "🖼️ Generating thumbnails..."
-                ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
-                  -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
-                  -q:v 2 "thumb.jpg" 2>/dev/null
-                
-                ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
-                  -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
-                  -q:v 2 "square_thumb.jpg" 2>/dev/null
-                
-                echo "merged_file_path=$(pwd)/$OUTPUT_FILE" >> $GITHUB_ENV
-                echo "has_merged=true" >> $GITHUB_ENV
-                echo "merge_success=true" >> $GITHUB_OUTPUT
-                
-                echo ""
-                echo "========================================="
-                echo "📊 FINAL MERGED FILE (FFmpeg Fallback)"
-                echo "========================================="
-                echo "📺 Series: $SERIES_TITLE"
-                echo "📁 File: $OUTPUT_FILE"
-                echo "⏱️  Duration: ${MERGED_DURATION_INT} seconds ($((MERGED_DURATION_INT / 60)) minutes)"
-                ls -lh "$OUTPUT_FILE"
-                echo "========================================="
-              else
-                echo "❌ FFmpeg fallback also failed!"
-                exit 1
-              fi
-            else
-              echo "❌ FFmpeg fallback failed!"
-              exit 1
-            fi
+            echo "========================================="
+            echo "📊 FINAL MERGED FILE"
+            echo "========================================="
+            echo "📺 Series: $SERIES_TITLE"
+            echo "📁 File: output.mp4"
+            ls -lh output.mp4
+            echo "========================================="
+          else
+            echo "❌ Merge failed!"
+            exit 1
           fi
 
       - name: Verify, Compress if Needed, and Fix Duration
@@ -1196,21 +1416,18 @@ jobs:
         run: |
           cd downloads
           
-          OUTPUT_FILE="${{ steps.fname.outputs.output_filename }}"
-          
           echo "========================================="
           echo "🔍 VERIFYING MERGED FILE"
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
-          echo "📁 File: $OUTPUT_FILE"
           echo "========================================="
           
-          if [ ! -f "$OUTPUT_FILE" ]; then
-            echo "❌ $OUTPUT_FILE not found!"
+          if [ ! -f "output.mp4" ]; then
+            echo "❌ output.mp4 not found!"
             exit 1
           fi
           
-          FILE_SIZE_BYTES=$(stat -c%s "$OUTPUT_FILE" 2>/dev/null || stat -f%z "$OUTPUT_FILE" 2>/dev/null || echo "0")
+          FILE_SIZE_BYTES=$(stat -c%s "output.mp4" 2>/dev/null || stat -f%z "output.mp4" 2>/dev/null || echo "0")
           FILE_SIZE_MB=$((FILE_SIZE_BYTES / 1024 / 1024))
           
           echo "📊 File size: ${FILE_SIZE_MB} MB"
@@ -1219,7 +1436,7 @@ jobs:
             echo "⚠️ File exceeds 1.8GB (${FILE_SIZE_MB} MB)"
             echo "🔧 Compressing file with veryfast preset..."
             
-            DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
+            DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
             DURATION_INT=${DURATION%.*}
             
             if [ "$DURATION_INT" -gt 0 ]; then
@@ -1235,7 +1452,7 @@ jobs:
             
             echo "🔧 Compressing with veryfast preset..."
             
-            ffmpeg -y -i "$OUTPUT_FILE" \
+            ffmpeg -y -i "output.mp4" \
               -c:v libx264 -preset veryfast -b:v ${TARGET_BITRATE}k -maxrate ${TARGET_BITRATE}k \
               -c:a aac -b:a 128k -ar 44100 \
               -movflags +faststart \
@@ -1251,13 +1468,13 @@ jobs:
               NEW_SIZE_MB=$((NEW_SIZE / 1024 / 1024))
               
               if [ $NEW_SIZE_MB -lt 1800 ]; then
-                mv output_compressed.mp4 "$OUTPUT_FILE"
+                mv output_compressed.mp4 output.mp4
                 echo "✅ File compressed! New size: ${NEW_SIZE_MB} MB"
                 echo "compressed=true" >> $GITHUB_OUTPUT
               else
                 echo "⚠️ Compression didn't reduce enough (${NEW_SIZE_MB} MB), trying CRF..."
                 
-                ffmpeg -y -i "$OUTPUT_FILE" \
+                ffmpeg -y -i "output.mp4" \
                   -c:v libx264 -preset veryfast -crf 28 \
                   -c:a aac -b:a 96k -ar 44100 \
                   -movflags +faststart \
@@ -1273,7 +1490,7 @@ jobs:
                   NEW_SIZE_MB=$((NEW_SIZE / 1024 / 1024))
                   
                   if [ $NEW_SIZE_MB -lt 1800 ]; then
-                    mv output_compressed.mp4 "$OUTPUT_FILE"
+                    mv output_compressed.mp4 output.mp4
                     echo "✅ File compressed! New size: ${NEW_SIZE_MB} MB"
                     echo "compressed=true" >> $GITHUB_OUTPUT
                   else
@@ -1292,40 +1509,40 @@ jobs:
             echo "compressed=false" >> $GITHUB_OUTPUT
           fi
           
-          if [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ]; then
+          if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
             echo "🖼️ Regenerating thumbnails..."
-            ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
+            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
               -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
               -q:v 2 "thumb.jpg" 2>/dev/null
             
-            ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
+            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
               -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
               -q:v 2 "square_thumb.jpg" 2>/dev/null
           fi
           
           echo "🔧 Fixing duration metadata..."
-          ffmpeg -i "$OUTPUT_FILE" -c copy -map_metadata 0 -movflags +faststart output_fixed.mp4 2>/dev/null
+          ffmpeg -i output.mp4 -c copy -map_metadata 0 -movflags +faststart output_fixed.mp4 2>/dev/null
           
           if [ -f "output_fixed.mp4" ] && [ -s "output_fixed.mp4" ]; then
-            mv output_fixed.mp4 "$OUTPUT_FILE"
+            mv output_fixed.mp4 output.mp4
             echo "✅ Duration metadata fixed"
           fi
           
-          if mediainfo "$OUTPUT_FILE" > /dev/null 2>&1; then
+          if mediainfo output.mp4 > /dev/null 2>&1; then
             echo "✅ MediaInfo can read the file"
             echo ""
-            mediainfo "$OUTPUT_FILE"
+            mediainfo output.mp4
             echo ""
             
-            DURATION=$(mediainfo --Inform="General;%Duration/String3%" "$OUTPUT_FILE" 2>/dev/null)
-            FINAL_SIZE=$(stat -c%s "$OUTPUT_FILE" 2>/dev/null || stat -f%z "$OUTPUT_FILE" 2>/dev/null || echo "0")
+            DURATION=$(mediainfo --Inform="General;%Duration/String3%" output.mp4 2>/dev/null)
+            FINAL_SIZE=$(stat -c%s "output.mp4" 2>/dev/null || stat -f%z "output.mp4" 2>/dev/null || echo "0")
             FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
             
             echo "📝 Duration: $DURATION"
             echo "💾 Final size: ${FINAL_SIZE_MB} MB"
             echo "✅ File is valid"
             echo "verify_success=true" >> $GITHUB_OUTPUT
-            echo "merged_file_path=$(pwd)/$OUTPUT_FILE" >> $GITHUB_ENV
+            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
             
             if [ $FINAL_SIZE_MB -gt 2000 ]; then
               echo "❌ File exceeds 2GB (${FINAL_SIZE_MB} MB)"
@@ -1338,7 +1555,7 @@ jobs:
             echo "❌ MediaInfo cannot read the file!"
             echo "🔧 Attempting to repair..."
             
-            ffmpeg -y -err_detect ignore_err -i "$OUTPUT_FILE" \
+            ffmpeg -y -err_detect ignore_err -i output.mp4 \
               -c:v libx264 -preset veryfast -crf 23 \
               -c:a aac -b:a 128k -ar 44100 \
               -movflags +faststart \
@@ -1353,10 +1570,10 @@ jobs:
               REPAIR_SIZE=$(stat -c%s "output_repaired.mp4" 2>/dev/null || echo "0")
               REPAIR_SIZE_MB=$((REPAIR_SIZE / 1024 / 1024))
               if [ "$REPAIR_SIZE" -gt 1000000 ] && [ $REPAIR_SIZE_MB -lt 2000 ]; then
-                mv output_repaired.mp4 "$OUTPUT_FILE"
+                mv output_repaired.mp4 output.mp4
                 echo "✅ File repaired!"
                 echo "verify_success=true" >> $GITHUB_OUTPUT
-                echo "merged_file_path=$(pwd)/$OUTPUT_FILE" >> $GITHUB_ENV
+                echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
               else
                 echo "❌ Repair failed or file still too large"
                 rm -f output_repaired.mp4
@@ -1392,14 +1609,15 @@ jobs:
           echo "📁 File: ${{ env.merged_file_path }}"
           echo "========================================="
           
-          if [ ! -f "${{ env.merged_file_path }}" ] && [ ! -f "${{ steps.fname.outputs.output_filename }}" ]; then
-            echo "❌ Merged file not found!"
-            exit 1          fi
+          if [ ! -f "${{ env.merged_file_path }}" ] && [ ! -f "output.mp4" ]; then
+            echo "❌ output.mp4 not found!"
+            exit 1
+          fi
           
           if [ -f "${{ env.merged_file_path }}" ]; then
             export MERGED_PATH="${{ env.merged_file_path }}"
           else
-            export MERGED_PATH="$(pwd)/${{ steps.fname.outputs.output_filename }}"
+            export MERGED_PATH="$(pwd)/output.mp4"
             echo "⚠️ Using fallback path: $MERGED_PATH"
           fi
           
@@ -1654,8 +1872,10 @@ jobs:
               video_path = os.environ.get("MERGED_PATH")
               
               if not video_path or not os.path.isfile(video_path):
-                  if os.path.exists("${{ steps.fname.outputs.output_filename }}"):
-                      video_path = os.path.abspath("${{ steps.fname.outputs.output_filename }}")
+                  if os.path.exists("output.mp4"):
+                      video_path = os.path.abspath("output.mp4")
+                  elif os.path.exists("../output.mp4"):
+                      video_path = os.path.abspath("../output.mp4")
                   else:
                       video_files = glob.glob("*.mp4")
                       if video_files:
@@ -2275,7 +2495,8 @@ jobs:
             fi
             
             local percent=$(echo "scale=2; ($current / $total) * 100" | bc 2>/dev/null || echo "0")
-            if [ "$(echo "$percent > 0" | bc)" = "0" ]; then              echo "Calculating..."
+            if [ "$(echo "$percent > 0" | bc)" = "0" ]; then
+              echo "Calculating..."
               return
             fi
             
