@@ -1249,28 +1249,21 @@ jobs:
             exit 0
           fi
           
-          echo "📊 MERGING: Using mkvmerge with explicit append mapping..."
+          echo "📊 MERGING: Using mkvmerge with default append mapping..."
+          echo "🔄 Running mkvmerge with + appending (auto-mapping)..."
           
-          # Build mkvmerge command
+          # Build the command with files separated by +
           MKVMERGE_CMD="mkvmerge -o temp_merged.mkv --title \"$TITLE\" \"${SORTED_FILES[0]}\""
           
-          # Add each subsequent file with + for appending
           for ((i=1; i<${#SORTED_FILES[@]}; i++)); do
             MKVMERGE_CMD="$MKVMERGE_CMD + \"${SORTED_FILES[$i]}\""
           done
           
-          # Add explicit append-to options for all files after the first
-          APPEND_OPTS=""
-          for ((i=1; i<${#SORTED_FILES[@]}; i++)); do
-            # Append video track (track 0) from file i to video track of previous file
-            APPEND_OPTS="$APPEND_OPTS --append-to $i:0:$((i-1)):0"
-            # Append audio track (track 1) from file i to audio track of previous file
-            APPEND_OPTS="$APPEND_OPTS --append-to $i:1:$((i-1)):1"
-          done
-          
-          echo "🔄 Running mkvmerge with explicit mapping..."
+          echo "Command: $MKVMERGE_CMD"
           echo ""
-          eval "$MKVMERGE_CMD $APPEND_OPTS" 2>&1
+          
+          # Execute WITHOUT explicit append-to options - let mkvmerge handle it
+          eval "$MKVMERGE_CMD" 2>&1
           
           # Check if mkvmerge succeeded
           if [ -f "temp_merged.mkv" ] && [ -s "temp_merged.mkv" ]; then
@@ -1314,6 +1307,76 @@ jobs:
             fi
           fi
           
+          # If mkvmerge failed, try with explicit mapping but using the correct syntax
+          echo ""
+          echo "⚠️ mkvmerge with auto-mapping failed. Trying with explicit track mapping..."
+          
+          # Use a different approach: Use file numbers with --append-to
+          # Format: --append-to source_file_id:source_track_id:target_file_id:target_track_id
+          # File IDs start from 0 for the first file
+          
+          MKVMERGE_CMD2="mkvmerge -o temp_merged2.mkv --title \"$TITLE\" \"${SORTED_FILES[0]}\""
+          
+          # Add all files with + for appending
+          for ((i=1; i<${#SORTED_FILES[@]}; i++)); do
+            MKVMERGE_CMD2="$MKVMERGE_CMD2 + \"${SORTED_FILES[$i]}\""
+          done
+          
+          # Build append-to options for all files after the first
+          APPEND_OPTS=""
+          for ((i=1; i<${#SORTED_FILES[@]}; i++)); do
+            # Each file has 2 tracks: video (0) and audio (1)
+            # Append to the previous file's tracks
+            APPEND_OPTS="$APPEND_OPTS --append-to $i:0:$((i-1)):0"
+            APPEND_OPTS="$APPEND_OPTS --append-to $i:1:$((i-1)):1"
+          done
+          
+          echo "Command: $MKVMERGE_CMD2 $APPEND_OPTS"
+          echo ""
+          
+          eval "$MKVMERGE_CMD2 $APPEND_OPTS" 2>&1
+          
+          if [ -f "temp_merged2.mkv" ] && [ -s "temp_merged2.mkv" ]; then
+            echo ""
+            echo "✅ mkvmerge with explicit mapping successful! Remuxing to MP4..."
+            ffmpeg -y -i "temp_merged2.mkv" \
+              -c copy \
+              -movflags +faststart \
+              -metadata title="$TITLE" \
+              -metadata series="$SERIES_TITLE" \
+              -metadata label="$LABEL" \
+              "$OUTPUT_FILE" 2>/dev/null
+            rm -f "temp_merged2.mkv" 2>/dev/null
+          fi
+          
+          if [ -f "$OUTPUT_FILE" ] && [ -s "$OUTPUT_FILE" ]; then
+            HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUTPUT_FILE" 2>/dev/null)
+            if [ "$HAS_VIDEO" = "video" ]; then
+              echo ""
+              echo "✅ mkvmerge merge successful with explicit mapping!"
+              echo "merged_file_path=$(pwd)/$OUTPUT_FILE" >> $GITHUB_ENV
+              echo "has_merged=true" >> $GITHUB_ENV
+              echo "merge_success=true" >> $GITHUB_OUTPUT
+              echo "merge_method=mkvmerge_explicit" >> $GITHUB_OUTPUT
+              
+              FINAL_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_FILE" 2>/dev/null || echo "0")
+              echo "⏱️  Duration: ${FINAL_DURATION%.*} seconds"
+              ls -lh "$OUTPUT_FILE"
+              
+              # Generate thumbnails
+              echo "🖼️ Generating thumbnails..."
+              ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
+                -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
+                -q:v 2 "thumb.jpg" 2>/dev/null
+              
+              ffmpeg -i "$OUTPUT_FILE" -ss 00:00:01 -vframes 1 \
+                -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
+                -q:v 2 "square_thumb.jpg" 2>/dev/null
+              
+              exit 0
+            fi
+          fi
+          
           echo ""
           echo "❌ mkvmerge merge failed!"
           echo "merge_success=false" >> $GITHUB_OUTPUT
@@ -1330,8 +1393,7 @@ jobs:
         run: |
           cd downloads
           
-          echo "========================================="
-          echo "🔗 MERGING EPISODES WITH FFMPEG (FALLBACK)"
+          echo "========================================="          echo "🔗 MERGING EPISODES WITH FFMPEG (FALLBACK)"
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "========================================="
