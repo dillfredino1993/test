@@ -1337,6 +1337,34 @@ jobs:
             
             if [ ! -f "$f" ]; then continue; fi
             
+            # Check if episode already matches the target standard — skip recode if so
+            CUR_W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null || echo "0")
+            CUR_H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null || echo "0")
+            CUR_VCODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
+            CUR_PIXFMT=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
+            CUR_ACODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
+            CUR_SR=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
+            CUR_CH=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$f" 2>/dev/null || echo "unknown")
+            
+            # Normalize compare codec name (libx264 in ffmpeg output is h264 in ffprobe)
+            TARGET_VCODEC_COMPARE="$TARGET_VIDEO_CODEC"
+            [ "$TARGET_VCODEC_COMPARE" = "libx264" ] && TARGET_VCODEC_COMPARE="h264"
+            
+            MATCHES=true
+            [ "$CUR_W" != "$TARGET_WIDTH" ] && MATCHES=false
+            [ "$CUR_H" != "$TARGET_HEIGHT" ] && MATCHES=false
+            [ "$CUR_VCODEC" != "$TARGET_VCODEC_COMPARE" ] && MATCHES=false
+            [ "$CUR_PIXFMT" != "$TARGET_PIX_FMT" ] && MATCHES=false
+            [ "$CUR_SR" != "$TARGET_AUDIO_SAMPLE_RATE" ] && MATCHES=false
+            [ "$CUR_CH" != "$TARGET_AUDIO_CHANNELS" ] && MATCHES=false
+            [ "$CUR_ACODEC" != "$TARGET_AUDIO_CODEC" ] && MATCHES=false
+            
+            if [ "$MATCHES" = true ]; then
+              echo "✅ Episode $EP_NUM: Already matches standard — skipping recode"
+              echo ""
+              continue
+            fi
+            
             echo "📹 Episode $EP_NUM: Standardizing with detected H.264 parameters..."
             
             # Create temporary file
