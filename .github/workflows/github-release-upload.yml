@@ -212,7 +212,6 @@ jobs:
             
             EP_NUM=$(printf "%02d" $EP_INDEX)
             OUT_FILE="EP${EP_NUM}.mp4"
-            TEMP_FILE="EP${EP_NUM}_temp.mp4"
             FIXED_FILE="EP${EP_NUM}_fixed.mp4"
             
             echo "========================================="
@@ -222,10 +221,9 @@ jobs:
             echo "========================================="
             
             # Clean up any existing files
-            rm -f "$OUT_FILE" "$TEMP_FILE" "$FIXED_FILE" 2>/dev/null
+            rm -f "$OUT_FILE" "$FIXED_FILE" 2>/dev/null
             
             DOWNLOAD_SUCCESS=false
-            DOWNLOADED_FILE=""
             
             # ------------------------------------------------------------
             # CHECK URL TYPE: HLS/m3u8 OR DIRECT VIDEO
@@ -252,68 +250,17 @@ jobs:
                 -o "$OUT_FILE" \
                 "$URL" 2>/dev/null
               
-              # Check if file was downloaded
+              # Check if file was downloaded and has video
               if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
-                DOWNLOADED_FILE="$OUT_FILE"
-                
-                # Check if it needs fixup (MPEG-TS in MP4 container)
-                NEEDS_FIXUP=false
-                CONTAINER=$(ffprobe -v error -show_entries format=format_name -of default=noprint_wrappers=1:nokey=1 "$OUT_FILE" 2>/dev/null | head -1)
-                if [[ "$CONTAINER" == *"mpegts"* ]] || [[ "$CONTAINER" == *"mpeg"* ]]; then
-                  NEEDS_FIXUP=true
-                  echo "🔄 Detected MPEG-TS container, applying fixup..."
-                fi
-                
-                # Also check if file has video stream
-                HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
-                  NEEDS_FIXUP=true
-                  echo "🔄 File has no video stream, attempting fixup..."
-                fi
-                
-                # Apply fixup if needed
-                if [ "$NEEDS_FIXUP" = true ]; then
-                  echo "🔧 Fixing MPEG-TS to MP4 container..."
-                  
-                  # Use ffmpeg to fix the file (similar to smart merge approach)
-                  ffmpeg -y -err_detect ignore_err -i "$OUT_FILE" \
-                    -c:v libx264 -preset veryfast -crf 23 \
-                    -c:a aac -b:a 128k -ar 44100 \
-                    -movflags +faststart \
-                    -metadata title="Episode $EP_NUM - $SERIES_TITLE" \
-                    -metadata episode_id="$EP_NUM" \
-                    -metadata series="$SERIES_TITLE" \
-                    -metadata label="$LABEL" \
-                    "$FIXED_FILE" 2>/dev/null
-                  
-                  if [ -f "$FIXED_FILE" ] && [ -s "$FIXED_FILE" ]; then
-                    # Verify the fixed file has video
-                    HAS_VIDEO_FIXED=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FIXED_FILE" 2>/dev/null)
-                    if [ -n "$HAS_VIDEO_FIXED" ] && [ "$HAS_VIDEO_FIXED" = "video" ]; then
-                      mv "$FIXED_FILE" "$OUT_FILE"
-                      echo "✅ Fixup successful: $OUT_FILE"
-                    else
-                      echo "⚠️ Fixup produced file without video, keeping original"
-                      rm -f "$FIXED_FILE" 2>/dev/null
-                    fi
-                  else
-                    echo "⚠️ Fixup failed, using original file"
-                    rm -f "$FIXED_FILE" 2>/dev/null
-                  fi
-                fi
-                
-                # Final verification
                 FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
                 if [ "$FILE_SIZE" -gt 100000 ]; then
                   HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
                   if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
                     DOWNLOAD_SUCCESS=true
                     FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-                    W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                    H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                    echo "✅ Downloaded HLS stream: $OUT_FILE (${FILE_SIZE_MB}MB, ${W}x${H})"
+                    echo "✅ Downloaded HLS stream: $OUT_FILE (${FILE_SIZE_MB}MB)"
                   else
-                    echo "⚠️ HLS download has NO video stream!"
+                    echo "⚠️ HLS download has NO video stream - will fixup"
                   fi
                 else
                   echo "⚠️ HLS download file too small (${FILE_SIZE} bytes) - likely corrupt"
@@ -362,61 +309,13 @@ jobs:
               if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
                 FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
                 if [ "$FILE_SIZE" -gt 100000 ]; then
-                  # Check container format
-                  NEEDS_FIXUP=false
-                  CONTAINER=$(ffprobe -v error -show_entries format=format_name -of default=noprint_wrappers=1:nokey=1 "$OUT_FILE" 2>/dev/null | head -1)
-                  if [[ "$CONTAINER" == *"mpegts"* ]] || [[ "$CONTAINER" == *"mpeg"* ]]; then
-                    NEEDS_FIXUP=true
-                    echo "🔄 Detected MPEG-TS container, applying fixup..."
-                  fi
-                  
                   HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                  if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
-                    NEEDS_FIXUP=true
-                    echo "🔄 File has no video stream, attempting fixup..."
-                  fi
-                  
-                  # Apply fixup if needed
-                  if [ "$NEEDS_FIXUP" = true ]; then
-                    echo "🔧 Fixing MPEG-TS to MP4 container..."
-                    
-                    ffmpeg -y -err_detect ignore_err -i "$OUT_FILE" \
-                      -c:v libx264 -preset veryfast -crf 23 \
-                      -c:a aac -b:a 128k -ar 44100 \
-                      -movflags +faststart \
-                      -metadata title="Episode $EP_NUM - $SERIES_TITLE" \
-                      -metadata episode_id="$EP_NUM" \
-                      -metadata series="$SERIES_TITLE" \
-                      -metadata label="$LABEL" \
-                      "$FIXED_FILE" 2>/dev/null
-                    
-                    if [ -f "$FIXED_FILE" ] && [ -s "$FIXED_FILE" ]; then
-                      HAS_VIDEO_FIXED=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FIXED_FILE" 2>/dev/null)
-                      if [ -n "$HAS_VIDEO_FIXED" ] && [ "$HAS_VIDEO_FIXED" = "video" ]; then
-                        mv "$FIXED_FILE" "$OUT_FILE"
-                        echo "✅ Fixup successful: $OUT_FILE"
-                      else
-                        echo "⚠️ Fixup produced file without video, keeping original"
-                        rm -f "$FIXED_FILE" 2>/dev/null
-                      fi
-                    else
-                      echo "⚠️ Fixup failed, using original file"
-                      rm -f "$FIXED_FILE" 2>/dev/null
-                    fi
-                  fi
-                  
-                  # Final verification after fixup
-                  if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
-                    HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                    if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
-                      DOWNLOAD_SUCCESS=true
-                      FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-                      W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                      H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" 2>/dev/null)
-                      echo "✅ Downloaded with aria2c: $OUT_FILE (${FILE_SIZE_MB}MB, ${W}x${H})"
-                    else
-                      echo "⚠️ aria2c download has NO video stream!"
-                    fi
+                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                    DOWNLOAD_SUCCESS=true
+                    FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+                    echo "✅ Downloaded with aria2c: $OUT_FILE (${FILE_SIZE_MB}MB)"
+                  else
+                    echo "⚠️ aria2c download has NO video stream - will fixup"
                   fi
                 else
                   echo "⚠️ aria2c download file too small (${FILE_SIZE} bytes) - likely corrupt"
@@ -491,7 +390,99 @@ jobs:
             fi
             
             # ------------------------------------------------------------
-            # CREATE VIDEO FROM AUDIO IF ONLY AUDIO IS AVAILABLE
+            # MPEG-TS FIXUP: Check and fix container if needed
+            # ------------------------------------------------------------
+            if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+              FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+              
+              if [ "$FILE_SIZE" -gt 100000 ]; then
+                # Check if file needs fixup (MPEG-TS container)
+                NEEDS_FIXUP=false
+                
+                # Check container format
+                CONTAINER=$(ffprobe -v error -show_entries format=format_name -of default=noprint_wrappers=1:nokey=1 "$OUT_FILE" 2>/dev/null | head -1)
+                if [[ "$CONTAINER" == *"mpegts"* ]] || [[ "$CONTAINER" == *"mpeg"* ]]; then
+                  NEEDS_FIXUP=true
+                  echo "🔄 Detected MPEG-TS container, applying fixup..."
+                fi
+                
+                # Check if file has video stream
+                HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
+                  NEEDS_FIXUP=true
+                  echo "🔄 File has no video stream, attempting fixup..."
+                fi
+                
+                # Also check for MPEG-TS in the file format string
+                if [ "$NEEDS_FIXUP" != true ]; then
+                  FORMAT_INFO=$(ffprobe -v error -show_entries format=format_long_name -of default=noprint_wrappers=1:nokey=1 "$OUT_FILE" 2>/dev/null | head -1)
+                  if [[ "$FORMAT_INFO" == *"MPEG-TS"* ]] || [[ "$FORMAT_INFO" == *"MPEGTS"* ]]; then
+                    NEEDS_FIXUP=true
+                    echo "🔄 Detected MPEG-TS format, applying fixup..."
+                  fi
+                fi
+                
+                # Apply fixup if needed
+                if [ "$NEEDS_FIXUP" = true ]; then
+                  echo "🔧 Fixing MPEG-TS to MP4 container (re-encoding with veryfast preset)..."
+                  
+                  # Use ffmpeg to fix the file
+                  ffmpeg -y -err_detect ignore_err -i "$OUT_FILE" \
+                    -c:v libx264 -preset veryfast -crf 23 \
+                    -c:a aac -b:a 128k -ar 44100 \
+                    -movflags +faststart \
+                    -metadata title="Episode $EP_INDEX - $SERIES_TITLE" \
+                    -metadata episode_id="$EP_INDEX" \
+                    -metadata series="$SERIES_TITLE" \
+                    -metadata label="$LABEL" \
+                    "$FIXED_FILE" 2>/dev/null
+                  
+                  if [ -f "$FIXED_FILE" ] && [ -s "$FIXED_FILE" ]; then
+                    # Verify the fixed file has video
+                    HAS_VIDEO_FIXED=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FIXED_FILE" 2>/dev/null)
+                    if [ -n "$HAS_VIDEO_FIXED" ] && [ "$HAS_VIDEO_FIXED" = "video" ]; then
+                      # Check fixed file size
+                      FIXED_SIZE=$(stat -c%s "$FIXED_FILE" 2>/dev/null || stat -f%z "$FIXED_FILE" 2>/dev/null || echo "0")
+                      if [ "$FIXED_SIZE" -gt 100000 ]; then
+                        mv "$FIXED_FILE" "$OUT_FILE"
+                        DOWNLOAD_SUCCESS=true
+                        FIXED_SIZE_MB=$((FIXED_SIZE / 1024 / 1024))
+                        echo "✅ Fixup successful: $OUT_FILE (${FIXED_SIZE_MB}MB)"
+                      else
+                        echo "⚠️ Fixed file too small (${FIXED_SIZE} bytes), keeping original"
+                        rm -f "$FIXED_FILE" 2>/dev/null
+                      fi
+                    else
+                      echo "⚠️ Fixup produced file without video, keeping original"
+                      rm -f "$FIXED_FILE" 2>/dev/null
+                    fi
+                  else
+                    echo "⚠️ Fixup failed, using original file"
+                    rm -f "$FIXED_FILE" 2>/dev/null
+                  fi
+                fi
+                
+                # Final verification after potential fixup
+                if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                  FINAL_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                  if [ "$FINAL_SIZE" -gt 100000 ]; then
+                    HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                      DOWNLOAD_SUCCESS=true
+                      FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
+                      W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                      H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                      echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FINAL_SIZE_MB}MB, ${W}x${H})"
+                    else
+                      echo "⚠️ File still has NO video stream after fixup!"
+                    fi
+                  fi
+                fi
+              fi
+            fi
+            
+            # ------------------------------------------------------------
+            # CREATE VIDEO FROM AUDIO IF ONLY AUDIO IS AVAILABLE (ULTIMATE FALLBACK)
             # ------------------------------------------------------------
             if [ "$DOWNLOAD_SUCCESS" != true ]; then
               # Check if we have a file with audio but no video
@@ -562,7 +553,7 @@ jobs:
             fi
             
             # Clean up temp files
-            rm -f "$TEMP_FILE" "$FIXED_FILE" 2>/dev/null
+            rm -f "$FIXED_FILE" 2>/dev/null
             
             EP_INDEX=$((EP_INDEX + 1))
             echo ""
@@ -611,7 +602,14 @@ jobs:
               else
                 W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null)
                 H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null)
-                echo "✅ $f: ${W}x${H}"
+                
+                # Check for invalid resolution
+                if [ -z "$W" ] || [ -z "$H" ] || [ "$W" = "0" ] || [ "$H" = "0" ]; then
+                  echo "❌ $f has invalid resolution!"
+                  ALL_GOOD=false
+                else
+                  echo "✅ $f: ${W}x${H}"
+                fi
               fi
             fi
           done
@@ -813,16 +811,29 @@ jobs:
               sys.exit(0 if success else 1)
           EOFCOMPRESS
           
-          # Get list of all episodes
-          EPISODE_FILES=$(ls -1 EP*.mp4 2>/dev/null)
-          TOTAL_EPISODES=$(echo "$EPISODE_FILES" | wc -l)
+          # Get list of all episodes sorted numerically
+          EPISODE_FILES=()
+          for f in EP*.mp4; do
+            if [ -f "$f" ]; then
+              EP_NUM=$(echo "$f" | grep -oE '[0-9]+' | head -1)
+              if [ -n "$EP_NUM" ]; then
+                EPISODE_FILES+=("$EP_NUM:$f")
+              fi
+            fi
+          done
+          
+          # Sort by episode number numerically
+          IFS=$'\n' SORTED_EPISODES=($(sort -t: -k1 -n <<<"${EPISODE_FILES[*]}"))
+          
+          TOTAL_EPISODES=${#SORTED_EPISODES[@]}
           COMPRESSED_COUNT=0
           FAILED_COMPRESSIONS=""
           
           echo "📊 Checking episode sizes..."
           echo ""
           
-          for f in $EPISODE_FILES; do
+          for entry in "${SORTED_EPISODES[@]}"; do
+            f="${entry#*:}"
             if [ ! -f "$f" ]; then continue; fi
             
             FILE_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
@@ -873,7 +884,8 @@ jobs:
           # Show final file sizes
           echo ""
           echo "📊 Final episode sizes:"
-          for f in EP*.mp4; do
+          for entry in "${SORTED_EPISODES[@]}"; do
+            f="${entry#*:}"
             if [ -f "$f" ]; then
               SIZE_MB=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null | awk '{print $1/1024/1024}')
               printf "   %-10s: %.1f MB\n" "$f" "$SIZE_MB"
@@ -891,10 +903,49 @@ jobs:
           echo "🔗 MERGING EPISODES"
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
-          echo "📊 Episodes: $(ls -1 EP*.mp4 2>/dev/null | wc -l)"
           echo "========================================="
           
-          EP_COUNT=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
+          # FIX: Sort episodes numerically instead of alphabetically
+          # Get list of episodes and sort by episode number properly
+          EPISODE_FILES=()
+          for f in EP*.mp4; do
+            if [ -f "$f" ]; then
+              # Extract episode number
+              EP_NUM=$(echo "$f" | grep -oE '[0-9]+' | head -1)
+              if [ -n "$EP_NUM" ]; then
+                EPISODE_FILES+=("$EP_NUM:$f")
+              fi
+            fi
+          done
+          
+          # Sort by episode number numerically
+          IFS=$'\n' SORTED_EPISODES=($(sort -t: -k1 -n <<<"${EPISODE_FILES[*]}"))
+          
+          # Extract just filenames in correct order
+          SORTED_FILES=()
+          for entry in "${SORTED_EPISODES[@]}"; do
+            filename="${entry#*:}"
+            SORTED_FILES+=("$filename")
+          done
+          
+          EP_COUNT=${#SORTED_FILES[@]}
+          
+          echo "📊 Found $EP_COUNT episodes to merge (sorted numerically)"
+          
+          # Show first 5 and last 5 for verification
+          echo "📋 First 5 episodes:"
+          for i in 0 1 2 3 4; do
+            if [ $i -lt $EP_COUNT ]; then
+              echo "   ${SORTED_FILES[$i]}"
+            fi
+          done
+          echo "📋 Last 5 episodes:"
+          for i in $(seq $((EP_COUNT - 5)) $((EP_COUNT - 1))); do
+            if [ $i -ge 0 ] && [ $i -lt $EP_COUNT ]; then
+              echo "   ${SORTED_FILES[$i]}"
+            fi
+          done
+          
           if [ "$EP_COUNT" -eq 0 ]; then
             echo "❌ No episodes to merge!"
             exit 1
@@ -902,7 +953,7 @@ jobs:
           
           if [ "$EP_COUNT" -eq 1 ]; then
             echo "📦 Only 1 episode - skipping merge"
-            SINGLE_FILE=$(ls EP*.mp4 | head -1)
+            SINGLE_FILE="${SORTED_FILES[0]}"
             ffmpeg -i "$SINGLE_FILE" -c copy -movflags +faststart \
               -metadata title="$TITLE" \
               -metadata series="$SERIES_TITLE" \
@@ -916,14 +967,12 @@ jobs:
             exit 0
           fi
           
-          echo "📊 Found $EP_COUNT episodes to merge"
-          
-          # First, verify all files have video streams and redownload if needed
+          # First, verify all files have video streams
           echo "🔍 Checking all files for video streams..."
           NEEDS_REDOWNLOAD=false
           REDOWNLOAD_LIST=""
           
-          for f in EP*.mp4; do
+          for f in "${SORTED_FILES[@]}"; do
             if [ ! -f "$f" ]; then continue; fi
             
             # Check if file has video stream
@@ -1045,7 +1094,7 @@ jobs:
           declare -A audio_codecs
           declare -A has_video
           
-          for f in EP*.mp4; do
+          for f in "${SORTED_FILES[@]}"; do
             if [ -f "$f" ]; then
               # Try MediaInfo first
               res=$(mediainfo --Inform="Video;%Width%x%Height%" "$f" 2>/dev/null || echo "")
@@ -1159,7 +1208,7 @@ jobs:
           NORMALIZED_FILES=""
           NEEDS_NORMALIZE=false
           
-          for f in EP*.mp4; do
+          for f in "${SORTED_FILES[@]}"; do
             if [ ! -f "$f" ]; then continue; fi
             
             CURRENT_RES="${resolutions[$f]:-0x0}"
@@ -2259,6 +2308,7 @@ jobs:
                       except: pass
 
           async def upload_episodes(client, entity, topic_id=None):
+              # Sort episodes numerically
               ep_files = sorted(glob.glob("EP*.mp4"), 
                   key=lambda f: int(re.search(r'EP(\d+)\.mp4', f).group(1)) if re.search(r'EP(\d+)\.mp4', f) else 0)
               
