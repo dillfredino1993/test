@@ -978,7 +978,7 @@ jobs:
                   # Use ffprobe to get stream info
                   cmd = [
                       "ffprobe", "-v", "error",
-                      "-show_entries", "stream=codec_name,profile,level,width,height,pix_fmt",
+                      "-show_entries", "stream=codec_type,codec_name,profile,level,width,height,pix_fmt",
                       "-show_entries", "format=format_name",
                       "-of", "json",
                       file_path
@@ -1018,7 +1018,7 @@ jobs:
                       "ffmpeg", "-i", file_path,
                       "-f", "null", "-"
                   ]
-                  result = subprocess.run(cmd, capture_output=True, text=True, stderr=subprocess.STDOUT)
+                  result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
                   
                   # Look for x264 encoding params in output
                   x264_params = {}
@@ -1258,6 +1258,9 @@ jobs:
           TARGET_B_FRAMES="${{ steps.detect_h264.outputs.b_frames }}"
           TARGET_KEYINT="${{ steps.detect_h264.outputs.keyint }}"
           TARGET_RESOLUTION="${{ steps.detect_h264.outputs.resolution }}"
+          TARGET_AUDIO_SAMPLE_RATE="${{ steps.analyze.outputs.audio_sample_rate }}"
+          TARGET_AUDIO_CHANNELS="${{ steps.analyze.outputs.audio_channels }}"
+          TARGET_AUDIO_CODEC="${{ steps.analyze.outputs.audio_codec }}"
           
           echo "========================================="
           echo "📐 STANDARDIZING EPISODES WITH DETECTED H.264 PARAMETERS"
@@ -1272,6 +1275,9 @@ jobs:
           echo "   Ref Frames: ${TARGET_REF_FRAMES}"
           echo "   B-frames: ${TARGET_B_FRAMES}"
           echo "   Keyint: ${TARGET_KEYINT}"
+          echo "   Audio Sample Rate: ${TARGET_AUDIO_SAMPLE_RATE}"
+          echo "   Audio Channels: ${TARGET_AUDIO_CHANNELS}"
+          echo "   Audio Codec: ${TARGET_AUDIO_CODEC}"
           echo "========================================="
           
           # Check if we have valid targets
@@ -1288,6 +1294,9 @@ jobs:
           [ -z "$TARGET_B_FRAMES" ] || [ "$TARGET_B_FRAMES" = "unknown" ] && TARGET_B_FRAMES="0"
           [ -z "$TARGET_KEYINT" ] || [ "$TARGET_KEYINT" = "unknown" ] && TARGET_KEYINT="250"
           [ -z "$TARGET_PIX_FMT" ] || [ "$TARGET_PIX_FMT" = "unknown" ] && TARGET_PIX_FMT="yuv420p"
+          [ -z "$TARGET_AUDIO_SAMPLE_RATE" ] || [ "$TARGET_AUDIO_SAMPLE_RATE" = "unknown" ] && TARGET_AUDIO_SAMPLE_RATE="44100"
+          [ -z "$TARGET_AUDIO_CHANNELS" ] || [ "$TARGET_AUDIO_CHANNELS" = "unknown" ] && TARGET_AUDIO_CHANNELS="2"
+          [ -z "$TARGET_AUDIO_CODEC" ] || [ "$TARGET_AUDIO_CODEC" = "unknown" ] && TARGET_AUDIO_CODEC="aac"
           
           echo ""
           echo "📋 Final Encoding Parameters:"
@@ -1299,6 +1308,7 @@ jobs:
           echo "   Ref Frames: ${TARGET_REF_FRAMES}"
           echo "   B-frames: ${TARGET_B_FRAMES}"
           echo "   Keyint: ${TARGET_KEYINT}"
+          echo "   Audio: ${TARGET_AUDIO_SAMPLE_RATE}Hz ${TARGET_AUDIO_CHANNELS}ch ${TARGET_AUDIO_CODEC}"
           echo "========================================="
           
           # Get list of all episodes sorted numerically
@@ -1342,10 +1352,10 @@ jobs:
               -profile:v "${TARGET_PROFILE}" \
               -level "${TARGET_LEVEL}" \
               -x264-params "keyint=${TARGET_KEYINT}:min-keyint=$((TARGET_KEYINT / 10)):scenecut=40:ref=${TARGET_REF_FRAMES}:bframes=${TARGET_B_FRAMES}" \
-              -c:a aac \
+              -c:a "${TARGET_AUDIO_CODEC}" \
               -b:a 128k \
-              -ar 44100 \
-              -ac 2 \
+              -ar "${TARGET_AUDIO_SAMPLE_RATE}" \
+              -ac "${TARGET_AUDIO_CHANNELS}" \
               -movflags +faststart \
               -map_metadata 0 \
               "$TEMP_FILE" 2>/dev/null
