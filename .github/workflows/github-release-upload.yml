@@ -1298,6 +1298,120 @@ jobs:
           [ -z "$TARGET_AUDIO_CHANNELS" ] || [ "$TARGET_AUDIO_CHANNELS" = "unknown" ] && TARGET_AUDIO_CHANNELS="2"
           [ -z "$TARGET_AUDIO_CODEC" ] || [ "$TARGET_AUDIO_CODEC" = "unknown" ] && TARGET_AUDIO_CODEC="aac"
           
+          # Reference codec private data — the SPS/PPS bytes, fingerprinted via
+          # ffprobe's extradata_hash (SHA-256). mkvmerge warns (and exits 1) when these
+          # differ between appended files even if width/height/codec look identical.
+          # 
+          # ffprobe 7.x: use `-show_data_hash sha256`. Older ffprobe: use
+          # `-show_entries stream=extradata -of default=noprint_wrappers=1:nokey=1`.
+          get_extradata() {
+            # $1 = file; prints extradata hash (or raw extradata fallback for old ffprobe)
+            local out
+            out=$(ffprobe -v error -select_streams v:0 -show_entries stream=extradata_hash -show_data_hash sha256 -of json "$1" 2>/dev/null)
+            if echo "$out" | grep -q 'extradata_hash'; then
+              echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['streams'][0].get('extradata_hash',''))"
+            else
+              ffprobe -v error -select_streams v:0 -show_entries stream=extradata -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | head -c 100
+            fi
+          }
+          
+          # Determine whether ALL episodes already share identical codec private data
+          # (SPS/PPS). If they do, mkvmerge appends cleanly and NOTHING needs recoding.
+          # Only when hashes differ do we re-encode — and since a re-encode with the
+          # standard command yields a NEW hash that can't match an untouched original,
+          # a mixed set is re-encoded entirely with the same command so all outputs
+          # share one identical SPS/PPS.
+          get_extradata() {
+            # $1 = file; prints extradata hash (or raw extradata fallback for old ffprobe)
+            local out
+            out=$(ffprobe -v error -select_streams v:0 -show_entries stream=extradata_hash -show_data_hash sha256 -of json "$1" 2>/dev/null)
+            if echo "$out" | grep -q 'extradata_hash'; then
+              echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['streams'][0].get('extradata_hash',''))"
+            else
+              ffprobe -v error -select_streams v:0 -show_entries stream=extradata -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | head -c 100
+            fi
+          }
+          
+          # Re-encode one episode into $2 using the exact standard command.
+          # Returns 0 on success (file exists and non-empty), 1 on failure.
+          recode_episode() {
+            local src="$1" dst="$2"
+            rm -f "$dst" 2>/dev/null
+            ffmpeg -y -i "$src" \
+              -vf "scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad=${TARGET_WIDTH}:${TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,format=${TARGET_PIX_FMT}" \
+              -c:v "${TARGET_VIDEO_CODEC}" \
+              -preset veryfast \
+              -crf 23 \
+              -profile:v "${TARGET_PROFILE}" \
+              -level "${TARGET_LEVEL}" \
+              -x264-params "keyint=${TARGET_KEYINT}:min-keyint=$((TARGET_KEYINT / 10)):scenecut=40:ref=${TARGET_REF_FRAMES}:bframes=${TARGET_B_FRAMES}" \
+              -c:a "${TARGET_AUDIO_CODEC}" \
+              -b:a 128k \
+              -ar "${TARGET_AUDIO_SAMPLE_RATE}" \
+              -ac "${TARGET_AUDIO_CHANNELS}" \
+              -movflags +faststart \
+              -map_metadata 0 \
+              "$dst" 2>/dev/null
+            [ -f "$dst" ] && [ -s "$dst" ]
+          }
+          
+          # Collect every episode's SPS/PPS hash
+          unset EP_HASHES
+          declare -A EP_HASHES
+          for ref in EP*.mp4; do
+            [ -f "$ref" ] || continue
+            EP_HASHES["$ref"]=$(get_extradata "$ref")
+          done
+          
+          # Distinct hashes present
+          DISTINCT_HASHES=$(printf '%s\n' "${EP_HASHES[@]}" | grep -v '^$' | sort -u | wc -l)
+          echo "📊 Found $DISTINCT_HASHES distinct codec private data sets across episodes"
+          
+          if [ "$DISTINCT_HASHES" -le 1 ]; then
+            # Single identical SPS/PPS everywhere (or unreadable) — nothing to re-encode
+            ALL_IDENTICAL=true
+            TARGET_EXTRADATA="$(printf '%s\n' "${EP_HASHES[@]}" | grep -v '^$' | head -1)"
+            echo "✅ All episodes share identical codec parameters — no recoding needed"
+          else
+            # Mixed SPS/PPS. Try to preserve the majority's codec config: recode just
+            # one divergent episode to a probe; if it reproduces the majority's SPS/PPS
+            # exactly, only the divergent episodes need recoding. Otherwise our encoder
+            # can't match the majority's bytes, so standardize everything with one
+            # command to guarantee mkvmerge-clean output.
+            MAJORITY_HASH=$(printf '%s\n' "${EP_HASHES[@]}" | grep -v '^$' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+            echo "⚠️ Episodes have different SPS/PPS — majority ${MAJORITY_HASH:-<none>}"
+            
+            PRESERVE_MAJORITY=false
+            DIVERGENT_FILE=""
+            for ref in EP*.mp4; do
+              [ -f "$ref" ] || continue
+              if [ -n "${EP_HASHES[$ref]}" ] && [ "${EP_HASHES[$ref]}" != "$MAJORITY_HASH" ]; then
+                DIVERGENT_FILE="$ref"
+                break
+              fi
+            done
+            
+            if [ -n "$DIVERGENT_FILE" ] && [ -n "$MAJORITY_HASH" ]; then
+              PROBE_TMP="temp_probe_${DIVERGENT_FILE}"
+              echo "            🔬 Probing: can our encoder reproduce majority SPS/PPS? (encoding $DIVERGENT_FILE...)"
+              if recode_episode "$DIVERGENT_FILE" "$PROBE_TMP"; then
+                PROBE_HASH=$(get_extradata "$PROBE_TMP")
+                if [ "$PROBE_HASH" = "$MAJORITY_HASH" ]; then
+                  PRESERVE_MAJORITY=true
+                  echo "            ✅ Recode reproduces majority SPS/PPS — will recode only divergent episodes"
+                else
+                  PRESERVE_MAJORITY=false
+                  echo "            ⚠️ Recode does NOT reproduce majority SPS/PPS ($(echo "$PROBE_HASH" | head -c 12)…) — will standardize ALL episodes"
+                fi
+              fi
+              rm -f "$PROBE_TMP" 2>/dev/null
+            fi
+            
+            ALL_IDENTICAL=false
+            TARGET_EXTRADATA=""
+          fi
+          echo "Reference codec extradata: ${TARGET_EXTRADATA:-<none>}"
+          
           echo ""
           echo "📋 Final Encoding Parameters:"
           echo "   Resolution: ${TARGET_WIDTH}x${TARGET_HEIGHT}"
@@ -1350,7 +1464,20 @@ jobs:
             TARGET_VCODEC_COMPARE="$TARGET_VIDEO_CODEC"
             [ "$TARGET_VCODEC_COMPARE" = "libx264" ] && TARGET_VCODEC_COMPARE="h264"
             
+            # Compare codec private data (SPS/PPS) via extradata hash — mkvmerge warns and
+            # exits 1 if these differ between appended files even when width/height/codec
+            # look identical. Raw extradata isn't exposed by ffprobe 7.x, so use the hash.
+            REF_EXTRADATA="$TARGET_EXTRADATA"
+            CUR_EXTRADATA=$(get_extradata "$f")
+            
             MATCHES=true
+            if [ "$PRESERVE_MAJORITY" = true ]; then
+              # Recode only divergent episodes; skip files whose SPS/PPS equals the majority
+              [ -n "$CUR_EXTRADATA" ] && [ "$CUR_EXTRADATA" != "$MAJORITY_HASH" ] && MATCHES=false
+            else
+              # Can't preserve majority bytes — force uniformity (recode all)
+              [ "$ALL_IDENTICAL" = true ] || MATCHES=false
+            fi
             [ "$CUR_W" != "$TARGET_WIDTH" ] && MATCHES=false
             [ "$CUR_H" != "$TARGET_HEIGHT" ] && MATCHES=false
             [ "$CUR_VCODEC" != "$TARGET_VCODEC_COMPARE" ] && MATCHES=false
@@ -1358,6 +1485,7 @@ jobs:
             [ "$CUR_SR" != "$TARGET_AUDIO_SAMPLE_RATE" ] && MATCHES=false
             [ "$CUR_CH" != "$TARGET_AUDIO_CHANNELS" ] && MATCHES=false
             [ "$CUR_ACODEC" != "$TARGET_AUDIO_CODEC" ] && MATCHES=false
+            [ -n "$CUR_EXTRADATA" ] && [ -n "$REF_EXTRADATA" ] && [ "$CUR_EXTRADATA" != "$REF_EXTRADATA" ] && MATCHES=false
             
             if [ "$MATCHES" = true ]; then
               echo "✅ Episode $EP_NUM: Already matches standard — skipping recode"
@@ -1372,22 +1500,7 @@ jobs:
             rm -f "$TEMP_FILE" 2>/dev/null
             
             # Build FFmpeg command with detected parameters
-            ffmpeg -y -i "$f" \
-              -vf "scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad=${TARGET_WIDTH}:${TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,format=${TARGET_PIX_FMT}" \
-              -c:v "${TARGET_VIDEO_CODEC}" \
-              -preset veryfast \
-              -crf 23 \
-              -profile:v "${TARGET_PROFILE}" \
-              -level "${TARGET_LEVEL}" \
-              -x264-params "keyint=${TARGET_KEYINT}:min-keyint=$((TARGET_KEYINT / 10)):scenecut=40:ref=${TARGET_REF_FRAMES}:bframes=${TARGET_B_FRAMES}" \
-              -c:a "${TARGET_AUDIO_CODEC}" \
-              -b:a 128k \
-              -ar "${TARGET_AUDIO_SAMPLE_RATE}" \
-              -ac "${TARGET_AUDIO_CHANNELS}" \
-              -movflags +faststart \
-              -map_metadata 0 \
-              "$TEMP_FILE" 2>/dev/null
-            
+            if recode_episode "$f" "$TEMP_FILE"; then
             if [ -f "$TEMP_FILE" ] && [ -s "$TEMP_FILE" ]; then
               HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$TEMP_FILE" 2>/dev/null)
               HAS_AUDIO=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "$TEMP_FILE" 2>/dev/null)
@@ -1407,6 +1520,7 @@ jobs:
               echo "   ❌ Standardization failed!"
               rm -f "$TEMP_FILE" 2>/dev/null
               FAILED="$FAILED $f"
+            fi
             fi
             
             echo ""
@@ -1432,17 +1546,17 @@ jobs:
           echo "🔍 VERIFYING CONSISTENT CODEC PARAMETERS..."
           
           REF_FILE=$(ls -1 EP*.mp4 | sort -V | head -1)
-          REF_EXTRADATA=$(ffprobe -v error -select_streams v:0 -show_entries stream=extradata -of default=noprint_wrappers=1:nokey=1 "$REF_FILE" 2>/dev/null | head -c 100)
+          REF_EXTRADATA=$(get_extradata "$REF_FILE")
           
           echo "Reference: $REF_FILE"
-          echo "Reference extradata (first 100 chars): $REF_EXTRADATA"
+          echo "Reference codec extradata: $REF_EXTRADATA"
           echo ""
           
           ALL_MATCH=true
           for f in $(ls -1 EP*.mp4 | sort -V); do
             if [ "$f" = "$REF_FILE" ]; then continue; fi
             
-            EXTRADATA=$(ffprobe -v error -select_streams v:0 -show_entries stream=extradata -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null | head -c 100)
+            EXTRADATA=$(get_extradata "$f")
             
             if [ "$EXTRADATA" != "$REF_EXTRADATA" ]; then
               echo "❌ $f: Codec private data MISMATCH!"
@@ -1603,14 +1717,16 @@ jobs:
           echo "Command: mkvmerge ${MKVMERGE_ARGS[*]}"
           echo ""
           
-          if mkvmerge "${MKVMERGE_ARGS[@]}" 2>&1; then
-            if [ -s temp_merged.mkv ] && finalize_merge temp_merged.mkv "mkvmerge"; then
-              exit 0
-            fi
-            echo "⚠️ Auto-mapping merge produced an invalid file, trying explicit mapping..."
-          else
-            echo "⚠️ mkvmerge auto-mapping failed (exit $?), trying explicit mapping..."
+          set +e
+          mkvmerge "${MKVMERGE_ARGS[@]}" 2>&1
+          MKX_RC=$?
+          set -e
+          echo "(mkvmerge exit code: $MKX_RC — a non-zero code here is often just appendability warnings)"
+          
+          if finalize_merge temp_merged.mkv "mkvmerge"; then
+            exit 0
           fi
+          echo "⚠️ Auto-mapping merge produced an invalid file, trying explicit mapping..."
           
           # --- ATTEMPT 2: explicit chained track mapping (single comma-joined --append-to) ---
           echo ""
@@ -1638,13 +1754,15 @@ jobs:
           echo "Command: mkvmerge ${MKVMERGE_ARGS2[*]}"
           echo ""
           
-          if mkvmerge "${MKVMERGE_ARGS2[@]}" 2>&1; then
-            if [ -s temp_merged2.mkv ] && finalize_merge temp_merged2.mkv "mkvmerge_explicit"; then
-              exit 0
-            fi
-          fi
+          set +e
+          mkvmerge "${MKVMERGE_ARGS2[@]}" 2>&1
+          MKX_RC2=$?
+          set -e
+          echo "(mkvmerge exit code: $MKX_RC2 — a non-zero code here is likely just appendability warnings)"
           
-          echo ""
+          if finalize_merge temp_merged2.mkv "mkvmerge_explicit"; then
+            exit 0
+          fi
           echo "❌ mkvmerge merge failed!"
           echo "merge_success=false" >> $GITHUB_OUTPUT
           exit 1
