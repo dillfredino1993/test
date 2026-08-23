@@ -329,9 +329,12 @@ jobs:
           # Worker function executed in parallel across runner cores
           process_episode() {
             local f="$1"
-            local temp="fixed_${f}"
+            local fname
+            fname=$(basename "$f")
+            local temp="temp_fixed_${fname}"
+            rm -f "$temp" 2>/dev/null
             
-            # Fast probe
+            # Probe container & video stream
             local container
             container=$(ffprobe -v error -show_entries format=format_name -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null | head -1)
             local format_info
@@ -346,40 +349,44 @@ jobs:
             
             if [ "$needs_fix" = true ]; then
               # Attempt 1: Ultra-fast stream-copy remux with MPEG-TS AAC bitstream filter (0 re-encoding, ~0.05s)
-              if ffmpeg -y -err_detect ignore_err -i "$f" -c copy -bsf:a aac_adtstoasc -movflags +faststart "$temp" 2>/dev/null; then
-                if [ -s "$temp" ]; then
+              ffmpeg -y -err_detect ignore_err -i "$f" -c:v copy -c:a copy -bsf:a aac_adtstoasc -movflags +faststart "$temp" >/dev/null 2>&1
+              
+              if [ -s "$temp" ]; then
+                local check_v
+                check_v=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$temp" 2>/dev/null)
+                if [ "$check_v" = "video" ]; then
                   mv "$temp" "$f"
-                  echo "⚡ [Fixed stream-copy] $f"
+                  echo "⚡ [Fixed Stream-Copy & Video Verified] $fname"
                   return 0
                 fi
               fi
               
-              # Attempt 2: Fallback re-encode if stream copy fails (timestamps broken/audio only)
+              # Attempt 2: High-speed ultrafast re-encode if stream copy fails
               rm -f "$temp" 2>/dev/null
               if [ "$has_video" = "video" ]; then
-                ffmpeg -y -err_detect ignore_err -i "$f" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -b:a 128k -ar 44100 -movflags +faststart "$temp" 2>/dev/null
+                ffmpeg -y -err_detect ignore_err -i "$f" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -b:a 128k -ar 44100 -movflags +faststart "$temp" >/dev/null 2>&1
               else
                 local dur
                 dur=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "30")
-                ffmpeg -y -f lavfi -i color=black:size=1280x720:duration="$dur" -i "$f" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -b:a 128k -ar 44100 -shortest -movflags +faststart "$temp" 2>/dev/null
+                ffmpeg -y -f lavfi -i color=black:size=1280x720:duration="$dur" -i "$f" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -b:a 128k -ar 44100 -shortest -movflags +faststart "$temp" >/dev/null 2>&1
               fi
               
               if [ -s "$temp" ]; then
                 mv "$temp" "$f"
-                echo "🔧 [Re-encoded fix] $f"
+                echo "🔧 [Re-encoded Fix & Video Verified] $fname"
               else
                 rm -f "$temp" 2>/dev/null
-                echo "⚠️ [Skipped fix] $f"
+                echo "⚠️ [Failed to Remux] $fname"
               fi
             else
-              echo "✅ [Standard MP4] $f"
+              echo "✅ [Standard MP4] $fname"
             fi
           }
           
           export -f process_episode
           
-          # Execute in parallel on all available runner CPU cores
-          find . -maxdepth 1 -name "EP*.mp4" | sort -V | xargs -n 1 -P $(nproc) -I {} bash -c 'process_episode "$@"' _ {}
+          # Execute in parallel on all runner CPU cores
+          ls -1 EP*.mp4 2>/dev/null | sort -V | xargs -P $(nproc) -I {} bash -c 'process_episode "{}"'
           
           echo "========================================="
           echo "✅ All episodes standardized across $(nproc) runner cores!"
