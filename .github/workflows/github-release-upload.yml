@@ -683,46 +683,65 @@ jobs:
           import sys
           
           def get_episode_specs(file_path):
-              """Get video and audio specs for an episode"""
+              """Get video and audio specs for an episode using ffprobe"""
               try:
-                  # Video specs
+                  # Get all stream info with ffprobe
                   cmd = [
                       "ffprobe", "-v", "error",
-                      "-show_entries", "stream=width,height,codec_name,pix_fmt,sample_aspect_ratio",
+                      "-show_entries", 
+                      "stream=index,codec_type,width,height,codec_name,pix_fmt,sample_rate,channels,channel_layout",
                       "-of", "json",
                       file_path
                   ]
                   result = subprocess.check_output(cmd, text=True)
                   data = json.loads(result)
                   
-                  width, height, vcodec, pix_fmt = 0, 0, "unknown", "unknown"
+                  # Initialize values
+                  width, height = 0, 0
+                  vcodec, pix_fmt = "unknown", "unknown"
+                  sample_rate, channels = 0, 0
+                  acodec = "unknown"
+                  
+                  # Find video and audio streams
+                  video_stream = None
+                  audio_stream = None
                   
                   for stream in data.get('streams', []):
-                      if stream.get('codec_type') == 'video':
-                          width = int(stream.get('width', 0))
-                          height = int(stream.get('height', 0))
-                          vcodec = stream.get('codec_name', 'unknown')
-                          pix_fmt = stream.get('pix_fmt', 'unknown')
-                          break
+                      codec_type = stream.get('codec_type', '')
+                      if codec_type == 'video' and video_stream is None:
+                          video_stream = stream
+                      elif codec_type == 'audio' and audio_stream is None:
+                          audio_stream = stream
                   
-                  # Audio specs
-                  cmd = [
-                      "ffprobe", "-v", "error",
-                      "-show_entries", "stream=sample_rate,channels,codec_name",
-                      "-of", "json",
-                      file_path
-                  ]
-                  result = subprocess.check_output(cmd, text=True)
-                  data = json.loads(result)
+                  # Extract video specs
+                  if video_stream:
+                      width = int(video_stream.get('width', 0))
+                      height = int(video_stream.get('height', 0))
+                      vcodec = video_stream.get('codec_name', 'unknown')
+                      pix_fmt = video_stream.get('pix_fmt', 'unknown')
+                  else:
+                      # Try to find any video stream (fallback)
+                      for stream in data.get('streams', []):
+                          if stream.get('codec_type') == 'video':
+                              width = int(stream.get('width', 0))
+                              height = int(stream.get('height', 0))
+                              vcodec = stream.get('codec_name', 'unknown')
+                              pix_fmt = stream.get('pix_fmt', 'unknown')
+                              break
                   
-                  sample_rate, channels, acodec = 0, 0, "unknown"
-                  
-                  for stream in data.get('streams', []):
-                      if stream.get('codec_type') == 'audio':
-                          sample_rate = int(stream.get('sample_rate', 0))
-                          channels = int(stream.get('channels', 0))
-                          acodec = stream.get('codec_name', 'unknown')
-                          break
+                  # Extract audio specs
+                  if audio_stream:
+                      sample_rate = int(audio_stream.get('sample_rate', 0))
+                      channels = int(audio_stream.get('channels', 0))
+                      acodec = audio_stream.get('codec_name', 'unknown')
+                  else:
+                      # Try to find any audio stream (fallback)
+                      for stream in data.get('streams', []):
+                          if stream.get('codec_type') == 'audio':
+                              sample_rate = int(stream.get('sample_rate', 0))
+                              channels = int(stream.get('channels', 0))
+                              acodec = stream.get('codec_name', 'unknown')
+                              break
                   
                   return {
                       'width': width,
@@ -752,8 +771,6 @@ jobs:
           
           # Analyze each episode
           all_specs = []
-          video_specs = []
-          audio_specs = []
           resolutions = []
           video_codecs = []
           audio_codecs = []
@@ -766,8 +783,6 @@ jobs:
               if specs:
                   specs['file'] = f
                   all_specs.append(specs)
-                  video_specs.append(specs['video_spec'])
-                  audio_specs.append(specs['audio_spec'])
                   resolutions.append(specs['resolution'])
                   video_codecs.append(specs['vcodec'])
                   audio_codecs.append(specs['acodec'])
@@ -775,10 +790,22 @@ jobs:
                   channels_list.append(specs['channels'])
                   pix_formats.append(specs['pix_fmt'])
                   
-                  print(f"📹 {f}: {specs['resolution']} {specs['vcodec']} {specs['pix_fmt']} | {specs['sample_rate']}Hz {specs['channels']}ch {specs['acodec']}")
+                  print(f"📹 {f}:")
+                  print(f"   Resolution: {specs['resolution']}")
+                  print(f"   Video Codec: {specs['vcodec']}")
+                  print(f"   Pixel Format: {specs['pix_fmt']}")
+                  print(f"   Audio Sample Rate: {specs['sample_rate']}Hz")
+                  print(f"   Audio Channels: {specs['channels']}ch")
+                  print(f"   Audio Codec: {specs['acodec']}")
+                  print("")
+              else:
+                  print(f"⚠️ Could not analyze {f}")
+          
+          if not all_specs:
+              print("❌ No valid episode specs found!")
+              sys.exit(1)
           
           # Find the most common specs
-          print("")
           print("=========================================")
           print("📊 MAJORITY ANALYSIS")
           print("=========================================")
@@ -824,21 +851,14 @@ jobs:
           channels = most_common_ch[0]
           acodec = most_common_acodec[0]
           
-          # Write standards to file for next steps
-          with open('standard_specs.txt', 'w') as f:
-              f.write(f"WIDTH={width}\n")
-              f.write(f"HEIGHT={height}\n")
-              f.write(f"VIDEO_CODEC={vcodec}\n")
-              f.write(f"PIX_FMT={pix_fmt}\n")
-              f.write(f"AUDIO_SAMPLE_RATE={sample_rate}\n")
-              f.write(f"AUDIO_CHANNELS={channels}\n")
-              f.write(f"AUDIO_CODEC={acodec}\n")
-              f.write(f"RESOLUTION={width}x{height}\n")
-          
           print("=========================================")
           print("✅ TARGET STANDARDS DETERMINED:")
-          print(f"   Video: {width}x{height} {vcodec} {pix_fmt}")
-          print(f"   Audio: {sample_rate}Hz {channels}ch {acodec}")
+          print(f"   Resolution: {width}x{height}")
+          print(f"   Video Codec: {vcodec}")
+          print(f"   Pixel Format: {pix_fmt}")
+          print(f"   Audio Sample Rate: {sample_rate}Hz")
+          print(f"   Audio Channels: {channels}ch")
+          print(f"   Audio Codec: {acodec}")
           print("=========================================")
           
           # Check which episodes need conversion
@@ -860,32 +880,72 @@ jobs:
           if len(needs_conversion) == 0:
               print("✅ ALL episodes already match the majority standard!")
           
+          # Write standards to file for next steps
+          with open('standard_specs.txt', 'w') as f:
+              f.write(f"WIDTH={width}\n")
+              f.write(f"HEIGHT={height}\n")
+              f.write(f"VIDEO_CODEC={vcodec}\n")
+              f.write(f"PIX_FMT={pix_fmt}\n")
+              f.write(f"AUDIO_SAMPLE_RATE={sample_rate}\n")
+              f.write(f"AUDIO_CHANNELS={channels}\n")
+              f.write(f"AUDIO_CODEC={acodec}\n")
+              f.write(f"RESOLUTION={width}x{height}\n")
+          
+          # Write to GitHub outputs
+          github_output = os.environ.get('GITHUB_OUTPUT')
+          if github_output:
+              with open(github_output, 'a') as f:
+                  f.write(f"width={width}\n")
+                  f.write(f"height={height}\n")
+                  f.write(f"video_codec={vcodec}\n")
+                  f.write(f"pix_fmt={pix_fmt}\n")
+                  f.write(f"audio_sample_rate={sample_rate}\n")
+                  f.write(f"audio_channels={channels}\n")
+                  f.write(f"audio_codec={acodec}\n")
+                  f.write(f"resolution={width}x{height}\n")
+          
+          # Also write a summary for debugging
+          with open('specs_summary.txt', 'w') as f:
+              f.write("EPISODE SPECS SUMMARY:\n")
+              f.write("=" * 50 + "\n")
+              for specs in all_specs:
+                  f.write(f"\n{specs['file']}:\n")
+                  f.write(f"  Resolution: {specs['resolution']}\n")
+                  f.write(f"  Video Codec: {specs['vcodec']}\n")
+                  f.write(f"  Pixel Format: {specs['pix_fmt']}\n")
+                  f.write(f"  Audio Sample Rate: {specs['sample_rate']}Hz\n")
+                  f.write(f"  Audio Channels: {specs['channels']}ch\n")
+                  f.write(f"  Audio Codec: {specs['acodec']}\n")
+          
           sys.exit(0)
           EOFANALYZE
           
           python3 analyze_specs.py
           
-          # Load the standard specs for later use
+          # Display the specs summary for debugging
+          if [ -f "specs_summary.txt" ]; then
+            echo ""
+            echo "========================================="
+            echo "📋 EPISODE SPECS SUMMARY:"
+            echo "========================================="
+            cat specs_summary.txt
+            echo "========================================="
+          fi
+          
+          # Load the standard specs
           if [ -f "standard_specs.txt" ]; then
-            source standard_specs.txt
-            echo "STANDARD_WIDTH=$WIDTH" >> $GITHUB_ENV
-            echo "STANDARD_HEIGHT=$HEIGHT" >> $GITHUB_ENV
-            echo "STANDARD_VIDEO_CODEC=$VIDEO_CODEC" >> $GITHUB_ENV
-            echo "STANDARD_PIX_FMT=$PIX_FMT" >> $GITHUB_ENV
-            echo "STANDARD_AUDIO_SAMPLE_RATE=$AUDIO_SAMPLE_RATE" >> $GITHUB_ENV
-            echo "STANDARD_AUDIO_CHANNELS=$AUDIO_CHANNELS" >> $GITHUB_ENV
-            echo "STANDARD_AUDIO_CODEC=$AUDIO_CODEC" >> $GITHUB_ENV
-            echo "STANDARD_RESOLUTION=$RESOLUTION" >> $GITHUB_ENV
+            echo ""
+            echo "📋 Standard specs file contents:"
+            cat standard_specs.txt
+            echo ""
             
-            echo "========================================="
-            echo "📋 STANDARD SPECS LOADED:"
-            echo "   Resolution: ${WIDTH}x${HEIGHT}"
-            echo "   Video Codec: ${VIDEO_CODEC}"
-            echo "   Pixel Format: ${PIX_FMT}"
-            echo "   Audio Sample Rate: ${AUDIO_SAMPLE_RATE}Hz"
-            echo "   Audio Channels: ${AUDIO_CHANNELS}ch"
-            echo "   Audio Codec: ${AUDIO_CODEC}"
-            echo "========================================="
+            # Source the file to verify variables
+            source standard_specs.txt
+            echo "✅ Verified: WIDTH=$WIDTH, HEIGHT=$HEIGHT"
+            echo "✅ Verified: VIDEO_CODEC=$VIDEO_CODEC"
+            echo "✅ Verified: AUDIO_SAMPLE_RATE=$AUDIO_SAMPLE_RATE"
+            echo "✅ Verified: AUDIO_CHANNELS=$AUDIO_CHANNELS"
+            echo "✅ Verified: AUDIO_CODEC=$AUDIO_CODEC"
           else
             echo "❌ Failed to generate standard specs!"
             exit 1
@@ -895,23 +955,73 @@ jobs:
         timeout-minutes: 120
         env:
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
-          TARGET_WIDTH: ${{ env.STANDARD_WIDTH }}
-          TARGET_HEIGHT: ${{ env.STANDARD_HEIGHT }}
-          TARGET_VIDEO_CODEC: ${{ env.STANDARD_VIDEO_CODEC }}
-          TARGET_PIX_FMT: ${{ env.STANDARD_PIX_FMT }}
-          TARGET_AUDIO_SAMPLE_RATE: ${{ env.STANDARD_AUDIO_SAMPLE_RATE }}
-          TARGET_AUDIO_CHANNELS: ${{ env.STANDARD_AUDIO_CHANNELS }}
-          TARGET_AUDIO_CODEC: ${{ env.STANDARD_AUDIO_CODEC }}
         run: |
           cd downloads
+          
+          # Get standards from the analyze step outputs
+          TARGET_WIDTH="${{ steps.analyze.outputs.width }}"
+          TARGET_HEIGHT="${{ steps.analyze.outputs.height }}"
+          TARGET_VIDEO_CODEC="${{ steps.analyze.outputs.video_codec }}"
+          TARGET_PIX_FMT="${{ steps.analyze.outputs.pix_fmt }}"
+          TARGET_AUDIO_SAMPLE_RATE="${{ steps.analyze.outputs.audio_sample_rate }}"
+          TARGET_AUDIO_CHANNELS="${{ steps.analyze.outputs.audio_channels }}"
+          TARGET_AUDIO_CODEC="${{ steps.analyze.outputs.audio_codec }}"
+          TARGET_RESOLUTION="${{ steps.analyze.outputs.resolution }}"
           
           echo "========================================="
           echo "📐 STANDARDIZING EPISODES TO MAJORITY STANDARD"
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "🎯 Target Standard:"
+          echo "   Resolution: ${TARGET_RESOLUTION}"
           echo "   Video: ${TARGET_WIDTH}x${TARGET_HEIGHT} ${TARGET_VIDEO_CODEC} ${TARGET_PIX_FMT}"
           echo "   Audio: ${TARGET_AUDIO_SAMPLE_RATE}Hz ${TARGET_AUDIO_CHANNELS}ch ${TARGET_AUDIO_CODEC}"
+          echo "========================================="
+          
+          # Check if we have valid targets
+          if [ "$TARGET_WIDTH" = "0" ] || [ "$TARGET_HEIGHT" = "0" ] || [ -z "$TARGET_WIDTH" ] || [ -z "$TARGET_HEIGHT" ]; then
+            echo "❌ Invalid target standards detected!"
+            echo "   Width: '$TARGET_WIDTH'"
+            echo "   Height: '$TARGET_HEIGHT'"
+            echo "   This usually means the analyze step failed to detect video streams."
+            echo "   Please check the episode files for corruption."
+            exit 1
+          fi
+          
+          # Also check if the codec is valid
+          if [ "$TARGET_VIDEO_CODEC" = "unknown" ] || [ -z "$TARGET_VIDEO_CODEC" ]; then
+            echo "⚠️ Warning: Unknown video codec detected. Defaulting to libx264."
+            TARGET_VIDEO_CODEC="libx264"
+          fi
+          
+          if [ "$TARGET_AUDIO_CODEC" = "unknown" ] || [ -z "$TARGET_AUDIO_CODEC" ]; then
+            echo "⚠️ Warning: Unknown audio codec detected. Defaulting to aac."
+            TARGET_AUDIO_CODEC="aac"
+          fi
+          
+          if [ "$TARGET_AUDIO_SAMPLE_RATE" = "0" ] || [ -z "$TARGET_AUDIO_SAMPLE_RATE" ]; then
+            echo "⚠️ Warning: Unknown audio sample rate detected. Defaulting to 44100."
+            TARGET_AUDIO_SAMPLE_RATE="44100"
+          fi
+          
+          if [ "$TARGET_AUDIO_CHANNELS" = "0" ] || [ -z "$TARGET_AUDIO_CHANNELS" ]; then
+            echo "⚠️ Warning: Unknown audio channels detected. Defaulting to 2."
+            TARGET_AUDIO_CHANNELS="2"
+          fi
+          
+          if [ "$TARGET_PIX_FMT" = "unknown" ] || [ -z "$TARGET_PIX_FMT" ]; then
+            echo "⚠️ Warning: Unknown pixel format detected. Defaulting to yuv420p."
+            TARGET_PIX_FMT="yuv420p"
+          fi
+          
+          echo ""
+          echo "📋 Final Target Standards:"
+          echo "   Resolution: ${TARGET_WIDTH}x${TARGET_HEIGHT}"
+          echo "   Video Codec: ${TARGET_VIDEO_CODEC}"
+          echo "   Pixel Format: ${TARGET_PIX_FMT}"
+          echo "   Audio Sample Rate: ${TARGET_AUDIO_SAMPLE_RATE}Hz"
+          echo "   Audio Channels: ${TARGET_AUDIO_CHANNELS}ch"
+          echo "   Audio Codec: ${TARGET_AUDIO_CODEC}"
           echo "========================================="
           
           # Get list of all episodes sorted numerically
@@ -970,15 +1080,9 @@ jobs:
             TEMP_FILE="temp_${f}"
             rm -f "$TEMP_FILE" 2>/dev/null
             
-            # Determine if we need to handle different pixel formats
-            PIX_FILTER=""
-            if [ -n "$TARGET_PIX_FMT" ] && [ "$TARGET_PIX_FMT" != "unknown" ]; then
-              PIX_FILTER=",format=${TARGET_PIX_FMT}"
-            fi
-            
-            # Build FFmpeg command
+            # Build FFmpeg command with all target specs
             ffmpeg -y -i "$f" \
-              -vf "scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad=${TARGET_WIDTH}:${TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black${PIX_FILTER}" \
+              -vf "scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad=${TARGET_WIDTH}:${TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,format=${TARGET_PIX_FMT}" \
               -c:v "${TARGET_VIDEO_CODEC}" -preset veryfast -crf 23 \
               -c:a "${TARGET_AUDIO_CODEC}" -b:a 128k \
               -ar "${TARGET_AUDIO_SAMPLE_RATE}" \
