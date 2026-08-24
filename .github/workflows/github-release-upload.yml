@@ -15,6 +15,12 @@ permissions:
   actions: write
   contents: read
 
+# ⏳ Seconds to wait between each episode download.
+# Change the default here, or override per run by sending
+# "download_delay": <seconds> in the repository_dispatch payload.
+env:
+  DOWNLOAD_DELAY: 5
+
 jobs:
   upload:
     runs-on: ubuntu-latest
@@ -199,6 +205,14 @@ jobs:
           TOTAL_EPISODES=$(cat urls.txt | wc -l)
           EP_INDEX=1
           FAILED_DOWNLOADS=""
+
+          # Resolve inter-episode delay: payload override > workflow default
+          DELAY="${DOWNLOAD_DELAY:-30}"
+          PAYLOAD_DELAY="${{ github.event.client_payload.download_delay || '' }}"
+          if [ -n "$PAYLOAD_DELAY" ] && [[ "$PAYLOAD_DELAY" =~ ^[0-9]+$ ]]; then
+            DELAY="$PAYLOAD_DELAY"
+          fi
+          echo "⏳ Inter-episode delay: ${DELAY}s"
           
           # Store URLs in array for redownload if needed
           declare -a URL_ARRAY
@@ -569,6 +583,18 @@ jobs:
             
             # Clean up temp files
             rm -f "$TEMP_FILE" "$FIXED_FILE" 2>/dev/null
+            
+            # ────────────────────────────────────────────────
+            # ⏳ DELAY BETWEEN EPISODE DOWNLOADS
+            # If more episodes remain, pause before starting the
+            # next one so we don't hammer the server back-to-back.
+            # Configure via env.DOWNLOAD_DELAY or the 'download_delay'
+            # payload value. Set to 0 to disable.
+            # ────────────────────────────────────────────────
+            if [ "$EP_INDEX" -lt "$TOTAL_EPISODES" ] && [ "$DELAY" -gt 0 ] 2>/dev/null; then
+              echo "⏳ Waiting ${DELAY}s before downloading episode $((EP_INDEX + 1))/$TOTAL_EPISODES..."
+              sleep "$DELAY"
+            fi
             
             EP_INDEX=$((EP_INDEX + 1))
             echo ""
