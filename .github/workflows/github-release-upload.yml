@@ -234,12 +234,14 @@ jobs:
               echo "📺 HLS STREAM DETECTED - Using yt-dlp"
               
               # Use yt-dlp for HLS streams with proper format selection
+              # NOTE: --hls-use-mpegts intentionally removed. The native HLS path
+              # (m3u8_native) writes a proper fragmented MP4. Forcing MPEG-TS into an
+              # .mp4 is what caused "video track not detected".
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
                 -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best" \
                 --merge-output-format mp4 \
-                --hls-use-mpegts \
                 --no-progress \
                 --no-warnings \
                 --quiet \
@@ -434,7 +436,6 @@ jobs:
                   --impersonate chrome \
                   -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best" \
                   --merge-output-format mp4 \
-                  --hls-use-mpegts \
                   --no-progress \
                   --no-warnings \
                   --quiet \
@@ -463,12 +464,14 @@ jobs:
               
               rm -f "$OUT_FILE" 2>/dev/null
               
+              # Kept: with an external downloader, TS is written. --remux-video mp4
+              # converts TS -> MP4 after download so the output stays a real MP4.
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
                 -f "bestvideo+bestaudio/best" \
                 --merge-output-format mp4 \
-                --hls-use-mpegts \
+                --remux-video mp4 \
                 --external-downloader aria2c \
                 --external-downloader-args "-x 16 -s 16 -k 1M" \
                 --no-progress \
@@ -544,10 +547,13 @@ jobs:
               echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FINAL_SIZE_MB}MB)"
               
               # Quick verify with mediainfo
-              if mediainfo "$OUT_FILE" 2>/dev/null | grep -q "Video"; then
-                echo "   📹 Video track confirmed"
+              # Use ffprobe for the definitive check (mediainfo parses MPEG-TS
+              # correctly even when the file is TS-in-MP4, so it can misreport)
+              HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+              if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                echo "   📹 Video track confirmed (ffprobe)"
               else
-                echo "   ⚠️ Video track not detected by mediainfo"
+                echo "   ⚠️ Video track not detected (ffprobe)"
               fi
               
               if mediainfo "$OUT_FILE" 2>/dev/null | grep -q "Audio"; then
@@ -978,6 +984,7 @@ jobs:
                 # Redownload with yt-dlp specifically to ensure video+audio
                 yt-dlp --extractor-args "generic:impersonate" --impersonate chrome \
                   -f "bestvideo+bestaudio/best" \
+                  --merge-output-format mp4 \
                   --no-progress --no-warnings \
                   -o "$FILE" "$URL" < /dev/null 2>&1
                 
