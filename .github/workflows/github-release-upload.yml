@@ -2395,7 +2395,7 @@ jobs:
 
       - name: Wait for All Uploads with Enhanced Progress Monitoring
         if: steps.verify.outputs.verify_success == 'true'
-        timeout-minutes: 30
+        timeout-minutes: 240
         run: |
           cd downloads
           
