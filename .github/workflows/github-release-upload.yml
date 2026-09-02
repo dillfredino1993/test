@@ -19,7 +19,7 @@ permissions:
 # Change the default here, or override per run by sending
 # "download_delay": <seconds> in the repository_dispatch payload.
 env:
-  DOWNLOAD_DELAY: 5
+  DOWNLOAD_DELAY: 10
 
 jobs:
   upload:
