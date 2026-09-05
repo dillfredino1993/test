@@ -137,7 +137,12 @@ jobs:
           CLEAN_SERIES_TITLE=$(echo "$SERIES" | sed -e 's/[\/:*?"<>|]/_/g' -e 's/^ *//' -e 's/ *$//')
           CLEAN_SERIES_TAG=$(echo "$CLEAN_SERIES_TITLE" | tr ' ' '_')
           
-          DATE_STR=$(date +'%Y-%m-%d')
+          # Use telegram date for the title/date (fallback to today's date if blank)
+          TELEGRAM_DATE="${{ github.event.client_payload.telegramdate }}"
+          if [ -z "$TELEGRAM_DATE" ] || [ "$TELEGRAM_DATE" = "null" ]; then
+            TELEGRAM_DATE=$(date +'%Y-%m-%d')
+          fi
+          DATE_STR="${TELEGRAM_DATE}"
           
           TAG_NAME="${DATE_STR}-${CLEAN_LABEL}-${CLEAN_SERIES_TAG}"
           FORMATTED_TITLE="[${DATE_STR}]-[${CLEAN_LABEL}]-${CLEAN_SERIES_TITLE}"
@@ -150,6 +155,52 @@ jobs:
           echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
           echo "series_title=${CLEAN_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "clean_label=${CLEAN_LABEL}" >> $GITHUB_OUTPUT
+
+      - name: 📋 Extract Payload Fields (Telegram Date, Provider, Description, Poster)
+        id: payload
+        run: |
+          echo "========================================="
+          echo "📋 EXTRACTING PAYLOAD FIELDS"
+          echo "========================================="
+          
+          # Telegram date (default to today's date)
+          TELEGRAM_DATE="${{ github.event.client_payload.telegramdate }}"
+          if [ -z "$TELEGRAM_DATE" ] || [ "$TELEGRAM_DATE" = "null" ]; then
+            TELEGRAM_DATE=$(date +'%Y-%m-%d')
+          fi
+          echo "📅 Telegram Date: $TELEGRAM_DATE"
+          
+          # Series provider (default to N/A)
+          SERIES_PROVIDER="${{ github.event.client_payload.series_provider }}"
+          if [ -z "$SERIES_PROVIDER" ] || [ "$SERIES_PROVIDER" = "null" ]; then
+            SERIES_PROVIDER="N/A"
+          fi
+          echo "🏢 Series Provider: $SERIES_PROVIDER"
+          
+          # Series description (default to N/A)
+          SERIES_DESCRIPTION="${{ github.event.client_payload.series_description }}"
+          if [ -z "$SERIES_DESCRIPTION" ] || [ "$SERIES_DESCRIPTION" = "null" ]; then
+            SERIES_DESCRIPTION="N/A"
+          fi
+          echo "📝 Series Description: $SERIES_DESCRIPTION"
+          
+          # Poster URL (can be blank; if blank, skip poster entirely)
+          POSTER_URL="${{ github.event.client_payload.poster_url }}"
+          echo "🖼️ Poster URL: $POSTER_URL"
+          
+          # Provider tag for hashtags: strip non-alphanumerics, uppercase
+          PROVIDER_TAG=$(echo "$SERIES_PROVIDER" | sed -e 's/[^a-zA-Z0-9]//g' | tr '[:lower:]' '[:upper:]')
+          if [ -z "$PROVIDER_TAG" ]; then
+            PROVIDER_TAG="N/A"
+          fi
+          echo "🏷️  Provider Tag: $PROVIDER_TAG"
+          echo "========================================="
+          
+          echo "telegram_date=${TELEGRAM_DATE}" >> $GITHUB_OUTPUT
+          echo "series_provider=${SERIES_PROVIDER}" >> $GITHUB_OUTPUT
+          echo "series_description=${SERIES_DESCRIPTION}" >> $GITHUB_OUTPUT
+          echo "poster_url=${POSTER_URL}" >> $GITHUB_OUTPUT
+          echo "provider_tag=${PROVIDER_TAG}" >> $GITHUB_OUTPUT
 
       - name: Parse URLs with jq (Clean & Uncorrupted)
         env:
@@ -1569,6 +1620,26 @@ jobs:
             fi
           fi
 
+      - name: 📥 Download Poster (for Telegram Uploads)
+        if: steps.verify.outputs.verify_success == 'true' && steps.payload.outputs.poster_url != ''
+        env:
+          POSTER_URL: ${{ steps.payload.outputs.poster_url }}
+        run: |
+          cd downloads
+          if [ -n "$POSTER_URL" ] && curl -f -sSL --connect-timeout 20 --max-time 120 -o poster.jpg "$POSTER_URL"; then
+            if file poster.jpg | grep -qiE 'image|jpeg|png|webp'; then
+              echo "✅ Poster downloaded: $(stat -c%s poster.jpg) bytes"
+              echo "poster_path=$(pwd)/poster.jpg" >> $GITHUB_ENV
+            else
+              echo "⚠️ Downloaded file is not an image, removing"
+              rm -f poster.jpg
+              echo "poster_path=" >> $GITHUB_ENV
+            fi
+          else
+            echo "⚠️ Poster download failed or URL blank, skipping poster"
+            echo "poster_path=" >> $GITHUB_ENV
+          fi
+
       - name: Start Merged Upload (Background with Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
         env:
@@ -1582,6 +1653,11 @@ jobs:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
           LABEL: ${{ steps.fname.outputs.clean_label }}
+          TELEGRAM_DATE: ${{ steps.payload.outputs.telegram_date }}
+          SERIES_PROVIDER: ${{ steps.payload.outputs.series_provider }}
+          SERIES_DESCRIPTION: ${{ steps.payload.outputs.series_description }}
+          PROVIDER_TAG: ${{ steps.payload.outputs.provider_tag }}
+          POSTER_PATH: ${{ env.poster_path }}
         run: |
           cd downloads
           
@@ -1645,6 +1721,11 @@ jobs:
           title = os.environ.get("TITLE")
           series_title = os.environ.get("SERIES_TITLE", "Series")
           label = os.environ.get("LABEL", "NONE")
+          telegram_date = os.environ.get("TELEGRAM_DATE", datetime.date.today().strftime("%Y-%m-%d"))
+          series_provider = os.environ.get("SERIES_PROVIDER", "N/A")
+          series_description = os.environ.get("SERIES_DESCRIPTION", "N/A")
+          provider_tag = os.environ.get("PROVIDER_TAG", "N/A")
+          poster_path = os.environ.get("POSTER_PATH", "") or ""
 
           if not all([api_id, api_hash]):
               print("❌ Missing Telegram API credentials.")
@@ -1781,7 +1862,7 @@ jobs:
                   print(f"❌ Upload failed: {e}")
                   raise
 
-          async def send_file_with_thumb(client, entity, file_path, caption):
+          async def send_file_with_thumb(client, entity, file_path, caption, poster_path=None):
               if not os.path.exists(file_path):
                   print(f"❌ File not found: {file_path}")
                   return False, None
@@ -1831,10 +1912,46 @@ jobs:
                   kwargs["thumb"] = thumb
                   print(f"📸 Using thumbnail: {thumb}")
               
+              # Upload poster together with the video as a media group (album)
+              use_poster = False
+              if poster_path and os.path.isfile(poster_path):
+                  print(f"🖼️ Poster found, uploading as album: {poster_path}")
+                  use_poster = True
+                  try:
+                      uploaded_poster = await fast_upload_file(
+                          client=client,
+                          file_path=poster_path,
+                          progress_callback=None
+                      )
+                      if uploaded_poster is None:
+                          print("⚠️ Poster upload failed, continuing with video only")
+                          use_poster = False
+                  except Exception as e:
+                      print(f"⚠️ Poster upload failed: {e}, continuing with video only")
+                      use_poster = False
+              
               try:
-                  result = await client.send_file(**kwargs)
-                  print("✅ File sent to Telegram Channel!")
-                  return True, result
+                  if use_poster:
+                      try:
+                          result = await client.send_file(
+                              entity=entity,
+                              file=[uploaded_poster, uploaded_file],
+                              caption=caption,
+                              supports_streaming=True,
+                              force_document=False,
+                              allow_cache=True
+                          )
+                          print("✅ Poster + Video sent to Telegram Channel (album)!")
+                          return True, result
+                      except Exception as e:
+                          print(f"⚠️ Album send failed ({e}), falling back to video only")
+                          result = await client.send_file(**kwargs)
+                          print("✅ File sent to Telegram Channel!")
+                          return True, result
+                  else:
+                      result = await client.send_file(**kwargs)
+                      print("✅ File sent to Telegram Channel!")
+                      return True, result
               except Exception as e:
                   print(f"❌ Send failed: {e}")
                   if "thumb" in kwargs:
@@ -1879,18 +1996,31 @@ jobs:
               
               now = datetime.datetime.now()
               month_year = now.strftime("%B%Y").upper()
+              if telegram_date:
+                  try:
+                      tg_dt = datetime.datetime.strptime(str(telegram_date).strip(), "%Y-%m-%d")
+                      month_year = tg_dt.strftime("%B%Y").upper()
+                      day_suffix = tg_dt.strftime("%d").lstrip('0')
+                  except ValueError:
+                      day_suffix = now.strftime("%d").lstrip('0')
+              else:
+                  day_suffix = now.strftime("%d").lstrip('0')
               
               clean_label = str(label).upper().replace("-", "").replace(" ", "").replace("_", "")
               if clean_label == "NONE" or clean_label == "":
                   clean_label = "NONE"
               
-              caption = f"{title}\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}"
+              provider_clean = str(provider_tag).upper().replace("-", "").replace(" ", "").replace("_", "")
+              if provider_clean == "NONE" or provider_clean == "":
+                  provider_clean = "N/A"
+              
+              caption = f"📺 {title}\n👤 {series_provider}\n📝 {series_description}\n\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}\n#{provider_clean}"
               
               print(f"📤 Uploading merged video to channel...")
               print(f"📝 Caption: {caption[:50]}...")
               
               try:
-                  success, result = await send_file_with_thumb(client, entity, video_path, caption)
+                  success, result = await send_file_with_thumb(client, entity, video_path, caption, poster_path=poster_path)
                   if success:
                       print("✅ Merged video successfully posted to channel!")
                       return True
@@ -1898,7 +2028,7 @@ jobs:
               except FloodWaitError as e:
                   print(f"⏳ Rate limited: waiting {e.seconds}s")
                   await asyncio.sleep(e.seconds)
-                  return await send_file_with_thumb(client, entity, video_path, caption)
+                  return await send_file_with_thumb(client, entity, video_path, caption, poster_path=poster_path)
               except Exception as e:
                   print(f"❌ Merged upload failed: {e}")
                   traceback.print_exc()
@@ -1960,6 +2090,11 @@ jobs:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
           LABEL: ${{ steps.fname.outputs.clean_label }}
+          TELEGRAM_DATE: ${{ steps.payload.outputs.telegram_date }}
+          SERIES_PROVIDER: ${{ steps.payload.outputs.series_provider }}
+          SERIES_DESCRIPTION: ${{ steps.payload.outputs.series_description }}
+          PROVIDER_TAG: ${{ steps.payload.outputs.provider_tag }}
+          POSTER_PATH: ${{ env.poster_path }}
         run: |
           cd downloads
           
@@ -2012,6 +2147,11 @@ jobs:
           title = os.environ.get("TITLE")
           series_title = os.environ.get("SERIES_TITLE", "Series")
           label = os.environ.get("LABEL", "NONE")
+          telegram_date = os.environ.get("TELEGRAM_DATE", datetime.date.today().strftime("%Y-%m-%d"))
+          series_provider = os.environ.get("SERIES_PROVIDER", "N/A")
+          series_description = os.environ.get("SERIES_DESCRIPTION", "N/A")
+          provider_tag = os.environ.get("PROVIDER_TAG", "N/A")
+          poster_path = os.environ.get("POSTER_PATH", "") or ""
 
           if not all([api_id, api_hash]):
               print("❌ Missing Telegram API credentials.")
@@ -2300,6 +2440,22 @@ jobs:
               print(f"📊 Found {len(ep_files)} episodes to upload to topic {topic_id}")
               count = 0
               
+              # 📌 Post the poster + series info message in the topic first (if poster available)
+              if topic_id and poster_path and os.path.isfile(poster_path):
+                  poster_caption = f"📺 {series_title}\n👤 {series_provider}\n📝 {series_description}"
+                  print(f"🖼️ Posting poster with series info into topic...")
+                  try:
+                      await client.send_file(
+                          entity=entity,
+                          file=poster_path,
+                          caption=poster_caption,
+                          reply_to=topic_id
+                      )
+                      print("✅ Poster + series info posted into topic")
+                  except Exception as e:
+                      print(f"⚠️ Poster post failed: {e}")
+                  await asyncio.sleep(2)
+              
               for ep_file in ep_files:
                   ep_match = re.search(r'EP(\d+)\.mp4', ep_file)
                   if not ep_match:
@@ -2315,6 +2471,13 @@ jobs:
                       print(f"⚠️ Episode {ep_num} exceeds 2GB! Skipping.")
                       continue
                   
+                  if tg_dt:
+                      hashtag_month = tg_dt.strftime("%B%Y").upper()
+                      hashtag_day = tg_dt.strftime("%d").lstrip('0')
+                  else:
+                      nowd = datetime.datetime.now()
+                      hashtag_month = nowd.strftime("%B%Y").upper()
+                      hashtag_day = nowd.strftime("%d").lstrip('0')
                   caption = f"📺 Episode {ep_num}"
                   print(f"📤 Uploading Episode {ep_num} ({file_size:.1f} MB)...")
                   
