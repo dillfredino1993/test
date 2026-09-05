@@ -2471,13 +2471,6 @@ jobs:
                       print(f"⚠️ Episode {ep_num} exceeds 2GB! Skipping.")
                       continue
                   
-                  if tg_dt:
-                      hashtag_month = tg_dt.strftime("%B%Y").upper()
-                      hashtag_day = tg_dt.strftime("%d").lstrip('0')
-                  else:
-                      nowd = datetime.datetime.now()
-                      hashtag_month = nowd.strftime("%B%Y").upper()
-                      hashtag_day = nowd.strftime("%d").lstrip('0')
                   caption = f"📺 Episode {ep_num}"
                   print(f"📤 Uploading Episode {ep_num} ({file_size:.1f} MB)...")
                   
