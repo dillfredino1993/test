@@ -319,10 +319,8 @@ jobs:
             echo "⬇️  Downloading episode $episode with yt-dlp..."
             
             # Try multiple format strategies in order of preference
-            # Strategy 1: Best video + best audio, preferring MP4 containers
-            # This picks the highest resolution available
             local format_selectors=(
-              "bestvideo[ext=mp4][height>=?]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
+              "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
               "bestvideo+bestaudio/best"
               "best[ext=mp4]/best"
             )
@@ -345,26 +343,65 @@ jobs:
                   --retries 5 \
                   --fragment-retries 5 \
                   -o "$output" \
-                  "$url" 2>&1 | grep -E "(Downloading|Merging|file size|Destination|height|[0-9]+x[0-9]+)" || true
+                  "$url" 2>&1 | grep -E "(Downloading|Merging|file size|Destination|height|[0-9]+x[0-9]+|format)" || true
                 
                 if [ ${PIPESTATUS[0]} -eq 0 ] && [ -f "$output" ] && [ -s "$output" ]; then
                   success=true
+                  echo "✅ Download successful with format: $format_selector"
                 else
                   rm -f "$output" 2>/dev/null
                 fi
               fi
             done
             
-            # If all format strategies failed, try with aria2c external downloader
+            # If all format strategies failed, try with explicit quality selection
             if [ "$success" = false ]; then
-              echo "🔄 Trying with aria2c external downloader..."
+              echo "🔄 Trying with explicit quality selection..."
+              
+              local formats=$(yt-dlp --extractor-args "generic:impersonate" --impersonate chrome -F "$url" 2>/dev/null)
+              local best_video=$(echo "$formats" | grep -E "mp4.*[0-9]+x[0-9]+" | sort -t'x' -k2 -rn | head -1 | awk '{print $1}')
+              local best_audio=$(echo "$formats" | grep -E "m4a|aac|mp4a" | grep -v "video" | head -1 | awk '{print $1}')
+              
+              if [ -n "$best_video" ]; then
+                echo "🎯 Selected video format: $best_video"
+                if [ -n "$best_audio" ]; then
+                  echo "🎯 Selected audio format: $best_audio"
+                  local format_string="${best_video}+${best_audio}"
+                else
+                  local format_string="$best_video"
+                fi
+                
+                yt-dlp \
+                  --extractor-args "generic:impersonate" \
+                  --impersonate chrome \
+                  -f "$format_string" \
+                  --merge-output-format mp4 \
+                  --no-warnings \
+                  --progress \
+                  --newline \
+                  --geo-bypass \
+                  --no-check-certificates \
+                  --socket-timeout 300 \
+                  --retries 5 \
+                  --fragment-retries 5 \
+                  -o "$output" \
+                  "$url" 2>&1 | grep -E "(Downloading|Merging|file size|Destination)" || true
+                
+                if [ ${PIPESTATUS[0]} -eq 0 ] && [ -f "$output" ] && [ -s "$output" ]; then
+                  success=true
+                  echo "✅ Download successful with explicit quality selection"
+                fi
+              fi
+            fi
+            
+            # Final attempt: Use built-in best quality
+            if [ "$success" = false ]; then
+              echo "🔄 Final attempt: Using best quality fallback..."
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                -f "bestvideo+bestaudio/best" \
+                -f "best" \
                 --merge-output-format mp4 \
-                --external-downloader aria2c \
-                --external-downloader-args "-x 16 -s 16 -k 1M" \
                 --no-warnings \
                 --progress \
                 --newline \
@@ -378,12 +415,14 @@ jobs:
               
               if [ ${PIPESTATUS[0]} -eq 0 ] && [ -f "$output" ] && [ -s "$output" ]; then
                 success=true
+                echo "✅ Download successful with best quality fallback"
               fi
             fi
             
             if [ "$success" = true ]; then
               return 0
             else
+              echo "❌ All download attempts failed"
               return 1
             fi
           }
@@ -425,13 +464,10 @@ jobs:
             
             DOWNLOAD_SUCCESS=false
             
-            # ------------------------------------------------------------
             # CHECK URL TYPE: HLS/m3u8 OR DIRECT VIDEO
-            # ------------------------------------------------------------
             if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *".m3u"* ]] || [[ "$URL" == *"master.m3u8"* ]]; then
               echo "📺 HLS STREAM DETECTED - Selecting highest quality"
               
-              # Try yt-dlp with quality selection
               if download_with_ytdlp "$URL" "$OUT_FILE" "$EP_INDEX"; then
                 if check_file_validity "$OUT_FILE"; then
                   DOWNLOAD_SUCCESS=true
@@ -442,7 +478,6 @@ jobs:
                 fi
               fi
               
-              # If yt-dlp failed, try aria2c
               if [ "$DOWNLOAD_SUCCESS" != true ]; then
                 echo "🔄 Trying aria2c fallback for HLS..."
                 if download_with_aria2c "$URL" "$OUT_FILE" "$EP_INDEX"; then
@@ -456,12 +491,8 @@ jobs:
               fi
               
             else
-              # ------------------------------------------------------------
-              # DIRECT VIDEO URL
-              # ------------------------------------------------------------
               echo "🎬 DIRECT VIDEO DETECTED"
               
-              # Try aria2c first (faster for direct downloads)
               if download_with_aria2c "$URL" "$OUT_FILE" "$EP_INDEX"; then
                 if check_file_validity "$OUT_FILE"; then
                   DOWNLOAD_SUCCESS=true
@@ -472,7 +503,6 @@ jobs:
                 fi
               fi
               
-              # If aria2c failed, try yt-dlp
               if [ "$DOWNLOAD_SUCCESS" != true ]; then
                 echo "🔄 Trying yt-dlp fallback..."
                 if download_with_ytdlp "$URL" "$OUT_FILE" "$EP_INDEX"; then
@@ -486,38 +516,7 @@ jobs:
               fi
             fi
             
-            # ------------------------------------------------------------
-            # ULTIMATE FALLBACK: yt-dlp with aria2c external
-            # ------------------------------------------------------------
-            if [ "$DOWNLOAD_SUCCESS" != true ]; then
-              echo "🔄 Trying ultimate fallback: yt-dlp with aria2c..."
-              rm -f "$OUT_FILE" 2>/dev/null
-              
-              yt-dlp \
-                --extractor-args "generic:impersonate" \
-                --impersonate chrome \
-                -f "bestvideo+bestaudio/best" \
-                --merge-output-format mp4 \
-                --remux-video mp4 \
-                --external-downloader aria2c \
-                --external-downloader-args "-x 16 -s 16 -k 1M" \
-                --no-progress \
-                --no-warnings \
-                --geo-bypass \
-                -o "$OUT_FILE" \
-                "$URL" 2>&1 | grep -E "(Merging|Destination)" || true
-              
-              if check_file_validity "$OUT_FILE"; then
-                DOWNLOAD_SUCCESS=true
-                echo "✅ Download with yt-dlp+aria2c successful"
-              else
-                rm -f "$OUT_FILE" 2>/dev/null
-              fi
-            fi
-            
-            # ------------------------------------------------------------
             # FINAL VERIFICATION
-            # ------------------------------------------------------------
             if [ "$DOWNLOAD_SUCCESS" = true ] && [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
               FINAL_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
               FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
@@ -531,9 +530,7 @@ jobs:
             # Clean up temp files
             rm -f "$TEMP_FILE" "$FIXED_FILE" 2>/dev/null
             
-            # ────────────────────────────────────────────────
-            # ⏳ DELAY BETWEEN EPISODE DOWNLOADS
-            # ────────────────────────────────────────────────
+            # DELAY BETWEEN EPISODE DOWNLOADS
             if [ "$EP_INDEX" -lt "$TOTAL_EPISODES" ] && [ "$DELAY" -gt 0 ] 2>/dev/null; then
               echo "⏳ Waiting ${DELAY}s before next episode..."
               sleep "$DELAY"
@@ -549,7 +546,6 @@ jobs:
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Expected: $TOTAL_EPISODES episodes"
           
-          # Show detailed info for all downloaded files
           echo ""
           echo "📋 Downloaded files:"
           for f in EP*.mp4; do
@@ -594,7 +590,6 @@ jobs:
           echo "⚡ Using VERY FAST compression preset"
           echo "========================================="
           
-          # Create fast compression script
           cat > fast_compress.py << 'EOFCOMPRESS'
           import os
           import sys
@@ -604,7 +599,6 @@ jobs:
           import time
           
           def get_video_info(file_path):
-              """Get video duration, width, height using ffprobe"""
               try:
                   cmd = [
                       "ffprobe", "-v", "error",
@@ -630,10 +624,6 @@ jobs:
                   return 0, 1280, 720
           
           def compress_with_veryfast(file_path, target_size_mb=80):
-              """
-              Compress video using FFmpeg with VERY FAST preset
-              This prioritizes speed over compression efficiency
-              """
               print(f"  ⚡ Compressing with VERY FAST preset...")
               
               file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
@@ -643,11 +633,9 @@ jobs:
                   print(f"  ✅ File already under {target_size_mb}MB, skipping compression")
                   return True
               
-              # Get video info
               duration, width, height = get_video_info(file_path)
               print(f"  📊 Duration: {duration:.1f}s, Resolution: {width}x{height}")
               
-              # Calculate target bitrate for target size
               if duration > 0:
                   target_bitrate = (target_size_mb * 8 * 1024) / duration
                   target_bitrate = min(max(target_bitrate, 500), 2000)
@@ -659,7 +647,6 @@ jobs:
               base_name = os.path.splitext(file_path)[0]
               temp_file = f"{base_name}_fast.mp4"
               
-              # Use VERY FAST preset for maximum speed
               cmd = [
                   "ffmpeg", "-y",
                   "-i", file_path,
@@ -694,8 +681,6 @@ jobs:
                           return True
                       else:
                           print(f"  ⚠️ Still too large: {new_size_mb:.1f}MB")
-                          
-                          # Try even more aggressive compression
                           print(f"  🔄 Trying ULTRA FAST with higher CRF...")
                           temp_file2 = f"{base_name}_ultrafast.mp4"
                           
@@ -738,7 +723,6 @@ jobs:
                   print(f"  ❌ Compression error: {e}")
                   return False
               finally:
-                  # Cleanup temp files
                   for f in [temp_file, f"{base_name}_ultrafast.mp4"]:
                       if os.path.exists(f):
                           try: os.remove(f)
@@ -747,7 +731,6 @@ jobs:
               return False
           
           def process_episode(file_path, target_size_mb=80):
-              """Process episode with fast compression"""
               if not os.path.exists(file_path):
                   print(f"❌ File not found: {file_path}")
                   return False
@@ -766,7 +749,6 @@ jobs:
               sys.exit(0 if success else 1)
           EOFCOMPRESS
           
-          # Get list of all episodes
           EPISODE_FILES=$(ls -1 EP*.mp4 2>/dev/null)
           TOTAL_EPISODES=$(echo "$EPISODE_FILES" | wc -l)
           COMPRESSED_COUNT=0
@@ -786,11 +768,9 @@ jobs:
             if [ $FILE_SIZE_MB -gt 80 ]; then
               echo "⚠️  $f exceeds 80MB, compressing..."
               
-              # Add metadata before compression
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
               EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
               
-              # Compress with very fast preset
               if python3 fast_compress.py "$f" 80 < /dev/null; then
                 COMPRESSED_COUNT=$((COMPRESSED_COUNT + 1))
                 NEW_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
@@ -823,7 +803,6 @@ jobs:
           echo "✅ All episodes processed successfully!"
           echo "========================================="
           
-          # Show final file sizes
           echo ""
           echo "📊 Final episode sizes:"
           for f in EP*.mp4; do
@@ -871,7 +850,6 @@ jobs:
           
           echo "📊 Found $EP_COUNT episodes to merge"
           
-          # First, verify all files have video streams and redownload if needed
           echo "🔍 Checking all files for video streams..."
           NEEDS_REDOWNLOAD=false
           REDOWNLOAD_LIST=""
@@ -879,18 +857,15 @@ jobs:
           for f in EP*.mp4; do
             if [ ! -f "$f" ]; then continue; fi
             
-            # Check if file has video stream
             HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$f" 2>/dev/null)
             
             if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
               echo "⚠️ $f has no video stream!"
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
-              # Remove leading zeros for the list
               EP_NUM_CLEAN=$(echo "$EP_NUM" | sed 's/^0*//')
               REDOWNLOAD_LIST="$REDOWNLOAD_LIST $EP_NUM_CLEAN"
               NEEDS_REDOWNLOAD=true
             else
-              # Also check resolution
               WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null)
               HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null)
               
@@ -906,12 +881,10 @@ jobs:
             fi
           done
           
-          # Redownload episodes that need it
           if [ "$NEEDS_REDOWNLOAD" = true ]; then
             echo ""
             echo "🔄 Redownloading episodes with yt-dlp to ensure proper video..."
             
-            # Read URLs into array
             mapfile -t URL_ARRAY < urls.txt
             
             for EP_NUM_CLEAN in $REDOWNLOAD_LIST; do
@@ -925,10 +898,8 @@ jobs:
                 echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp..."
                 echo "📎 URL: $URL"
                 
-                # Remove the bad file
                 rm -f "$FILE"
                 
-                # Redownload with yt-dlp specifically to ensure video+audio
                 yt-dlp --extractor-args "generic:impersonate" --impersonate chrome \
                   -f "bestvideo+bestaudio/best" \
                   --merge-output-format mp4 \
@@ -936,7 +907,6 @@ jobs:
                   -o "$FILE" "$URL" < /dev/null 2>&1
                 
                 if [ -f "$FILE" ] && [ -s "$FILE" ]; then
-                  # Verify the new file has video
                   HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FILE" 2>/dev/null)
                   if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
                     echo "✅ Episode $EP_NUM_FORMATTED redownloaded successfully with video!"
@@ -944,7 +914,6 @@ jobs:
                     echo "❌ Redownloaded file still has no video for Episode $EP_NUM_FORMATTED"
                     echo "   Creating a blank video with audio instead..."
                     
-                    # Create a blank video with the audio from the file
                     DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FILE" 2>/dev/null || echo "30")
                     TEMP_FILE="EP${EP_NUM_FORMATTED}_temp.mp4"
                     
@@ -963,7 +932,6 @@ jobs:
                   fi
                 else
                   echo "❌ Redownload failed for Episode $EP_NUM_FORMATTED"
-                  # Try to create a video from what we have
                   DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FILE" 2>/dev/null || echo "30")
                   TEMP_FILE="EP${EP_NUM_FORMATTED}_temp.mp4"
                   
@@ -992,7 +960,6 @@ jobs:
           echo ""
           echo "🔍 Analyzing file properties with MediaInfo and ffprobe..."
           
-          # Use a more robust approach with ffprobe as fallback
           declare -A resolutions
           declare -A audio_sample_rates
           declare -A video_codecs
@@ -1001,10 +968,8 @@ jobs:
           
           for f in EP*.mp4; do
             if [ -f "$f" ]; then
-              # Try MediaInfo first
               res=$(mediainfo --Inform="Video;%Width%x%Height%" "$f" 2>/dev/null || echo "")
               
-              # If MediaInfo returns empty, try ffprobe
               if [ -z "$res" ] || [ "$res" = "0x0" ] || [ "$res" = "x" ]; then
                 width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null || echo "0")
                 height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null || echo "0")
@@ -1013,7 +978,6 @@ jobs:
                   res="${width}x${height}"
                   has_video["$f"]="true"
                 else
-                  # No video stream, use default resolution
                   res="0x0"
                   has_video["$f"]="false"
                 fi
@@ -1022,21 +986,18 @@ jobs:
               fi
               resolutions["$f"]="$res"
               
-              # Get audio sample rate
               sample_rate=$(mediainfo --Inform="Audio;%SamplingRate%" "$f" 2>/dev/null | tr -d ' ' | cut -d'/' -f1 | cut -d' ' -f1)
               if [ -z "$sample_rate" ] || [ "$sample_rate" = "0" ]; then
                 sample_rate=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$f" 2>/dev/null || echo "44100")
               fi
               audio_sample_rates["$f"]="$sample_rate"
               
-              # Get video codec
               video_codec=$(mediainfo --Inform="Video;%CodecID%" "$f" 2>/dev/null || echo "")
               if [ -z "$video_codec" ] || [ "$video_codec" = "unknown" ]; then
                 video_codec=$(mediainfo --Inform="Video;%Format%" "$f" 2>/dev/null || echo "")
               fi
               if [ -z "$video_codec" ] || [ "$video_codec" = "unknown" ]; then
                 video_codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "avc1")
-                # Convert codec name to codec ID format
                 if [ "$video_codec" = "h264" ]; then
                   video_codec="avc1"
                 elif [ "$video_codec" = "hevc" ]; then
@@ -1045,7 +1006,6 @@ jobs:
               fi
               video_codecs["$f"]="$video_codec"
               
-              # Get audio codec
               audio_codec=$(mediainfo --Inform="Audio;%Format%" "$f" 2>/dev/null || echo "")
               if [ -z "$audio_codec" ] || [ "$audio_codec" = "unknown" ]; then
                 audio_codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "AAC")
@@ -1061,7 +1021,6 @@ jobs:
             exit 1
           fi
           
-          # Determine target resolution from files with valid video
           VALID_RESOLUTIONS=""
           for f in "${!resolutions[@]}"; do
             res="${resolutions[$f]}"
@@ -1073,7 +1032,6 @@ jobs:
           if [ -n "$VALID_RESOLUTIONS" ]; then
             TARGET_RES=$(echo "$VALID_RESOLUTIONS" | tr ' ' '\n' | grep -v "0x0" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           else
-            # No valid resolutions found, use default
             TARGET_RES="720x1280"
           fi
           
@@ -1081,19 +1039,16 @@ jobs:
             TARGET_RES="720x1280"
           fi
           
-          # Determine target audio sample rate
           TARGET_SAMPLE_RATE=$(printf '%s\n' "${audio_sample_rates[@]}" | grep -v "^$" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           if [ -z "$TARGET_SAMPLE_RATE" ]; then
             TARGET_SAMPLE_RATE="44100"
           fi
           
-          # Determine target video codec
           TARGET_VIDEO_CODEC=$(printf '%s\n' "${video_codecs[@]}" | grep -v "^$" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           if [ -z "$TARGET_VIDEO_CODEC" ]; then
             TARGET_VIDEO_CODEC="avc1"
           fi
           
-          # Determine target audio codec
           TARGET_AUDIO_CODEC=$(printf '%s\n' "${audio_codecs[@]}" | grep -v "^$" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           if [ -z "$TARGET_AUDIO_CODEC" ]; then
             TARGET_AUDIO_CODEC="AAC"
@@ -1121,10 +1076,8 @@ jobs:
             CURRENT_VIDEO_CODEC="${video_codecs[$f]:-}"
             CURRENT_AUDIO_CODEC="${audio_codecs[$f]:-AAC}"
             
-            # Check if file has video
             HAS_VIDEO="${has_video[$f]:-false}"
             
-            # If file has no video or resolution is invalid, we need to normalize
             if [ "$HAS_VIDEO" = "false" ] || [ "$CURRENT_RES" = "0x0" ] || [ "$CURRENT_RES" = "x" ] || [ -z "$CURRENT_RES" ]; then
               echo "⚠️ $f has no video or invalid resolution, will normalize"
               NEEDS_NORMALIZE=true
@@ -1132,7 +1085,6 @@ jobs:
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
               EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
               
-              # For files without video, create a blank video with audio
               echo "  🎵 $f is audio-only, creating video with audio..."
               DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "30")
               ffmpeg -f lavfi -i color=black:size=${TARGET_W}x${TARGET_H}:duration="$DURATION" \
@@ -1206,7 +1158,6 @@ jobs:
               continue
             fi
             
-            # Check if file is valid
             if ffprobe -v error "$f" 2>/dev/null; then
               echo "✅ Valid: $f"
               VERIFIED_FILES="$VERIFIED_FILES $f"
@@ -1279,12 +1230,10 @@ jobs:
           if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
             echo "✅ Merge successful!"
             
-            # Verify duration
             MERGED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
             MERGED_DURATION_INT=${MERGED_DURATION%.*}
             echo "📊 Merged file duration: ${MERGED_DURATION_INT} seconds"
             
-            # Generate thumbnails
             echo "🖼️ Generating thumbnails..."
             ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
               -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
@@ -1294,7 +1243,6 @@ jobs:
               -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
               -q:v 2 "square_thumb.jpg" 2>/dev/null
             
-            # Cleanup
             rm -f normalized_*.mp4 concat_list.txt
             
             echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
@@ -1615,37 +1563,48 @@ jobs:
                   return val
 
           def get_video_metadata(file_path):
+              """Get accurate video metadata using ffprobe as primary method"""
               try:
                   cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
                   if result and result.replace('.', '', 1).isdigit():
                       duration = float(result)
                   else:
-                      cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
-                      result = subprocess.check_output(cmd, text=True).strip()
-                      duration = float(result) if result.replace('.', '', 1).isdigit() else 0.0
+                      duration = 0
                   
-                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
+                  cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", 
+                         "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
-                  parts = result.split('|')
+                  parts = result.split(',')
                   
                   if len(parts) >= 2:
                       w = int(parts[0]) if parts[0].isdigit() else 1280
                       h = int(parts[1]) if parts[1].isdigit() else 720
                   else:
-                      w, h = 1280, 720
+                      cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      parts = result.split('|')
+                      
+                      if len(parts) >= 2:
+                          w = int(parts[0]) if parts[0].isdigit() else 1280
+                          h = int(parts[1]) if parts[1].isdigit() else 720
+                      else:
+                          w, h = 1280, 720
                   
+                  print(f"📊 Metadata: duration={duration}, {w}x{h}")
                   return int(duration), w, h
-              except:
-                  pass
-              return 0, 1280, 720
+                  
+              except Exception as e:
+                  print(f"⚠️ Error getting metadata: {e}")
+                  return 0, 1280, 720
 
           def generate_thumbnail(file_path):
               try:
                   thumb_path = f"{file_path}_thumb.jpg"
-                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
+                  cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", 
+                         "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
-                  parts = result.split('|')
+                  parts = result.split(',')
                   
                   if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
                       w = int(parts[0])
@@ -1709,24 +1668,21 @@ jobs:
                           return dialog.entity
               return None
 
-          async def fast_upload_file(client, file_path, progress_callback=None):
+          async def fast_upload_file(client, file_path, progress_callback=None, attributes=None):
               if not os.path.exists(file_path):
                   print(f"❌ File not found: {file_path}")
                   return None
               
               file_size = os.path.getsize(file_path)
-              CHUNK_SIZE = 512 * 1024
-              NUM_CHUNKS = math.ceil(file_size / CHUNK_SIZE)
-              
               print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
-              print(f"📊 Chunks: {NUM_CHUNKS} (512KB each)")
               
               try:
                   return await client.upload_file(
                       file_path,
                       part_size_kb=512,
                       file_name=os.path.basename(file_path),
-                      progress_callback=progress_callback
+                      progress_callback=progress_callback,
+                      attributes=attributes
                   )
               except Exception as e:
                   print(f"❌ Upload failed: {e}")
@@ -1737,23 +1693,71 @@ jobs:
                   print(f"❌ File not found: {file_path}")
                   return False, None
               
+              # Get accurate video metadata
               duration, w, h = get_video_metadata(file_path)
               print(f"📊 Video duration: {duration} seconds, {w}x{h}")
+              
+              # Ensure we have valid dimensions
+              if w <= 0 or h <= 0:
+                  print("⚠️ Invalid dimensions detected, using ffprobe fallback...")
+                  try:
+                      cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", 
+                             "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      parts = result.split(',')
+                      if len(parts) >= 2:
+                          w = int(parts[0]) if parts[0].isdigit() else 1280
+                          h = int(parts[1]) if parts[1].isdigit() else 720
+                  except:
+                      w, h = 1280, 720
+                  print(f"📊 Using fallback dimensions: {w}x{h}")
+              
+              # Create video attributes with correct dimensions
+              video_attr = DocumentAttributeVideo(
+                  duration=duration if duration > 0 else 60,
+                  w=w if w > 0 else 1280,
+                  h=h if h > 0 else 720,
+                  supports_streaming=True
+              )
+              
+              print(f"📐 Video attributes: {video_attr.w}x{video_attr.h}, duration: {video_attr.duration}s")
+              
               thumb = generate_thumbnail(file_path)
               
-              print(f"⬆️ Uploading to channel...")
+              # Step 1: Send poster separately FIRST (full size) with Title, Provider, Description
+              if poster_path and os.path.isfile(poster_path):
+                  try:
+                      print("🖼️ Sending poster as separate full-size photo...")
+                      
+                      # Poster caption: Title, Provider, Description (NO HASHTAGS)
+                      poster_caption = f"📺 {title}\n👤 {series_provider}\n📝 {series_description}"
+                      
+                      await client.send_file(
+                          entity=entity,
+                          file=poster_path,
+                          caption=poster_caption,
+                          force_document=False
+                      )
+                      print("✅ Poster sent as full-size photo with title, provider, description")
+                      await asyncio.sleep(1)
+                  except Exception as e:
+                      print(f"⚠️ Poster send failed: {e}")
+              
+              # Step 2: Upload video with attributes
+              print(f"⬆️ Uploading video to Telegram...")
               try:
                   uploaded_file = await fast_upload_file(
                       client=client,
                       file_path=file_path,
-                      progress_callback=progress_callback
+                      progress_callback=progress_callback,
+                      attributes=[video_attr]
                   )
                   
                   if uploaded_file is None:
                       print("❌ Upload returned None")
                       return False, None
                       
-                  print("✅ Upload complete!")
+                  print("✅ Video upload complete!")
                   with open("merged_progress.log", "a") as f:
                       f.write(f"{datetime.datetime.now()}: UPLOAD_COMPLETE\n")
               except Exception as e:
@@ -1761,17 +1765,31 @@ jobs:
                   traceback.print_exc()
                   return False, None
               
-              video_attr = DocumentAttributeVideo(
-                  duration=duration,
-                  w=w,
-                  h=h,
-                  supports_streaming=True
-              )
+              # Step 3: Send video with Title + Hashtags ONLY (no description/provider)
+              now = datetime.datetime.now()
+              month_year = now.strftime("%B%Y").upper()
+              if telegram_date:
+                  try:
+                      tg_dt = datetime.datetime.strptime(str(telegram_date).strip(), "%Y-%m-%d")
+                      month_year = tg_dt.strftime("%B%Y").upper()
+                  except ValueError:
+                      pass
+              
+              clean_label = str(label).upper().replace("-", "").replace(" ", "").replace("_", "")
+              if clean_label == "NONE" or clean_label == "":
+                  clean_label = "NONE"
+              
+              provider_clean = str(provider_tag).upper().replace("-", "").replace(" ", "").replace("_", "")
+              if provider_clean == "NONE" or provider_clean == "":
+                  provider_clean = "N/A"
+              
+              # Video caption: Title + Hashtags ONLY
+              video_caption = f"📺 {title}\n\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}\n#{provider_clean}"
               
               kwargs = {
                   "entity": entity,
                   "file": uploaded_file,
-                  "caption": caption,
+                  "caption": video_caption,
                   "attributes": [video_attr],
                   "supports_streaming": True,
                   "force_document": False,
@@ -1782,46 +1800,10 @@ jobs:
                   kwargs["thumb"] = thumb
                   print(f"📸 Using thumbnail: {thumb}")
               
-              # Upload poster together with the video as a media group (album)
-              use_poster = False
-              if poster_path and os.path.isfile(poster_path):
-                  print(f"🖼️ Poster found, uploading as album: {poster_path}")
-                  use_poster = True
-                  try:
-                      uploaded_poster = await fast_upload_file(
-                          client=client,
-                          file_path=poster_path,
-                          progress_callback=None
-                      )
-                      if uploaded_poster is None:
-                          print("⚠️ Poster upload failed, continuing with video only")
-                          use_poster = False
-                  except Exception as e:
-                      print(f"⚠️ Poster upload failed: {e}, continuing with video only")
-                      use_poster = False
-              
               try:
-                  if use_poster:
-                      try:
-                          result = await client.send_file(
-                              entity=entity,
-                              file=[uploaded_poster, uploaded_file],
-                              caption=caption,
-                              supports_streaming=True,
-                              force_document=False,
-                              allow_cache=True
-                          )
-                          print("✅ Poster + Video sent to Telegram Channel (album)!")
-                          return True, result
-                      except Exception as e:
-                          print(f"⚠️ Album send failed ({e}), falling back to video only")
-                          result = await client.send_file(**kwargs)
-                          print("✅ File sent to Telegram Channel!")
-                          return True, result
-                  else:
-                      result = await client.send_file(**kwargs)
-                      print("✅ File sent to Telegram Channel!")
-                      return True, result
+                  result = await client.send_file(**kwargs)
+                  print("✅ Video sent with Title + Hashtags!")
+                  return True, result
               except Exception as e:
                   print(f"❌ Send failed: {e}")
                   if "thumb" in kwargs:
@@ -1864,33 +1846,10 @@ jobs:
                   print(f"❌ File exceeds 2GB ({file_size_mb:.1f} MB)")
                   return False
               
-              now = datetime.datetime.now()
-              month_year = now.strftime("%B%Y").upper()
-              if telegram_date:
-                  try:
-                      tg_dt = datetime.datetime.strptime(str(telegram_date).strip(), "%Y-%m-%d")
-                      month_year = tg_dt.strftime("%B%Y").upper()
-                      day_suffix = tg_dt.strftime("%d").lstrip('0')
-                  except ValueError:
-                      day_suffix = now.strftime("%d").lstrip('0')
-              else:
-                  day_suffix = now.strftime("%d").lstrip('0')
-              
-              clean_label = str(label).upper().replace("-", "").replace(" ", "").replace("_", "")
-              if clean_label == "NONE" or clean_label == "":
-                  clean_label = "NONE"
-              
-              provider_clean = str(provider_tag).upper().replace("-", "").replace(" ", "").replace("_", "")
-              if provider_clean == "NONE" or provider_clean == "":
-                  provider_clean = "N/A"
-              
-              caption = f"📺 {title}\n👤 {series_provider}\n📝 {series_description}\n\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}\n#{provider_clean}"
-              
               print(f"📤 Uploading merged video to channel...")
-              print(f"📝 Caption: {caption[:50]}...")
               
               try:
-                  success, result = await send_file_with_thumb(client, entity, video_path, caption, poster_path=poster_path)
+                  success, result = await send_file_with_thumb(client, entity, video_path, "", poster_path=poster_path)
                   if success:
                       print("✅ Merged video successfully posted to channel!")
                       return True
@@ -1898,7 +1857,7 @@ jobs:
               except FloodWaitError as e:
                   print(f"⏳ Rate limited: waiting {e.seconds}s")
                   await asyncio.sleep(e.seconds)
-                  return await send_file_with_thumb(client, entity, video_path, caption, poster_path=poster_path)
+                  return await send_file_with_thumb(client, entity, video_path, "", poster_path=poster_path)
               except Exception as e:
                   print(f"❌ Merged upload failed: {e}")
                   traceback.print_exc()
@@ -2310,7 +2269,7 @@ jobs:
               print(f"📊 Found {len(ep_files)} episodes to upload to topic {topic_id}")
               count = 0
               
-              # 📌 Post the poster + series info message in the topic first (if poster available)
+              # Post poster + series info in topic first
               if topic_id and poster_path and os.path.isfile(poster_path):
                   poster_caption = f"📺 {series_title}\n👤 {series_provider}\n📝 {series_description}"
                   print(f"🖼️ Posting poster with series info into topic...")
@@ -2568,13 +2527,6 @@ jobs:
             # Check if both are complete first
             if [ -f "single_episodes_complete.txt" ]; then
               EPISODES_COMPLETE=true
-            elif [ -f "episode_upload.log" ]; then
-              chk_total=0
-              chk_done="0"
-              if [ "" -gt 0 ] && [ "" -ge "" ]; then
-                EPISODES_COMPLETE=true
-                touch single_episodes_complete.txt
-              fi
             fi
             
             # Check merged completion - either from log or process ended
@@ -2582,7 +2534,7 @@ jobs:
               MERGED_COMPLETE=true
             elif ! is_merged_running && [ -f "merged_upload.log" ]; then
               # Process ended, check if it was successful
-              if tail -20 merged_upload.log | grep -q "✅ Merged video uploaded!"; then
+              if tail -20 merged_upload.log | grep -q "✅ Merged video successfully posted to channel!"; then
                 MERGED_COMPLETE=true
                 # Write completion marker if missing
                 if ! grep -q "UPLOAD_COMPLETE" merged_progress.log 2>/dev/null; then
