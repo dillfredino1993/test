@@ -1983,6 +1983,10 @@ jobs:
                   result = await client.send_file(**kwargs)
                   print("✅ Video sent to Telegram Channel!")
                   
+                  # Write VIDEO_SENT marker to indicate the video was actually posted
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: VIDEO_SENT\n")
+                  
                   return True, result
               except Exception as e:
                   print(f"❌ Send failed: {e}")
@@ -1990,6 +1994,10 @@ jobs:
                       del kwargs["thumb"]
                       try:
                           result = await client.send_file(**kwargs)
+                          print("✅ Video sent to Telegram Channel!")
+                          # Write VIDEO_SENT marker even if thumb was removed
+                          with open("merged_progress.log", "a") as f:
+                              f.write(f"{datetime.datetime.now()}: VIDEO_SENT\n")
                           return True, result
                       except Exception as e2:
                           print(f"❌ Send failed without thumb: {e2}")
@@ -2637,8 +2645,8 @@ jobs:
           # Function to parse progress from log files
           get_merged_progress() {
             if [ -f "merged_progress.log" ]; then
-              # Check if upload is complete first
-              if grep -q "UPLOAD_COMPLETE" merged_progress.log; then
+              # Check if video was sent successfully (KEY CHANGE - check for VIDEO_SENT)
+              if grep -q "VIDEO_SENT" merged_progress.log; then
                 echo "100|complete"
                 return
               fi
@@ -2769,22 +2777,22 @@ jobs:
               EPISODES_COMPLETE=true
             fi
             
-            # Check merged completion - from log, process ended, or success in upload log
-            if [ -f "merged_progress.log" ] && grep -q "UPLOAD_COMPLETE" merged_progress.log; then
+            # Check merged completion - CHECK FOR VIDEO_SENT NOT UPLOAD_COMPLETE
+            if [ -f "merged_progress.log" ] && grep -q "VIDEO_SENT" merged_progress.log; then
               MERGED_COMPLETE=true
             elif [ -f "merged_upload.log" ] && grep -q "✅ Video sent to Telegram Channel!" merged_upload.log; then
               MERGED_COMPLETE=true
               # Write completion marker if missing
-              if ! grep -q "UPLOAD_COMPLETE" merged_progress.log 2>/dev/null; then
-                echo "$(date): UPLOAD_COMPLETE" >> merged_progress.log
+              if ! grep -q "VIDEO_SENT" merged_progress.log 2>/dev/null; then
+                echo "$(date): VIDEO_SENT" >> merged_progress.log
               fi
             elif ! is_merged_running && [ -f "merged_upload.log" ]; then
               # Process ended, check if it was successful
               if tail -20 merged_upload.log | grep -q "✅ Video sent to Telegram Channel!"; then
                 MERGED_COMPLETE=true
                 # Write completion marker if missing
-                if ! grep -q "UPLOAD_COMPLETE" merged_progress.log 2>/dev/null; then
-                  echo "$(date): UPLOAD_COMPLETE" >> merged_progress.log
+                if ! grep -q "VIDEO_SENT" merged_progress.log 2>/dev/null; then
+                  echo "$(date): VIDEO_SENT" >> merged_progress.log
                 fi
               fi
             fi
@@ -2828,12 +2836,22 @@ jobs:
             if [ -f "merged_upload.log" ]; then
               if grep -q "✅ Poster posted with series info!" merged_upload.log; then
                 POSTER_STATUS="✅ Poster sent"
-              elif grep -q "🖼️ Poster will be sent with series info" merged_upload.log; then
-                POSTER_STATUS="🖼️ Poster sending..."
+              elif grep -q "🖼️ Posting poster with series info first..." merged_upload.log; then
+                POSTER_STATUS="🖼️ Poster posting..."
               elif grep -q "ℹ️ Skipping poster" merged_upload.log; then
                 POSTER_STATUS="ℹ️ Poster skipped (missing info)"
               elif grep -q "Poster skipped:" merged_upload.log; then
                 POSTER_STATUS="ℹ️ Poster skipped"
+              fi
+            fi
+            
+            # Check if video is being sent
+            VIDEO_STATUS=""
+            if [ -f "merged_upload.log" ]; then
+              if grep -q "✅ Video sent to Telegram Channel!" merged_upload.log; then
+                VIDEO_STATUS="✅ Video sent"
+              elif grep -q "📤 Sending video to channel..." merged_upload.log; then
+                VIDEO_STATUS="📤 Sending video..."
               fi
             fi
             
@@ -2848,6 +2866,9 @@ jobs:
               echo "║    [${BAR}] ║"
               if [ -n "$POSTER_STATUS" ]; then
                 echo "║    $POSTER_STATUS                                    ║"
+              fi
+              if [ -n "$VIDEO_STATUS" ]; then
+                echo "║    $VIDEO_STATUS                                     ║"
               fi
               echo "║                                                              ║"
             elif [ "$MERGED_PERCENT" != "0" ] && [ "$MERGED_PERCENT" != "100" ]; then
@@ -2880,12 +2901,18 @@ jobs:
               if [ -n "$POSTER_STATUS" ]; then
                 echo "║    $POSTER_STATUS                                    ║"
               fi
+              if [ -n "$VIDEO_STATUS" ]; then
+                echo "║    $VIDEO_STATUS                                     ║"
+              fi
               echo "║                                                              ║"
             elif is_merged_running; then
               echo "║ 📹 Merged Video: Uploading...                           ║"
               echo "║    Status: ⏳ In Progress                                 ║"
               if [ -n "$POSTER_STATUS" ]; then
                 echo "║    $POSTER_STATUS                                    ║"
+              fi
+              if [ -n "$VIDEO_STATUS" ]; then
+                echo "║    $VIDEO_STATUS                                     ║"
               fi
               echo "║                                                              ║"
             else
@@ -2900,8 +2927,7 @@ jobs:
             EP_PERCENT=$(echo "$EP_PROGRESS" | cut -d'|' -f1)
             EP_DATA=$(echo "$EP_PROGRESS" | cut -d'|' -f2)
             
-            if [ "$EPISODES_COMPLETE" = true ] || [ "$EP_DATA" = "complete" ]; then
-              EPISODES_COMPLETE=true
+            if [ "$EPISODES_COMPLETE" = true ] || [ "$EP_DATA" = "complete" ]; then              EPISODES_COMPLETE=true
               echo "║    Status: ✅ COMPLETE                                     ║"
               BAR_LENGTH=40
               BAR=""
@@ -2965,15 +2991,23 @@ jobs:
             # If merged upload is at 100% but not marked complete for a while, force complete
             if [ "$MERGED_PERCENT" = "100" ] && [ "$MERGED_COMPLETE" = false ]; then
               NO_PROGRESS_COUNT=$((NO_PROGRESS_COUNT + 1))
-              if [ $NO_PROGRESS_COUNT -gt 6 ]; then  # After 30 seconds (6 * 5s)
+              if [ $NO_PROGRESS_COUNT -gt 12 ]; then  # After 60 seconds (12 * 5s)
                 echo ""
                 echo "⚠️  Merged upload at 100% but not marked complete..."
                 echo "   Checking if process is still running..."
                 
                 if ! is_merged_running; then
-                  echo "✅ Process ended, marking as complete..."
-                  echo "$(date): UPLOAD_COMPLETE" >> merged_progress.log
-                  MERGED_COMPLETE=true
+                  echo "✅ Process ended, checking if video was sent..."
+                  if [ -f "merged_upload.log" ] && grep -q "✅ Video sent to Telegram Channel!" merged_upload.log; then
+                    echo "✅ Video was sent successfully!"
+                    echo "$(date): VIDEO_SENT" >> merged_progress.log
+                    MERGED_COMPLETE=true
+                  else
+                    echo "⚠️  Process ended but video may not have been sent!"
+                    echo "   Check merged_upload.log for details."
+                    # Don't force complete, let the loop continue
+                    NO_PROGRESS_COUNT=0
+                  fi
                 else
                   echo "⚠️  Process still running, waiting..."
                   NO_PROGRESS_COUNT=0
@@ -3023,7 +3057,7 @@ jobs:
           fi
           
           echo "========================================="
-          if [ -f "single_episodes_complete.txt" ] && [ -f "merged_progress.log" ] && grep -q "UPLOAD_COMPLETE" merged_progress.log; then
+          if [ -f "single_episodes_complete.txt" ] && [ -f "merged_progress.log" ] && grep -q "VIDEO_SENT" merged_progress.log; then
             echo "🎉 All uploads completed successfully!"
           fi
           echo "========================================="
