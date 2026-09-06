@@ -20,8 +20,6 @@ permissions:
 # "download_delay": <seconds> in the repository_dispatch payload.
 env:
   DOWNLOAD_DELAY: 15
-  MIN_UPLOAD_SPEED_MBPS: 0.5
-  RESTART_ATTEMPTS: 3
 
 jobs:
   upload:
@@ -34,6 +32,7 @@ jobs:
           echo "📋 SERIES INFORMATION"
           echo "========================================="
           
+          # Extract series information from payload
           SERIES="${{ github.event.client_payload.series || github.event.client_payload.series_name || 'Unknown Series' }}"
           LABEL="${{ github.event.client_payload.label || 'NONE' }}"
           EPISODE_COUNT="${{ github.event.client_payload.episode_count || 'Unknown' }}"
@@ -44,8 +43,11 @@ jobs:
           echo "⏰ Started at: $(date)"
           echo "========================================="
           
+          # Store for later use
           echo "series_title=$SERIES" >> $GITHUB_ENV
           echo "label=$LABEL" >> $GITHUB_ENV
+          
+          # Create a file to track workflow progress
           echo "STARTED" > workflow_status.txt
 
       - name: Checkout Code
@@ -67,6 +69,7 @@ jobs:
           echo "🔧 INSTALLING TOOLS"
           echo "========================================="
           
+          # Prevent interactive debconf prompts and disable needrestart hangs
           export DEBIAN_FRONTEND=noninteractive
           export NEEDRESTART_MODE=a
           export NEEDRESTART_SUSPEND=1
@@ -77,7 +80,7 @@ jobs:
           echo "📦 Updating apt cache..."
           sudo apt-get update -qq -o Acquire::ForceIPv4=true -o Acquire::Retries=3 || true
           
-          echo "📦 Installing system packages..."
+          echo "📦 Installing system packages (aria2, mkvtoolnix, mediainfo, exiftool, bc)..."
           sudo apt-get install $APT_FLAGS ffmpeg aria2 mkvtoolnix mediainfo libimage-exiftool-perl bc jq || {
             echo "⚠️ Retrying package install individually..."
             for pkg in ffmpeg aria2 mkvtoolnix mediainfo libimage-exiftool-perl bc jq; do
@@ -107,6 +110,7 @@ jobs:
           echo "✅ INSTALLATION COMPLETE"
           echo "========================================="
           
+          # Show versions
           echo "📊 Tool versions:"
           ffmpeg -version | head -1 || echo "⚠️ ffmpeg not found"
           aria2c --version | head -1 || echo "⚠️ aria2 not found"
@@ -133,6 +137,10 @@ jobs:
           CLEAN_SERIES_TITLE=$(echo "$SERIES" | sed -e 's/[\/:*?"<>|]/_/g' -e 's/^ *//' -e 's/ *$//')
           CLEAN_SERIES_TAG=$(echo "$CLEAN_SERIES_TITLE" | tr ' ' '_')
           
+          # Store display title with spaces for Telegram messages
+          DISPLAY_SERIES_TITLE=$(echo "$SERIES" | sed -e 's/[\/:*?"<>|]/_/g' -e 's/^ *//' -e 's/ *$//')
+          
+          # Use telegram date for the title/date (fallback to today's date if blank)
           TELEGRAM_DATE="${{ github.event.client_payload.telegramdate }}"
           if [ -z "$TELEGRAM_DATE" ] || [ "$TELEGRAM_DATE" = "null" ]; then
             TELEGRAM_DATE=$(date +'%Y-%m-%d')
@@ -143,42 +151,49 @@ jobs:
           FORMATTED_TITLE="[${DATE_STR}]-[${CLEAN_LABEL}]-${CLEAN_SERIES_TITLE}"
           
           echo "📄 Formatted Title: $FORMATTED_TITLE"
+          echo "📄 Display Title (with spaces): $DISPLAY_SERIES_TITLE"
           echo "🏷️  Tag Name: $TAG_NAME"
           echo "========================================="
           
           echo "formatted_title=${FORMATTED_TITLE}" >> $GITHUB_OUTPUT
+          echo "display_title=${DISPLAY_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
           echo "series_title=${CLEAN_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "clean_label=${CLEAN_LABEL}" >> $GITHUB_OUTPUT
 
-      - name: 📋 Extract Payload Fields
+      - name: 📋 Extract Payload Fields (Telegram Date, Provider, Description, Poster)
         id: payload
         run: |
           echo "========================================="
           echo "📋 EXTRACTING PAYLOAD FIELDS"
           echo "========================================="
           
+          # Telegram date (default to today's date)
           TELEGRAM_DATE="${{ github.event.client_payload.telegramdate }}"
           if [ -z "$TELEGRAM_DATE" ] || [ "$TELEGRAM_DATE" = "null" ]; then
             TELEGRAM_DATE=$(date +'%Y-%m-%d')
           fi
           echo "📅 Telegram Date: $TELEGRAM_DATE"
           
+          # Series provider (default to N/A)
           SERIES_PROVIDER="${{ github.event.client_payload.series_provider }}"
           if [ -z "$SERIES_PROVIDER" ] || [ "$SERIES_PROVIDER" = "null" ]; then
             SERIES_PROVIDER="N/A"
           fi
           echo "🏢 Series Provider: $SERIES_PROVIDER"
           
+          # Series description (default to N/A)
           SERIES_DESCRIPTION="${{ github.event.client_payload.series_description }}"
           if [ -z "$SERIES_DESCRIPTION" ] || [ "$SERIES_DESCRIPTION" = "null" ]; then
             SERIES_DESCRIPTION="N/A"
           fi
           echo "📝 Series Description: $SERIES_DESCRIPTION"
           
+          # Poster URL (can be blank; if blank, skip poster entirely)
           POSTER_URL="${{ github.event.client_payload.poster_url }}"
           echo "🖼️ Poster URL: $POSTER_URL"
           
+          # Provider tag for hashtags: strip non-alphanumerics, uppercase
           PROVIDER_TAG=$(echo "$SERIES_PROVIDER" | sed -e 's/[^a-zA-Z0-9]//g' | tr '[:lower:]' '[:upper:]')
           if [ -z "$PROVIDER_TAG" ]; then
             PROVIDER_TAG="N/A"
@@ -192,7 +207,7 @@ jobs:
           echo "poster_url=${POSTER_URL}" >> $GITHUB_OUTPUT
           echo "provider_tag=${PROVIDER_TAG}" >> $GITHUB_OUTPUT
 
-      - name: Parse URLs with jq
+      - name: Parse URLs with jq (Clean & Uncorrupted)
         env:
           CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
@@ -204,11 +219,13 @@ jobs:
           
           mkdir -p downloads && cd downloads
           
+          # Extract URLs cleanly: remove \r carriage returns and trim whitespace
           echo "$CLIENT_PAYLOAD" | tr -d '\r' | jq -r '
             (.episodes[]?.url // .video_urls[]? // .video_url // .url // empty)
             | tostring | gsub("^\\s+|\\s+$"; "")
           ' > urls.txt
           
+          # Remove empty lines
           sed -i '/^$/d' urls.txt
           
           echo "========================================="
@@ -245,6 +262,7 @@ jobs:
           EP_INDEX=1
           FAILED_DOWNLOADS=""
 
+          # Resolve inter-episode delay: payload override > workflow default
           DELAY="${DOWNLOAD_DELAY:-30}"
           PAYLOAD_DELAY="${{ github.event.client_payload.download_delay || '' }}"
           if [ -n "$PAYLOAD_DELAY" ] && [[ "$PAYLOAD_DELAY" =~ ^[0-9]+$ ]]; then
@@ -252,175 +270,11 @@ jobs:
           fi
           echo "⏳ Inter-episode delay: ${DELAY}s"
           
+          # Store URLs in array for redownload if needed
           declare -a URL_ARRAY
           while IFS= read -r line; do
             URL_ARRAY+=("$line")
           done < urls.txt
-          
-          check_file_validity() {
-            local file="$1"
-            if [ ! -f "$file" ] || [ ! -s "$file" ]; then
-              echo "❌ File missing or empty: $file"
-              return 1
-            fi
-            
-            local file_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo "0")
-            if [ "$file_size" -lt 100000 ]; then
-              echo "❌ File too small (${file_size} bytes): $file"
-              return 1
-            fi
-            
-            local has_video=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null)
-            if [ -z "$has_video" ] || [ "$has_video" != "video" ]; then
-              echo "❌ No video stream in: $file"
-              return 1
-            fi
-            
-            local width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$file" 2>/dev/null)
-            local height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$file" 2>/dev/null)
-            
-            if [ -n "$width" ] && [ "$width" != "0" ] && [ -n "$height" ] && [ "$height" != "0" ]; then
-              local has_audio=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null)
-              if [ -n "$has_audio" ] && [ "$has_audio" = "audio" ]; then
-                echo "✅ ${file}: ${width}x${height}, $(($file_size/1024/1024))MB, with audio"
-              else
-                echo "⚠️ ${file}: ${width}x${height}, $(($file_size/1024/1024))MB, NO AUDIO"
-              fi
-              return 0
-            else
-              echo "❌ Invalid resolution (${width}x${height}) in: $file"
-              return 1
-            fi
-          }
-          
-          download_with_ytdlp() {
-            local url="$1"
-            local output="$2"
-            local episode="$3"
-            
-            echo "⬇️  Downloading episode $episode with yt-dlp..."
-            
-            local format_selectors=(
-              "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
-              "bestvideo+bestaudio/best"
-              "best[ext=mp4]/best"
-            )
-            
-            local success=false
-            
-            for format_selector in "${format_selectors[@]}"; do
-              if [ "$success" = false ]; then
-                yt-dlp \
-                  --extractor-args "generic:impersonate" \
-                  --impersonate chrome \
-                  -f "$format_selector" \
-                  --merge-output-format mp4 \
-                  --no-warnings \
-                  --progress \
-                  --newline \
-                  --geo-bypass \
-                  --no-check-certificates \
-                  --socket-timeout 300 \
-                  --retries 5 \
-                  --fragment-retries 5 \
-                  -o "$output" \
-                  "$url" 2>&1 | grep -E "(Downloading|Merging|file size|Destination|height|[0-9]+x[0-9]+|format)" || true
-                
-                if [ ${PIPESTATUS[0]} -eq 0 ] && [ -f "$output" ] && [ -s "$output" ]; then
-                  success=true
-                  echo "✅ Download successful with format: $format_selector"
-                else
-                  rm -f "$output" 2>/dev/null
-                fi
-              fi
-            done
-            
-            if [ "$success" = false ]; then
-              echo "🔄 Trying with explicit quality selection..."
-              
-              local formats=$(yt-dlp --extractor-args "generic:impersonate" --impersonate chrome -F "$url" 2>/dev/null)
-              local best_video=$(echo "$formats" | grep -E "mp4.*[0-9]+x[0-9]+" | sort -t'x' -k2 -rn | head -1 | awk '{print $1}')
-              local best_audio=$(echo "$formats" | grep -E "m4a|aac|mp4a" | grep -v "video" | head -1 | awk '{print $1}')
-              
-              if [ -n "$best_video" ]; then
-                echo "🎯 Selected video format: $best_video"
-                if [ -n "$best_audio" ]; then
-                  echo "🎯 Selected audio format: $best_audio"
-                  local format_string="${best_video}+${best_audio}"
-                else
-                  local format_string="$best_video"
-                fi
-                
-                yt-dlp \
-                  --extractor-args "generic:impersonate" \
-                  --impersonate chrome \
-                  -f "$format_string" \
-                  --merge-output-format mp4 \
-                  --no-warnings \
-                  --progress \
-                  --newline \
-                  --geo-bypass \
-                  --no-check-certificates \
-                  --socket-timeout 300 \
-                  --retries 5 \
-                  --fragment-retries 5 \
-                  -o "$output" \
-                  "$url" 2>&1 | grep -E "(Downloading|Merging|file size|Destination)" || true
-                
-                if [ ${PIPESTATUS[0]} -eq 0 ] && [ -f "$output" ] && [ -s "$output" ]; then
-                  success=true
-                  echo "✅ Download successful with explicit quality selection"
-                fi
-              fi
-            fi
-            
-            if [ "$success" = false ]; then
-              echo "🔄 Final attempt: Using best quality fallback..."
-              yt-dlp \
-                --extractor-args "generic:impersonate" \
-                --impersonate chrome \
-                -f "best" \
-                --merge-output-format mp4 \
-                --no-warnings \
-                --progress \
-                --newline \
-                --geo-bypass \
-                --no-check-certificates \
-                --socket-timeout 300 \
-                --retries 5 \
-                --fragment-retries 5 \
-                -o "$output" \
-                "$url" 2>&1 | grep -E "(Downloading|Merging|file size|Destination)" || true
-              
-              if [ ${PIPESTATUS[0]} -eq 0 ] && [ -f "$output" ] && [ -s "$output" ]; then
-                success=true
-                echo "✅ Download successful with best quality fallback"
-              fi
-            fi
-            
-            if [ "$success" = true ]; then
-              return 0
-            else
-              echo "❌ All download attempts failed"
-              return 1
-            fi
-          }
-          
-          download_with_aria2c() {
-            local url="$1"
-            local output="$2"
-            local episode="$3"
-            
-            echo "⬇️  Downloading episode $episode with aria2c..."
-            
-            aria2c -x 16 -s 16 -k 1M --continue=true \
-              --console-log-level=error \
-              --summary-interval=0 \
-              --download-result=default \
-              -o "$output" "$url" 2>&1 | grep -E "(Downloading|Saved|ERROR)" || true
-            
-            return ${PIPESTATUS[0]}
-          }
           
           while IFS= read -u 3 -r URL || [ -n "$URL" ]; do
             URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
@@ -432,80 +286,362 @@ jobs:
             FIXED_FILE="EP${EP_NUM}_fixed.mp4"
             
             echo "========================================="
-            echo "📥 Episode $EP_INDEX/$TOTAL_EPISODES"
-            echo "📎 URL: $(echo "$URL" | cut -c1-60)..."
+            echo "📥 Downloading Episode $EP_INDEX/$TOTAL_EPISODES"
+            echo "📎 URL: $URL"
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
+            # Clean up any existing files
             rm -f "$OUT_FILE" "$TEMP_FILE" "$FIXED_FILE" 2>/dev/null
             
             DOWNLOAD_SUCCESS=false
+            DOWNLOADED_FILE=""
             
+            # ------------------------------------------------------------
+            # CHECK URL TYPE: HLS/m3u8 OR DIRECT VIDEO
+            # ------------------------------------------------------------
             if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *".m3u"* ]] || [[ "$URL" == *"master.m3u8"* ]]; then
-              echo "📺 HLS STREAM DETECTED - Selecting highest quality"
+              echo "📺 HLS STREAM DETECTED - Using yt-dlp with best quality selection"
               
-              if download_with_ytdlp "$URL" "$OUT_FILE" "$EP_INDEX"; then
-                if check_file_validity "$OUT_FILE"; then
-                  DOWNLOAD_SUCCESS=true
-                  echo "✅ HLS download successful (highest quality)"
+              # Use yt-dlp for HLS streams with best quality selection
+              # Format selector: bestvideo+bestaudio -> merge to mp4
+              # This selects the highest quality video and audio available
+              yt-dlp \
+                --extractor-args "generic:impersonate" \
+                --impersonate chrome \
+                -f "bestvideo+bestaudio/best" \
+                --merge-output-format mp4 \
+                --no-progress \
+                --no-warnings \
+                --quiet \
+                --geo-bypass \
+                --no-check-certificates \
+                --socket-timeout 300 \
+                --retries 10 \
+                --fragment-retries 10 \
+                --download-archive "/tmp/ep_${EP_NUM}_archive.txt" \
+                -o "$OUT_FILE" \
+                "$URL" 2>/dev/null
+              
+              # Check if file was downloaded
+              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                DOWNLOADED_FILE="$OUT_FILE"
+                
+                # Check if it needs fixup (MPEG-TS in MP4 container)
+                NEEDS_FIXUP=false
+                CONTAINER=$(ffprobe -v error -show_entries format=format_name -of default=noprint_wrappers=1:nokey=1 "$OUT_FILE" 2>/dev/null | head -1)
+                if [[ "$CONTAINER" == *"mpegts"* ]] || [[ "$CONTAINER" == *"mpeg"* ]]; then
+                  NEEDS_FIXUP=true
+                  echo "🔄 Detected MPEG-TS container, applying fixup..."
+                fi
+                
+                # Also check if file has video stream
+                HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
+                  NEEDS_FIXUP=true
+                  echo "🔄 File has no video stream, attempting fixup..."
+                fi
+                
+                # Apply fixup if needed
+                if [ "$NEEDS_FIXUP" = true ]; then
+                  echo "🔧 Fixing MPEG-TS to MP4 container..."
+                  
+                  # Use ffmpeg to fix the file
+                  ffmpeg -y -err_detect ignore_err -i "$OUT_FILE" \
+                    -c:v libx264 -preset veryfast -crf 23 \
+                    -c:a aac -b:a 128k -ar 44100 \
+                    -movflags +faststart \
+                    -metadata title="Episode $EP_NUM - $SERIES_TITLE" \
+                    -metadata episode_id="$EP_NUM" \
+                    -metadata series="$SERIES_TITLE" \
+                    -metadata label="$LABEL" \
+                    "$FIXED_FILE" 2>/dev/null
+                  
+                  if [ -f "$FIXED_FILE" ] && [ -s "$FIXED_FILE" ]; then
+                    # Verify the fixed file has video
+                    HAS_VIDEO_FIXED=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FIXED_FILE" 2>/dev/null)
+                    if [ -n "$HAS_VIDEO_FIXED" ] && [ "$HAS_VIDEO_FIXED" = "video" ]; then
+                      mv "$FIXED_FILE" "$OUT_FILE"
+                      echo "✅ Fixup successful: $OUT_FILE"
+                    else
+                      echo "⚠️ Fixup produced file without video, keeping original"
+                      rm -f "$FIXED_FILE" 2>/dev/null
+                    fi
+                  else
+                    echo "⚠️ Fixup failed, using original file"
+                    rm -f "$FIXED_FILE" 2>/dev/null
+                  fi
+                fi
+                
+                # Final verification
+                FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                if [ "$FILE_SIZE" -gt 100000 ]; then
+                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                    DOWNLOAD_SUCCESS=true
+                    FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+                    W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    echo "✅ Downloaded HLS stream: $OUT_FILE (${FILE_SIZE_MB}MB, ${W}x${H})"
+                  else
+                    echo "⚠️ HLS download has NO video stream!"
+                  fi
                 else
-                  echo "⚠️ HLS download produced invalid file, trying fallback..."
+                  echo "⚠️ HLS download file too small (${FILE_SIZE} bytes) - likely corrupt"
                   rm -f "$OUT_FILE" 2>/dev/null
                 fi
               fi
               
+              # If yt-dlp HLS download failed, try with aria2c fallback
               if [ "$DOWNLOAD_SUCCESS" != true ]; then
-                echo "🔄 Trying aria2c fallback for HLS..."
-                if download_with_aria2c "$URL" "$OUT_FILE" "$EP_INDEX"; then
-                  if check_file_validity "$OUT_FILE"; then
-                    DOWNLOAD_SUCCESS=true
-                    echo "✅ HLS download with aria2c successful"
-                  else
-                    rm -f "$OUT_FILE" 2>/dev/null
+                echo "⚠️ HLS download with yt-dlp failed. Trying aria2c fallback..."
+                rm -f "$OUT_FILE" 2>/dev/null
+                
+                aria2c -x 16 -s 16 -k 1M --continue=true \
+                  --console-log-level=error \
+                  -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
+                
+                if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                  FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                  if [ "$FILE_SIZE" -gt 100000 ]; then
+                    HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                      DOWNLOAD_SUCCESS=true
+                      echo "✅ Downloaded HLS with aria2c fallback: $OUT_FILE"
+                    fi
                   fi
                 fi
               fi
               
             else
-              echo "🎬 DIRECT VIDEO DETECTED"
+              # ------------------------------------------------------------
+              # DIRECT VIDEO URL - Use aria2c for speed with best quality
+              # ------------------------------------------------------------
+              echo "🎬 DIRECT VIDEO DETECTED - Using aria2c for fast download"
               
-              if download_with_aria2c "$URL" "$OUT_FILE" "$EP_INDEX"; then
-                if check_file_validity "$OUT_FILE"; then
-                  DOWNLOAD_SUCCESS=true
-                  echo "✅ Direct download with aria2c successful"
+              # Try aria2c first (faster for direct downloads)
+              aria2c -x 16 -s 16 -k 1M --continue=true \
+                --console-log-level=error \
+                --max-connection-per-server=16 \
+                --split=16 \
+                --min-split-size=1M \
+                --max-overall-download-limit=0 \
+                --max-download-limit=0 \
+                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null
+              
+              # Verify aria2c download
+              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                if [ "$FILE_SIZE" -gt 100000 ]; then
+                  # Check container format
+                  NEEDS_FIXUP=false
+                  CONTAINER=$(ffprobe -v error -show_entries format=format_name -of default=noprint_wrappers=1:nokey=1 "$OUT_FILE" 2>/dev/null | head -1)
+                  if [[ "$CONTAINER" == *"mpegts"* ]] || [[ "$CONTAINER" == *"mpeg"* ]]; then
+                    NEEDS_FIXUP=true
+                    echo "🔄 Detected MPEG-TS container, applying fixup..."
+                  fi
+                  
+                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                  if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
+                    NEEDS_FIXUP=true
+                    echo "🔄 File has no video stream, attempting fixup..."
+                  fi
+                  
+                  # Apply fixup if needed
+                  if [ "$NEEDS_FIXUP" = true ]; then
+                    echo "🔧 Fixing MPEG-TS to MP4 container..."
+                    
+                    ffmpeg -y -err_detect ignore_err -i "$OUT_FILE" \
+                      -c:v libx264 -preset veryfast -crf 23 \
+                      -c:a aac -b:a 128k -ar 44100 \
+                      -movflags +faststart \
+                      -metadata title="Episode $EP_NUM - $SERIES_TITLE" \
+                      -metadata episode_id="$EP_NUM" \
+                      -metadata series="$SERIES_TITLE" \
+                      -metadata label="$LABEL" \
+                      "$FIXED_FILE" 2>/dev/null
+                    
+                    if [ -f "$FIXED_FILE" ] && [ -s "$FIXED_FILE" ]; then
+                      HAS_VIDEO_FIXED=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FIXED_FILE" 2>/dev/null)
+                      if [ -n "$HAS_VIDEO_FIXED" ] && [ "$HAS_VIDEO_FIXED" = "video" ]; then
+                        mv "$FIXED_FILE" "$OUT_FILE"
+                        echo "✅ Fixup successful: $OUT_FILE"
+                      else
+                        echo "⚠️ Fixup produced file without video, keeping original"
+                        rm -f "$FIXED_FILE" 2>/dev/null
+                      fi
+                    else
+                      echo "⚠️ Fixup failed, using original file"
+                      rm -f "$FIXED_FILE" 2>/dev/null
+                    fi
+                  fi
+                  
+                  # Final verification after fixup
+                  if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                    HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                      DOWNLOAD_SUCCESS=true
+                      FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+                      W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                      H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                      echo "✅ Downloaded with aria2c: $OUT_FILE (${FILE_SIZE_MB}MB, ${W}x${H})"
+                    else
+                      echo "⚠️ aria2c download has NO video stream!"
+                    fi
+                  fi
                 else
-                  echo "⚠️ aria2c download produced invalid file, trying fallback..."
+                  echo "⚠️ aria2c download file too small (${FILE_SIZE} bytes) - likely corrupt"
                   rm -f "$OUT_FILE" 2>/dev/null
                 fi
               fi
               
+              # If aria2c failed, try yt-dlp as fallback with best quality
               if [ "$DOWNLOAD_SUCCESS" != true ]; then
-                echo "🔄 Trying yt-dlp fallback..."
-                if download_with_ytdlp "$URL" "$OUT_FILE" "$EP_INDEX"; then
-                  if check_file_validity "$OUT_FILE"; then
-                    DOWNLOAD_SUCCESS=true
-                    echo "✅ Direct download with yt-dlp successful"
-                  else
-                    rm -f "$OUT_FILE" 2>/dev/null
+                echo "⚠️ aria2c failed. Trying yt-dlp fallback with best quality..."
+                rm -f "$OUT_FILE" 2>/dev/null
+                
+                yt-dlp \
+                  --extractor-args "generic:impersonate" \
+                  --impersonate chrome \
+                  -f "bestvideo+bestaudio/best" \
+                  --merge-output-format mp4 \
+                  --no-progress \
+                  --no-warnings \
+                  --quiet \
+                  --geo-bypass \
+                  -o "$OUT_FILE" \
+                  "$URL" 2>/dev/null
+                
+                if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                  FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                  if [ "$FILE_SIZE" -gt 100000 ]; then
+                    HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                    if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                      DOWNLOAD_SUCCESS=true
+                      echo "✅ Downloaded with yt-dlp fallback: $OUT_FILE"
+                    fi
                   fi
                 fi
               fi
             fi
             
+            # ------------------------------------------------------------
+            # ULTIMATE FALLBACK: Try yt-dlp with best quality and external downloader
+            # ------------------------------------------------------------
+            if [ "$DOWNLOAD_SUCCESS" != true ]; then
+              echo "⚠️ Primary download methods failed. Trying yt-dlp with best quality + aria2c external..."
+              
+              rm -f "$OUT_FILE" 2>/dev/null
+              
+              # Use yt-dlp with best quality selection and aria2c as external downloader
+              # This ensures we get the best quality available
+              yt-dlp \
+                --extractor-args "generic:impersonate" \
+                --impersonate chrome \
+                -f "bestvideo+bestaudio/best" \
+                --merge-output-format mp4 \
+                --remux-video mp4 \
+                --external-downloader aria2c \
+                --external-downloader-args "-x 16 -s 16 -k 1M" \
+                --no-progress \
+                --no-warnings \
+                --quiet \
+                --geo-bypass \
+                -o "$OUT_FILE" \
+                "$URL" 2>/dev/null
+              
+              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                if [ "$FILE_SIZE" -gt 100000 ]; then
+                  HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                  if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                    DOWNLOAD_SUCCESS=true
+                    echo "✅ Downloaded with yt-dlp+aria2c: $OUT_FILE"
+                  fi
+                fi
+              fi
+            fi
+            
+            # ------------------------------------------------------------
+            # CREATE VIDEO FROM AUDIO IF ONLY AUDIO IS AVAILABLE
+            # ------------------------------------------------------------
+            if [ "$DOWNLOAD_SUCCESS" != true ]; then
+              # Check if we have a file with audio but no video
+              if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+                FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+                if [ "$FILE_SIZE" -gt 100000 ]; then
+                  HAS_AUDIO=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+                  
+                  if [ -n "$HAS_AUDIO" ] && [ "$HAS_AUDIO" = "audio" ]; then
+                    echo "🎵 File has audio but no video. Creating video with static image..."
+                    
+                    DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUT_FILE" 2>/dev/null || echo "30")
+                    
+                    # Create a video with black background and the audio
+                    TEMP_VIDEO="EP${EP_NUM}_video_temp.mp4"
+                    ffmpeg -y -f lavfi -i color=black:size=1280x720:duration="$DURATION" \
+                      -i "$OUT_FILE" \
+                      -c:v libx264 -preset veryfast -crf 23 \
+                      -c:a aac -b:a 128k -ar 44100 \
+                      -shortest \
+                      -movflags +faststart \
+                      "$TEMP_VIDEO" 2>/dev/null
+                    
+                    if [ -f "$TEMP_VIDEO" ] && [ -s "$TEMP_VIDEO" ]; then
+                      mv "$TEMP_VIDEO" "$OUT_FILE"
+                      DOWNLOAD_SUCCESS=true
+                      echo "✅ Created video from audio for Episode $EP_INDEX"
+                    else
+                      echo "❌ Failed to create video from audio!"
+                    fi
+                  else
+                    echo "❌ File has neither video nor audio!"
+                  fi
+                else
+                  echo "❌ File too small (${FILE_SIZE} bytes) - likely corrupt"
+                fi
+              else
+                echo "❌ No file downloaded at all!"
+              fi
+            fi
+            
+            # ------------------------------------------------------------
+            # FINAL VERIFICATION
+            # ------------------------------------------------------------
             if [ "$DOWNLOAD_SUCCESS" = true ] && [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+              # Final verification
               FINAL_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
               FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
+              
               echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FINAL_SIZE_MB}MB)"
+              
+              # Quick verify with ffprobe
+              HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
+              if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
+                echo "   📹 Video track confirmed (ffprobe)"
+              else
+                echo "   ⚠️ Video track not detected (ffprobe)"
+              fi
+              
+              if mediainfo "$OUT_FILE" 2>/dev/null | grep -q "Audio"; then
+                echo "   🔊 Audio track confirmed"
+              else
+                echo "   ⚠️ Audio track not detected by mediainfo"
+              fi
             else
               echo "❌ Download failed for Episode $EP_INDEX"
               FAILED_DOWNLOADS="$FAILED_DOWNLOADS $EP_NUM"
               rm -f "$OUT_FILE" 2>/dev/null
             fi
             
+            # Clean up temp files
             rm -f "$TEMP_FILE" "$FIXED_FILE" 2>/dev/null
             
+            # ────────────────────────────────────────────────
+            # ⏳ DELAY BETWEEN EPISODE DOWNLOADS
+            # ────────────────────────────────────────────────
             if [ "$EP_INDEX" -lt "$TOTAL_EPISODES" ] && [ "$DELAY" -gt 0 ] 2>/dev/null; then
-              echo "⏳ Waiting ${DELAY}s before next episode..."
+              echo "⏳ Waiting ${DELAY}s before downloading episode $((EP_INDEX + 1))/$TOTAL_EPISODES..."
               sleep "$DELAY"
             fi
             
@@ -518,15 +654,6 @@ jobs:
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Expected: $TOTAL_EPISODES episodes"
-          
-          echo ""
-          echo "📋 Downloaded files:"
-          for f in EP*.mp4; do
-            if [ -f "$f" ]; then
-              check_file_validity "$f"
-            fi
-          done
-          echo ""
           
           TOTAL_FILES=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           echo "✅ Downloaded: $TOTAL_FILES/$TOTAL_EPISODES episodes"
@@ -544,10 +671,42 @@ jobs:
             exit 1
           fi
           
+          # Final verification of all files
+          echo ""
+          echo "🔍 Final verification of all episodes..."
+          ALL_GOOD=true
+          for f in EP*.mp4; do
+            if [ -f "$f" ]; then
+              # Check file size first
+              FILE_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
+              if [ "$FILE_SIZE" -lt 100000 ]; then
+                echo "❌ $f is too small (${FILE_SIZE} bytes) - likely corrupt!"
+                ALL_GOOD=false
+                continue
+              fi
+              
+              HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$f" 2>/dev/null)
+              if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
+                echo "❌ $f has no video stream!"
+                ALL_GOOD=false
+              else
+                W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null)
+                H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null)
+                echo "✅ $f: ${W}x${H}"
+              fi
+            fi
+          done
+          
+          if [ "$ALL_GOOD" != true ]; then
+            echo "❌ Some episodes are missing video streams or are corrupt!"
+            echo "❌ Exiting - all episodes must have valid video."
+            exit 1
+          fi
+          
           echo "✅ All $TOTAL_EPISODES episodes downloaded and verified successfully!"
           echo "========================================="
 
-      - name: Compress Episodes Larger Than 80MB
+      - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
         timeout-minutes: 240
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
@@ -563,6 +722,7 @@ jobs:
           echo "⚡ Using VERY FAST compression preset"
           echo "========================================="
           
+          # Create fast compression script
           cat > fast_compress.py << 'EOFCOMPRESS'
           import os
           import sys
@@ -572,6 +732,7 @@ jobs:
           import time
           
           def get_video_info(file_path):
+              """Get video duration, width, height using ffprobe"""
               try:
                   cmd = [
                       "ffprobe", "-v", "error",
@@ -597,6 +758,10 @@ jobs:
                   return 0, 1280, 720
           
           def compress_with_veryfast(file_path, target_size_mb=80):
+              """
+              Compress video using FFmpeg with VERY FAST preset
+              This prioritizes speed over compression efficiency
+              """
               print(f"  ⚡ Compressing with VERY FAST preset...")
               
               file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
@@ -606,9 +771,11 @@ jobs:
                   print(f"  ✅ File already under {target_size_mb}MB, skipping compression")
                   return True
               
+              # Get video info
               duration, width, height = get_video_info(file_path)
               print(f"  📊 Duration: {duration:.1f}s, Resolution: {width}x{height}")
               
+              # Calculate target bitrate for target size
               if duration > 0:
                   target_bitrate = (target_size_mb * 8 * 1024) / duration
                   target_bitrate = min(max(target_bitrate, 500), 2000)
@@ -620,6 +787,7 @@ jobs:
               base_name = os.path.splitext(file_path)[0]
               temp_file = f"{base_name}_fast.mp4"
               
+              # Use VERY FAST preset for maximum speed
               cmd = [
                   "ffmpeg", "-y",
                   "-i", file_path,
@@ -654,6 +822,8 @@ jobs:
                           return True
                       else:
                           print(f"  ⚠️ Still too large: {new_size_mb:.1f}MB")
+                          
+                          # Try even more aggressive compression
                           print(f"  🔄 Trying ULTRA FAST with higher CRF...")
                           temp_file2 = f"{base_name}_ultrafast.mp4"
                           
@@ -696,6 +866,7 @@ jobs:
                   print(f"  ❌ Compression error: {e}")
                   return False
               finally:
+                  # Cleanup temp files
                   for f in [temp_file, f"{base_name}_ultrafast.mp4"]:
                       if os.path.exists(f):
                           try: os.remove(f)
@@ -704,6 +875,7 @@ jobs:
               return False
           
           def process_episode(file_path, target_size_mb=80):
+              """Process episode with fast compression"""
               if not os.path.exists(file_path):
                   print(f"❌ File not found: {file_path}")
                   return False
@@ -722,6 +894,7 @@ jobs:
               sys.exit(0 if success else 1)
           EOFCOMPRESS
           
+          # Get list of all episodes
           EPISODE_FILES=$(ls -1 EP*.mp4 2>/dev/null)
           TOTAL_EPISODES=$(echo "$EPISODE_FILES" | wc -l)
           COMPRESSED_COUNT=0
@@ -741,9 +914,11 @@ jobs:
             if [ $FILE_SIZE_MB -gt 80 ]; then
               echo "⚠️  $f exceeds 80MB, compressing..."
               
+              # Add metadata before compression
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
               EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
               
+              # Compress with very fast preset
               if python3 fast_compress.py "$f" 80 < /dev/null; then
                 COMPRESSED_COUNT=$((COMPRESSED_COUNT + 1))
                 NEW_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
@@ -770,11 +945,13 @@ jobs:
             echo "❌ FAILED COMPRESSIONS: $FAILED_COMPRESSIONS"
             echo "❌ Not all episodes compressed successfully!"
             echo "   This is an all-or-nothing workflow. Exiting."
-            exit 1          fi
+            exit 1
+          fi
           
           echo "✅ All episodes processed successfully!"
           echo "========================================="
           
+          # Show final file sizes
           echo ""
           echo "📊 Final episode sizes:"
           for f in EP*.mp4; do
@@ -822,6 +999,7 @@ jobs:
           
           echo "📊 Found $EP_COUNT episodes to merge"
           
+          # First, verify all files have video streams and redownload if needed
           echo "🔍 Checking all files for video streams..."
           NEEDS_REDOWNLOAD=false
           REDOWNLOAD_LIST=""
@@ -829,15 +1007,18 @@ jobs:
           for f in EP*.mp4; do
             if [ ! -f "$f" ]; then continue; fi
             
+            # Check if file has video stream
             HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$f" 2>/dev/null)
             
             if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
               echo "⚠️ $f has no video stream!"
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
+              # Remove leading zeros for the list
               EP_NUM_CLEAN=$(echo "$EP_NUM" | sed 's/^0*//')
               REDOWNLOAD_LIST="$REDOWNLOAD_LIST $EP_NUM_CLEAN"
               NEEDS_REDOWNLOAD=true
             else
+              # Also check resolution
               WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null)
               HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null)
               
@@ -853,10 +1034,12 @@ jobs:
             fi
           done
           
+          # Redownload episodes that need it
           if [ "$NEEDS_REDOWNLOAD" = true ]; then
             echo ""
             echo "🔄 Redownloading episodes with yt-dlp to ensure proper video..."
             
+            # Read URLs into array
             mapfile -t URL_ARRAY < urls.txt
             
             for EP_NUM_CLEAN in $REDOWNLOAD_LIST; do
@@ -867,11 +1050,13 @@ jobs:
               if [ $URL_INDEX -ge 0 ] && [ $URL_INDEX -lt ${#URL_ARRAY[@]} ]; then
                 URL="${URL_ARRAY[$URL_INDEX]}"
                 echo ""
-                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp..."
+                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp (best quality)..."
                 echo "📎 URL: $URL"
                 
+                # Remove the bad file
                 rm -f "$FILE"
                 
+                # Redownload with yt-dlp with best quality
                 yt-dlp --extractor-args "generic:impersonate" --impersonate chrome \
                   -f "bestvideo+bestaudio/best" \
                   --merge-output-format mp4 \
@@ -879,6 +1064,7 @@ jobs:
                   -o "$FILE" "$URL" < /dev/null 2>&1
                 
                 if [ -f "$FILE" ] && [ -s "$FILE" ]; then
+                  # Verify the new file has video
                   HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FILE" 2>/dev/null)
                   if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
                     echo "✅ Episode $EP_NUM_FORMATTED redownloaded successfully with video!"
@@ -886,6 +1072,7 @@ jobs:
                     echo "❌ Redownloaded file still has no video for Episode $EP_NUM_FORMATTED"
                     echo "   Creating a blank video with audio instead..."
                     
+                    # Create a blank video with the audio from the file
                     DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FILE" 2>/dev/null || echo "30")
                     TEMP_FILE="EP${EP_NUM_FORMATTED}_temp.mp4"
                     
@@ -904,6 +1091,7 @@ jobs:
                   fi
                 else
                   echo "❌ Redownload failed for Episode $EP_NUM_FORMATTED"
+                  # Try to create a video from what we have
                   DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FILE" 2>/dev/null || echo "30")
                   TEMP_FILE="EP${EP_NUM_FORMATTED}_temp.mp4"
                   
@@ -932,6 +1120,7 @@ jobs:
           echo ""
           echo "🔍 Analyzing file properties with MediaInfo and ffprobe..."
           
+          # Use a more robust approach with ffprobe as fallback
           declare -A resolutions
           declare -A audio_sample_rates
           declare -A video_codecs
@@ -940,8 +1129,10 @@ jobs:
           
           for f in EP*.mp4; do
             if [ -f "$f" ]; then
+              # Try MediaInfo first
               res=$(mediainfo --Inform="Video;%Width%x%Height%" "$f" 2>/dev/null || echo "")
               
+              # If MediaInfo returns empty, try ffprobe
               if [ -z "$res" ] || [ "$res" = "0x0" ] || [ "$res" = "x" ]; then
                 width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null || echo "0")
                 height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null || echo "0")
@@ -950,6 +1141,7 @@ jobs:
                   res="${width}x${height}"
                   has_video["$f"]="true"
                 else
+                  # No video stream, use default resolution
                   res="0x0"
                   has_video["$f"]="false"
                 fi
@@ -958,18 +1150,21 @@ jobs:
               fi
               resolutions["$f"]="$res"
               
+              # Get audio sample rate
               sample_rate=$(mediainfo --Inform="Audio;%SamplingRate%" "$f" 2>/dev/null | tr -d ' ' | cut -d'/' -f1 | cut -d' ' -f1)
               if [ -z "$sample_rate" ] || [ "$sample_rate" = "0" ]; then
                 sample_rate=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$f" 2>/dev/null || echo "44100")
               fi
               audio_sample_rates["$f"]="$sample_rate"
               
+              # Get video codec
               video_codec=$(mediainfo --Inform="Video;%CodecID%" "$f" 2>/dev/null || echo "")
               if [ -z "$video_codec" ] || [ "$video_codec" = "unknown" ]; then
                 video_codec=$(mediainfo --Inform="Video;%Format%" "$f" 2>/dev/null || echo "")
               fi
               if [ -z "$video_codec" ] || [ "$video_codec" = "unknown" ]; then
                 video_codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "avc1")
+                # Convert codec name to codec ID format
                 if [ "$video_codec" = "h264" ]; then
                   video_codec="avc1"
                 elif [ "$video_codec" = "hevc" ]; then
@@ -978,6 +1173,7 @@ jobs:
               fi
               video_codecs["$f"]="$video_codec"
               
+              # Get audio codec
               audio_codec=$(mediainfo --Inform="Audio;%Format%" "$f" 2>/dev/null || echo "")
               if [ -z "$audio_codec" ] || [ "$audio_codec" = "unknown" ]; then
                 audio_codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null || echo "AAC")
@@ -993,6 +1189,7 @@ jobs:
             exit 1
           fi
           
+          # Determine target resolution from files with valid video
           VALID_RESOLUTIONS=""
           for f in "${!resolutions[@]}"; do
             res="${resolutions[$f]}"
@@ -1004,6 +1201,7 @@ jobs:
           if [ -n "$VALID_RESOLUTIONS" ]; then
             TARGET_RES=$(echo "$VALID_RESOLUTIONS" | tr ' ' '\n' | grep -v "0x0" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           else
+            # No valid resolutions found, use default
             TARGET_RES="720x1280"
           fi
           
@@ -1011,16 +1209,19 @@ jobs:
             TARGET_RES="720x1280"
           fi
           
+          # Determine target audio sample rate
           TARGET_SAMPLE_RATE=$(printf '%s\n' "${audio_sample_rates[@]}" | grep -v "^$" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           if [ -z "$TARGET_SAMPLE_RATE" ]; then
             TARGET_SAMPLE_RATE="44100"
           fi
           
+          # Determine target video codec
           TARGET_VIDEO_CODEC=$(printf '%s\n' "${video_codecs[@]}" | grep -v "^$" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           if [ -z "$TARGET_VIDEO_CODEC" ]; then
             TARGET_VIDEO_CODEC="avc1"
           fi
           
+          # Determine target audio codec
           TARGET_AUDIO_CODEC=$(printf '%s\n' "${audio_codecs[@]}" | grep -v "^$" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
           if [ -z "$TARGET_AUDIO_CODEC" ]; then
             TARGET_AUDIO_CODEC="AAC"
@@ -1048,8 +1249,10 @@ jobs:
             CURRENT_VIDEO_CODEC="${video_codecs[$f]:-}"
             CURRENT_AUDIO_CODEC="${audio_codecs[$f]:-AAC}"
             
+            # Check if file has video
             HAS_VIDEO="${has_video[$f]:-false}"
             
+            # If file has no video or resolution is invalid, we need to normalize
             if [ "$HAS_VIDEO" = "false" ] || [ "$CURRENT_RES" = "0x0" ] || [ "$CURRENT_RES" = "x" ] || [ -z "$CURRENT_RES" ]; then
               echo "⚠️ $f has no video or invalid resolution, will normalize"
               NEEDS_NORMALIZE=true
@@ -1057,6 +1260,7 @@ jobs:
               EP_NUM=$(echo "$f" | grep -o '[0-9]*' | head -1)
               EPISODE_TITLE="Episode ${EP_NUM} - ${SERIES_TITLE}"
               
+              # For files without video, create a blank video with audio
               echo "  🎵 $f is audio-only, creating video with audio..."
               DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo "30")
               ffmpeg -f lavfi -i color=black:size=${TARGET_W}x${TARGET_H}:duration="$DURATION" \
@@ -1130,6 +1334,7 @@ jobs:
               continue
             fi
             
+            # Check if file is valid
             if ffprobe -v error "$f" 2>/dev/null; then
               echo "✅ Valid: $f"
               VERIFIED_FILES="$VERIFIED_FILES $f"
@@ -1202,10 +1407,12 @@ jobs:
           if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
             echo "✅ Merge successful!"
             
+            # Verify duration
             MERGED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
             MERGED_DURATION_INT=${MERGED_DURATION%.*}
             echo "📊 Merged file duration: ${MERGED_DURATION_INT} seconds"
             
+            # Generate thumbnails
             echo "🖼️ Generating thumbnails..."
             ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
               -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
@@ -1215,6 +1422,7 @@ jobs:
               -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
               -q:v 2 "square_thumb.jpg" 2>/dev/null
             
+            # Cleanup
             rm -f normalized_*.mp4 concat_list.txt
             
             echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
@@ -1410,7 +1618,7 @@ jobs:
             fi
           fi
 
-      - name: 📥 Download Poster
+      - name: 📥 Download Poster (for Telegram Uploads)
         if: steps.verify.outputs.verify_success == 'true' && steps.payload.outputs.poster_url != ''
         env:
           POSTER_URL: ${{ steps.payload.outputs.poster_url }}
@@ -1430,7 +1638,7 @@ jobs:
             echo "poster_path=" >> $GITHUB_ENV
           fi
 
-      - name: Start Merged Upload with Speed Monitoring
+      - name: Start Merged Upload (Background with Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -1442,24 +1650,21 @@ jobs:
           MERGED_PATH: ${{ env.merged_file_path }}
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
+          DISPLAY_TITLE: ${{ steps.fname.outputs.display_title }}
           LABEL: ${{ steps.fname.outputs.clean_label }}
           TELEGRAM_DATE: ${{ steps.payload.outputs.telegram_date }}
           SERIES_PROVIDER: ${{ steps.payload.outputs.series_provider }}
           SERIES_DESCRIPTION: ${{ steps.payload.outputs.series_description }}
           PROVIDER_TAG: ${{ steps.payload.outputs.provider_tag }}
           POSTER_PATH: ${{ env.poster_path }}
-          MIN_UPLOAD_SPEED_MBPS: ${{ env.MIN_UPLOAD_SPEED_MBPS }}
-          RESTART_ATTEMPTS: ${{ env.RESTART_ATTEMPTS }}
         run: |
           cd downloads
           
           echo "========================================="
-          echo "📤 STARTING MERGED UPLOAD WITH SPEED MONITORING"
+          echo "📤 STARTING MERGED UPLOAD TO CHANNEL"
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "📁 File: ${{ env.merged_file_path }}"
-          echo "⚡ Min Speed: ${MIN_UPLOAD_SPEED_MBPS} MB/s"
-          echo "🔄 Max Restarts: ${RESTART_ATTEMPTS}"
           echo "========================================="
           
           if [ ! -f "${{ env.merged_file_path }}" ] && [ ! -f "output.mp4" ]; then
@@ -1474,62 +1679,7 @@ jobs:
             echo "⚠️ Using fallback path: $MERGED_PATH"
           fi
           
-          # Validate output file
-          if [ -f "output.mp4" ]; then
-            FILE_SIZE=$(stat -c%s "output.mp4" 2>/dev/null || stat -f%z "output.mp4" 2>/dev/null || echo "0")
-            FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-            echo "📊 Merged file size: ${FILE_SIZE_MB} MB"
-            
-            if [ "$FILE_SIZE" -lt 100000 ]; then
-              echo "❌ output.mp4 is too small (${FILE_SIZE} bytes)!"
-              exit 1
-            fi
-            
-            HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "output.mp4" 2>/dev/null)
-            if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
-              echo "❌ output.mp4 has no video stream!"
-              exit 1
-            fi
-            
-            W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "output.mp4" 2>/dev/null)
-            H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "output.mp4" 2>/dev/null)
-            echo "✅ output.mp4: ${W}x${H}, ${FILE_SIZE_MB}MB"
-          else
-            echo "❌ output.mp4 not found!"
-            exit 1
-          fi
-          
-          # Check poster availability
-          if [ -f "${{ env.poster_path }}" ]; then
-            POSTER_EXISTS=true
-            echo "✅ Poster exists: ${{ env.poster_path }}"
-          else
-            POSTER_EXISTS=false
-            echo "⚠️ No poster available"
-          fi
-          
-          # Check if provider and description are valid
-          PROVIDER_VALID=false
-          DESCRIPTION_VALID=false
-          if [ -n "$SERIES_PROVIDER" ] && [ "$SERIES_PROVIDER" != "N/A" ] && [ -n "$(echo "$SERIES_PROVIDER" | tr -d ' ')" ]; then
-            PROVIDER_VALID=true
-          fi
-          if [ -n "$SERIES_DESCRIPTION" ] && [ "$SERIES_DESCRIPTION" != "N/A" ] && [ -n "$(echo "$SERIES_DESCRIPTION" | tr -d ' ')" ]; then
-            DESCRIPTION_VALID=true
-          fi
-          
-          if [ "$POSTER_EXISTS" = true ] && [ "$PROVIDER_VALID" = true ] && [ "$DESCRIPTION_VALID" = true ]; then
-            echo "✅ Poster will be uploaded (provider and description present)"
-          else
-            echo "⚠️ Poster will be skipped (missing: provider=$PROVIDER_VALID, description=$DESCRIPTION_VALID)"
-          fi
-          
-          echo "========================================="
-          echo "🚀 Creating upload_merged.py script..."
-          echo "========================================="
-          
-          # Create the upload_merged.py script directly
-          cat > upload_merged.py << 'EOFUPLOAD'
+          python3 -c "import sys, textwrap; open('upload_merged.py', 'w').write(textwrap.dedent(sys.stdin.read()))" << 'EOFUPLOAD'
           import os
           import sys
           import glob
@@ -1540,7 +1690,6 @@ jobs:
           import traceback
           import json
           import math
-          import time
 
           if hasattr(sys.stdout, "reconfigure"):
               sys.stdout.reconfigure(line_buffering=True)
@@ -1570,6 +1719,7 @@ jobs:
           video_path = os.environ.get("MERGED_PATH")
           title = os.environ.get("TITLE")
           series_title = os.environ.get("SERIES_TITLE", "Series")
+          display_title = os.environ.get("DISPLAY_TITLE", series_title)
           label = os.environ.get("LABEL", "NONE")
           telegram_date = os.environ.get("TELEGRAM_DATE", datetime.date.today().strftime("%Y-%m-%d"))
           series_provider = os.environ.get("SERIES_PROVIDER", "N/A")
@@ -1595,39 +1745,54 @@ jobs:
                   return val
 
           def get_video_metadata(file_path):
+              """Get video duration, width, height using ffprobe and mediainfo"""
+              duration = 0
+              width = 1280
+              height = 720
+              
               try:
+                  # Try ffprobe first for duration
                   cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
                   if result and result.replace('.', '', 1).isdigit():
-                      duration = float(result)
+                      duration = int(float(result))
                   else:
-                      duration = 0
-                  
-                  cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", 
-                         "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
+                      # Fallback to mediainfo
+                      cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      if result and result.replace('.', '', 1).isdigit():
+                          duration = int(float(result))
+              except:
+                  pass
+              
+              try:
+                  # Get resolution using ffprobe
+                  cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
-                  parts = result.split(',')
-                  
-                  if len(parts) >= 2:
-                      w = int(parts[0]) if parts[0].isdigit() else 1280
-                      h = int(parts[1]) if parts[1].isdigit() else 720
+                  if result:
+                      parts = result.split(',')
+                      if len(parts) >= 2:
+                          width = int(parts[0]) if parts[0].isdigit() else 1280
+                          height = int(parts[1]) if parts[1].isdigit() else 720
                   else:
-                      w, h = 1280, 720
-                  
-                  print(f"📊 Metadata: duration={duration}, {w}x{h}")
-                  return int(duration), w, h
-                  
-              except Exception as e:
-                  print(f"⚠️ Error getting metadata: {e}")
-                  return 0, 1280, 720
+                      # Fallback to mediainfo
+                      cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      parts = result.split('|')
+                      if len(parts) >= 2:
+                          width = int(parts[0]) if parts[0].isdigit() else 1280
+                          height = int(parts[1]) if parts[1].isdigit() else 720
+              except:
+                  pass
+              
+              return duration, width, height
 
           def generate_thumbnail(file_path):
               try:
                   thumb_path = f"{file_path}_thumb.jpg"
-                  cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", 
-                         "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
+                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
-                  parts = result.split(',')
+                  parts = result.split('|')
                   
                   if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
                       w = int(parts[0])
@@ -1646,49 +1811,14 @@ jobs:
                   pass
               return None
 
-          # Speed tracking variables
-          last_progress_time = time.time()
-          last_progress_bytes = 0
-          current_speed = 0
-          speed_samples = []
-
           def progress_callback(current, total):
-              global last_progress_time, last_progress_bytes, current_speed, speed_samples
-              
               percent = (current / total) * 100
               mb_uploaded = current / (1024 * 1024)
               mb_total = total / (1024 * 1024)
-              
-              current_time = time.time()
-              time_diff = current_time - last_progress_time
-              bytes_diff = current - last_progress_bytes
-              
-              if time_diff > 0:
-                  speed_mbps = (bytes_diff / (1024 * 1024)) / time_diff
-                  speed_samples.append(speed_mbps)
-                  if len(speed_samples) > 10:
-                      speed_samples.pop(0)
-                  current_speed = sum(speed_samples) / len(speed_samples)
-                  print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB) @ {current_speed:.2f} MB/s")
-                  
+              if int(percent) % 5 == 0 or int(percent) == 100:
+                  print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
                   with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: UPLOAD_PROGRESS:{percent:.1f}:{mb_uploaded:.1f}:{mb_total:.1f}:{current_speed:.2f}\n")
-                  
-                  with open("merged_upload_progress.txt", "w") as f:
-                      f.write(f"{percent:.1f}\n{mb_uploaded:.1f}\n{mb_total:.1f}\n{current_speed:.2f}")
-                  
-                  with open("merged_upload_speed.txt", "w") as f:
-                      f.write(f"{current_speed:.2f}")
-                  
-                  min_speed = float(os.environ.get("MIN_UPLOAD_SPEED_MBPS", 0.5))
-                  if percent > 10 and current_speed < min_speed and len(speed_samples) > 5:
-                      with open("merged_progress.log", "a") as f:
-                          f.write(f"{datetime.datetime.now()}: SPEED_TOO_SLOW:{current_speed:.2f}:{min_speed}\n")
-                      print(f"⚠️ Speed too slow: {current_speed:.2f} MB/s (min: {min_speed} MB/s)")
-              
-              last_progress_time = current_time
-              last_progress_bytes = current
-              sys.stdout.flush()
+                      f.write(f"{datetime.datetime.now()}: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)\n")
 
           chat_id = parse_chat_id(chat_id_raw)
 
@@ -1726,21 +1856,24 @@ jobs:
                           return dialog.entity
               return None
 
-          async def fast_upload_file(client, file_path, progress_callback=None, attributes=None):
+          async def fast_upload_file(client, file_path, progress_callback=None):
               if not os.path.exists(file_path):
                   print(f"❌ File not found: {file_path}")
                   return None
               
               file_size = os.path.getsize(file_path)
+              CHUNK_SIZE = 512 * 1024
+              NUM_CHUNKS = math.ceil(file_size / CHUNK_SIZE)
+              
               print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
+              print(f"📊 Chunks: {NUM_CHUNKS} (512KB each)")
               
               try:
                   return await client.upload_file(
                       file_path,
                       part_size_kb=512,
                       file_name=os.path.basename(file_path),
-                      progress_callback=progress_callback,
-                      attributes=attributes
+                      progress_callback=progress_callback
                   )
               except Exception as e:
                   print(f"❌ Upload failed: {e}")
@@ -1751,134 +1884,52 @@ jobs:
                   print(f"❌ File not found: {file_path}")
                   return False, None
               
+              # Get accurate video metadata using ffprobe
               duration, w, h = get_video_metadata(file_path)
               print(f"📊 Video duration: {duration} seconds, {w}x{h}")
               
-              if w <= 0 or h <= 0:
-                  print("⚠️ Invalid dimensions detected, using ffprobe fallback...")
-                  try:
-                      cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", 
-                             "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
-                      result = subprocess.check_output(cmd, text=True).strip()
-                      parts = result.split(',')
-                      if len(parts) >= 2:
-                          w = int(parts[0]) if parts[0].isdigit() else 1280
-                          h = int(parts[1]) if parts[1].isdigit() else 720
-                  except:
-                      w, h = 1280, 720
-                  print(f"📊 Using fallback dimensions: {w}x{h}")
-              
-              video_attr = DocumentAttributeVideo(
-                  duration=duration if duration > 0 else 60,
-                  w=w if w > 0 else 1280,
-                  h=h if h > 0 else 720,
-                  supports_streaming=True
-              )
-              
-              print(f"📐 Video attributes: {video_attr.w}x{video_attr.h}, duration: {video_attr.duration}s")
-              with open("merged_progress.log", "a") as f:
-                  f.write(f"{datetime.datetime.now()}: VIDEO_ATTRS: {video_attr.w}x{video_attr.h}, {video_attr.duration}s\n")
+              # Ensure we have valid values for DocumentAttributeVideo
+              if duration == 0:
+                  print("⚠️ Could not detect duration, using 60 seconds as fallback")
+                  duration = 60
+              if w == 0 or h == 0:
+                  print("⚠️ Could not detect resolution, using 1280x720 as fallback")
+                  w, h = 1280, 720
               
               thumb = generate_thumbnail(file_path)
               
-              should_send_poster = False
-              if poster_path and os.path.isfile(poster_path):
-                  provider_valid = series_provider and series_provider != "N/A" and series_provider.strip()
-                  description_valid = series_description and series_description != "N/A" and series_description.strip()
-                  
-                  if provider_valid and description_valid:
-                      should_send_poster = True
-                      print("✅ Poster will be sent (provider and description present)")
-                      with open("merged_progress.log", "a") as f:
-                          f.write(f"{datetime.datetime.now()}: POSTER_WILL_BE_SENT\n")
-                  else:
-                      missing = []
-                      if not provider_valid:
-                          missing.append("provider")
-                      if not description_valid:
-                          missing.append("description")
-                      print(f"⚠️ Skipping poster - missing: {', '.join(missing)}")
-                      with open("merged_progress.log", "a") as f:
-                          f.write(f"{datetime.datetime.now()}: POSTER_SKIPPED - missing: {', '.join(missing)}\n")
-              else:
-                  print("⚠️ No poster available, skipping")
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: NO_POSTER_AVAILABLE\n")
-              
-              if should_send_poster:
-                  try:
-                      print("🖼️ Sending poster as separate full-size photo...")
-                      with open("merged_progress.log", "a") as f:
-                          f.write(f"{datetime.datetime.now()}: POSTER_SENDING_STARTED\n")
-                      
-                      poster_caption = f"📺 {title}\n👤 {series_provider}\n📝 {series_description}"
-                      
-                      await client.send_file(
-                          entity=entity,
-                          file=poster_path,
-                          caption=poster_caption,
-                          force_document=False
-                      )
-                      print("✅ Poster sent as full-size photo with title, provider, description")
-                      with open("merged_progress.log", "a") as f:
-                          f.write(f"{datetime.datetime.now()}: POSTER_SENT\n")
-                      await asyncio.sleep(1)
-                  except Exception as e:
-                      print(f"⚠️ Poster send failed: {e}")
-                      with open("merged_progress.log", "a") as f:
-                          f.write(f"{datetime.datetime.now()}: POSTER_FAILED: {e}\n")
-              
-              print("⬆️ Uploading video to Telegram...")
-              with open("merged_progress.log", "a") as f:
-                  f.write(f"{datetime.datetime.now()}: VIDEO_UPLOAD_STARTED\n")
-              
+              print(f"⬆️ Uploading to channel...")
               try:
                   uploaded_file = await fast_upload_file(
                       client=client,
                       file_path=file_path,
-                      progress_callback=progress_callback,
-                      attributes=[video_attr]
+                      progress_callback=progress_callback
                   )
                   
                   if uploaded_file is None:
                       print("❌ Upload returned None")
-                      with open("merged_progress.log", "a") as f:
-                          f.write(f"{datetime.datetime.now()}: UPLOAD_RETURNED_NONE\n")
                       return False, None
                       
-                  print("✅ Video upload complete!")
+                  print("✅ Upload complete!")
                   with open("merged_progress.log", "a") as f:
                       f.write(f"{datetime.datetime.now()}: UPLOAD_COMPLETE\n")
               except Exception as e:
                   print(f"❌ Upload failed: {e}")
                   traceback.print_exc()
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: UPLOAD_FAILED: {e}\n")
                   return False, None
               
-              now = datetime.datetime.now()
-              month_year = now.strftime("%B%Y").upper()
-              if telegram_date:
-                  try:
-                      tg_dt = datetime.datetime.strptime(str(telegram_date).strip(), "%Y-%m-%d")
-                      month_year = tg_dt.strftime("%B%Y").upper()
-                  except ValueError:
-                      pass
-              
-              clean_label = str(label).upper().replace("-", "").replace(" ", "").replace("_", "")
-              if clean_label == "NONE" or clean_label == "":
-                  clean_label = "NONE"
-              
-              provider_clean = str(provider_tag).upper().replace("-", "").replace(" ", "").replace("_", "")
-              if provider_clean == "NONE" or provider_clean == "":
-                  provider_clean = "N/A"
-              
-              video_caption = f"📺 {title}\n\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}\n#{provider_clean}"
+              # Create video attribute with correct duration and resolution
+              video_attr = DocumentAttributeVideo(
+                  duration=duration,
+                  w=w,
+                  h=h,
+                  supports_streaming=True
+              )
               
               kwargs = {
                   "entity": entity,
                   "file": uploaded_file,
-                  "caption": video_caption,
+                  "caption": caption,
                   "attributes": [video_attr],
                   "supports_streaming": True,
                   "force_document": False,
@@ -1889,31 +1940,59 @@ jobs:
                   kwargs["thumb"] = thumb
                   print(f"📸 Using thumbnail: {thumb}")
               
-              print("📤 Sending video to channel...")
+              # Check if poster should be sent
+              # Only send poster if ALL conditions are met:
+              # 1. Poster file exists
+              # 2. Series provider is not N/A or empty
+              # 3. Series description is not N/A or empty
+              should_send_poster = False
+              if poster_path and os.path.isfile(poster_path):
+                  provider_has_value = series_provider and series_provider != "N/A" and series_provider.strip()
+                  description_has_value = series_description and series_description != "N/A" and series_description.strip()
+                  
+                  if provider_has_value and description_has_value:
+                      should_send_poster = True
+                      print(f"🖼️ Poster will be sent with series info (Provider: {series_provider}, Description: {series_description[:50]}...)")
+                  else:
+                      print(f"⚠️ Poster skipped: Missing provider or description")
+                      if not provider_has_value:
+                          print(f"   - Provider: '{series_provider}' (missing or N/A)")
+                      if not description_has_value:
+                          print(f"   - Description: '{series_description}' (missing or N/A)")
+              
               try:
+                  # First: Post poster with series info if all conditions are met
+                  if should_send_poster:
+                      print(f"🖼️ Posting poster with series info first...")
+                      try:
+                          poster_caption = f"📺 {series_title}\n👤 {series_provider}\n📝 {series_description}"
+                          poster_result = await client.send_file(
+                              entity=entity,
+                              file=poster_path,
+                              caption=poster_caption
+                          )
+                          print("✅ Poster posted with series info!")
+                          await asyncio.sleep(2)  # Small delay before video
+                      except Exception as e:
+                          print(f"⚠️ Poster send failed: {e}, continuing with video")
+                  else:
+                      print("ℹ️ Skipping poster (missing provider, description, or poster file)")
+                  
+                  # Now post the video with title and hashtags only
+                  print("📤 Sending video to channel...")
                   result = await client.send_file(**kwargs)
-                  print("✅ Video sent with Title + Hashtags!")
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: VIDEO_SENT\n")
-                      f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_COMPLETE\n")
+                  print("✅ Video sent to Telegram Channel!")
+                  
                   return True, result
               except Exception as e:
                   print(f"❌ Send failed: {e}")
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: SEND_FAILED: {e}\n")
                   if "thumb" in kwargs:
                       del kwargs["thumb"]
                       try:
                           result = await client.send_file(**kwargs)
-                          print("✅ Video sent with Title + Hashtags (without thumb)!")
-                          with open("merged_progress.log", "a") as f:
-                              f.write(f"{datetime.datetime.now()}: VIDEO_SENT_NO_THUMB\n")
-                              f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_COMPLETE\n")
                           return True, result
                       except Exception as e2:
                           print(f"❌ Send failed without thumb: {e2}")
-                          with open("merged_progress.log", "a") as f:
-                              f.write(f"{datetime.datetime.now()}: SEND_FAILED_NO_THUMB: {e2}\n")
                           return False, None
                   return False, None
               finally:
@@ -1947,29 +2026,52 @@ jobs:
                   print(f"❌ File exceeds 2GB ({file_size_mb:.1f} MB)")
                   return False
               
+              now = datetime.datetime.now()
+              month_year = now.strftime("%B%Y").upper()
+              if telegram_date:
+                  try:
+                      tg_dt = datetime.datetime.strptime(str(telegram_date).strip(), "%Y-%m-%d")
+                      month_year = tg_dt.strftime("%B%Y").upper()
+                      day_suffix = tg_dt.strftime("%d").lstrip('0')
+                  except ValueError:
+                      day_suffix = now.strftime("%d").lstrip('0')
+              else:
+                  day_suffix = now.strftime("%d").lstrip('0')
+              
+              clean_label = str(label).upper().replace("-", "").replace(" ", "").replace("_", "")
+              if clean_label == "NONE" or clean_label == "":
+                  clean_label = "NONE"
+              
+              provider_clean = str(provider_tag).upper().replace("-", "").replace(" ", "").replace("_", "")
+              if provider_clean == "NONE" or provider_clean == "":
+                  provider_clean = "N/A"
+              
+              # Video caption with title (with spaces) and hashtags ONLY
+              video_caption = f"📺 [{telegram_date}]-[{clean_label}]-{display_title}\n\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}\n#{provider_clean}"
+              
               print(f"📤 Uploading merged video to channel...")
-              with open("merged_progress.log", "a") as f:
-                  f.write(f"{datetime.datetime.now()}: UPLOAD_STARTED\n")
+              print(f"📝 Video Caption: {video_caption[:50]}...")
               
               try:
-                  success, result = await send_file_with_thumb(client, entity, video_path, "", poster_path=poster_path)
+                  success, result = await send_file_with_thumb(
+                      client, entity, video_path, video_caption, 
+                      poster_path=poster_path
+                  )
                   if success:
                       print("✅ Merged video successfully posted to channel!")
-                      with open("merged_progress.log", "a") as f:
-                          f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_SUCCESS\n")
                       return True
                   return False
               except FloodWaitError as e:
                   print(f"⏳ Rate limited: waiting {e.seconds}s")
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: FLOOD_WAIT: {e.seconds}s\n")
                   await asyncio.sleep(e.seconds)
-                  return await send_file_with_thumb(client, entity, video_path, "", poster_path=poster_path)
+                  success, result = await send_file_with_thumb(
+                      client, entity, video_path, video_caption,
+                      poster_path=poster_path
+                  )
+                  return success
               except Exception as e:
                   print(f"❌ Merged upload failed: {e}")
                   traceback.print_exc()
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_FAILED: {e}\n")
                   return False
 
           async def main():
@@ -2001,51 +2103,22 @@ jobs:
                   
                   await client.disconnect()
                   print("\n✅ Merged channel upload complete!")
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: SCRIPT_COMPLETE\n")
               except Exception as e:
                   print(f"❌ Error: {e}")
                   traceback.print_exc()
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: SCRIPT_ERROR: {e}\n")
 
           if __name__ == '__main__':
               asyncio.run(main())
           EOFUPLOAD
           
-          # Verify the script was created
-          if [ -f "upload_merged.py" ]; then
-            echo "✅ upload_merged.py created successfully"
-            echo "📋 Script size: $(stat -c%s upload_merged.py 2>/dev/null || stat -f%z upload_merged.py 2>/dev/null || echo "unknown") bytes"
-          else
-            echo "❌ Failed to create upload_merged.py!"
-            exit 1
-          fi
-          
-          echo "========================================="
           echo "🚀 Starting upload to channel in background..."
-          echo "📤 Step 1: Uploading poster (if available)"
-          echo "📤 Step 2: Uploading video"
-          echo "========================================="
-          
-          python3 -u upload_merged.py > merged_upload.log 2>&1 &
+          python3 upload_merged.py > merged_upload.log 2>&1 &
           MERGED_PID=$!
           echo "merged_pid=$MERGED_PID" >> $GITHUB_ENV
           echo "✅ Merged upload started with PID: $MERGED_PID"
-          
-          sleep 3
-          if kill -0 $MERGED_PID 2>/dev/null; then
-            echo "✅ Merged upload process is running (PID: $MERGED_PID)"
-            echo "📋 Check merged_progress.log for status updates"
-          else
-            echo "❌ Merged upload process died immediately!"
-            echo "📋 Error log:"
-            cat merged_upload.log
-            exit 1
-          fi
 
-      - name: Upload Single Episodes
-        if: steps.verify.outputs.verify_success == 'true'
+      - name: Upload Single Episodes (Fast Upload)
+        if: steps.verify.outputs.verify_success == 'true' && github.event.client_payload.skipsingleupload != 'yes'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -2056,6 +2129,7 @@ jobs:
           TG_SINGLE_EPISODES_INVITE_LINK: ${{ secrets.TELEGRAM_SINGLE_EPISODES_INVITE_LINK }}
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
+          DISPLAY_TITLE: ${{ steps.fname.outputs.display_title }}
           LABEL: ${{ steps.fname.outputs.clean_label }}
           TELEGRAM_DATE: ${{ steps.payload.outputs.telegram_date }}
           SERIES_PROVIDER: ${{ steps.payload.outputs.series_provider }}
@@ -2162,38 +2236,47 @@ jobs:
                   return False
 
           def get_video_metadata(file_path):
+              """Get video duration, width, height using ffprobe and mediainfo"""
+              duration = 0
+              width = 1280
+              height = 720
+              
               try:
+                  # Try ffprobe first for duration
                   cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
                   if result and result.replace('.', '', 1).isdigit():
-                      duration = float(result)
+                      duration = int(float(result))
                   else:
+                      # Fallback to mediainfo
                       cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
                       result = subprocess.check_output(cmd, text=True).strip()
-                      duration = float(result) if result.replace('.', '', 1).isdigit() else 0.0
-                  
-                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
+                      if result and result.replace('.', '', 1).isdigit():
+                          duration = int(float(result))
+              except:
+                  pass
+              
+              try:
+                  # Get resolution using ffprobe
+                  cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
-                  parts = result.split('|')
-                  
-                  if len(parts) >= 2:
-                      w = int(parts[0]) if parts[0].isdigit() else 1280
-                      h = int(parts[1]) if parts[1].isdigit() else 720
+                  if result:
+                      parts = result.split(',')
+                      if len(parts) >= 2:
+                          width = int(parts[0]) if parts[0].isdigit() else 1280
+                          height = int(parts[1]) if parts[1].isdigit() else 720
                   else:
-                      cmd = ["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "default=noprint_wrappers=1", file_path]
+                      # Fallback to mediainfo
+                      cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
                       result = subprocess.check_output(cmd, text=True).strip()
-                      w = 1280
-                      h = 720
-                      for line in result.split('\n'):
-                          if 'width=' in line:
-                              w = int(line.split('=')[1])
-                          elif 'height=' in line:
-                              h = int(line.split('=')[1])
-                  
-                  return int(duration), w, h
-              except Exception as e:
-                  print(f"⚠️ Error getting metadata: {e}")
-              return 0, 1280, 720
+                      parts = result.split('|')
+                      if len(parts) >= 2:
+                          width = int(parts[0]) if parts[0].isdigit() else 1280
+                          height = int(parts[1]) if parts[1].isdigit() else 720
+              except:
+                  pass
+              
+              return duration, width, height
 
           def generate_thumbnail(file_path):
               try:
@@ -2325,14 +2408,13 @@ jobs:
               duration, w, h = get_video_metadata(file_path)
               print(f"📊 Video duration: {duration} seconds, {w}x{h}")
               
+              # Ensure we have valid values
               if duration == 0:
-                  try:
-                      cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
-                      result = subprocess.check_output(cmd, text=True).strip()
-                      if result and result.replace('.', '', 1).isdigit():
-                          duration = int(float(result))
-                  except:
-                      pass
+                  print("⚠️ Could not detect duration, using 60 seconds as fallback")
+                  duration = 60
+              if w == 0 or h == 0:
+                  print("⚠️ Could not detect resolution, using 1280x720 as fallback")
+                  w, h = 1280, 720
               
               thumb = generate_thumbnail(file_path)
               
@@ -2407,25 +2489,8 @@ jobs:
               print(f"📊 Found {len(ep_files)} episodes to upload to topic {topic_id}")
               count = 0
               
-              should_send_poster = False
-              if poster_path and os.path.isfile(poster_path):
-                  provider_valid = series_provider and series_provider != "N/A" and series_provider.strip()
-                  description_valid = series_description and series_description != "N/A" and series_description.strip()
-                  
-                  if provider_valid and description_valid:
-                      should_send_poster = True
-                      print("✅ Poster will be sent to topic (provider and description present)")
-                  else:
-                      missing = []
-                      if not provider_valid:
-                          missing.append("provider")
-                      if not description_valid:
-                          missing.append("description")
-                      print(f"⚠️ Skipping poster in topic - missing: {', '.join(missing)}")
-              else:
-                  print("⚠️ No poster available for topic, skipping")
-              
-              if topic_id and should_send_poster:
+              # 📌 Post the poster + series info message in the topic first (if poster available)
+              if topic_id and poster_path and os.path.isfile(poster_path):
                   poster_caption = f"📺 {series_title}\n👤 {series_provider}\n📝 {series_description}"
                   print(f"🖼️ Posting poster with series info into topic...")
                   try:
@@ -2533,184 +2598,73 @@ jobs:
           python3 upload_single.py
           touch single_episodes_complete.txt
 
-      - name: Wait for All Uploads with Speed Monitoring and Auto-Restart
+      - name: Skip Single Episodes Upload (skipsingleupload = yes)
+        if: steps.verify.outputs.verify_success == 'true' && github.event.client_payload.skipsingleupload == 'yes'
+        run: |
+          cd downloads
+          echo "========================================="
+          echo "⏭️ SKIPPING SINGLE EPISODES UPLOAD"
+          echo "========================================="
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+          echo "ℹ️  skipsingleupload = yes, skipping single episodes upload"
+          echo "========================================="
+          echo "Single episodes upload skipped due to skipsingleupload=yes" > single_episodes_complete.txt
+          echo "⏭️ Skipped by user request"
+
+      - name: Wait for All Uploads with Enhanced Progress Monitoring
         if: steps.verify.outputs.verify_success == 'true'
         timeout-minutes: 240
-        env:
-          MIN_UPLOAD_SPEED_MBPS: ${{ env.MIN_UPLOAD_SPEED_MBPS }}
-          RESTART_ATTEMPTS: ${{ env.RESTART_ATTEMPTS }}
         run: |
           cd downloads
           
           echo "========================================="
-          echo "⏳ MONITORING UPLOAD PROGRESS WITH SPEED CHECK"
+          echo "⏳ MONITORING UPLOAD PROGRESS"
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
-          echo "⚡ Min Speed: ${MIN_UPLOAD_SPEED_MBPS} MB/s"
-          echo "🔄 Max Restarts: ${RESTART_ATTEMPTS}"
           echo "========================================="
           
-          RESTART_COUNT=0
-          RESTART_LOG="restart_log.txt"
-          echo "0" > "$RESTART_LOG"
-          
+          # Function to check if merged upload process is still running
           is_merged_running() {
-            if [ -n "$MERGED_PID" ]; then
-              if kill -0 "$MERGED_PID" 2>/dev/null; then
-                return 0
+            if [ -n "${{ env.merged_pid }}" ]; then
+              if kill -0 ${{ env.merged_pid }} 2>/dev/null; then
+                return 0  # Running
               fi
             fi
-            return 1
+            return 1  # Not running
           }
           
-          get_current_speed() {
-            if [ -f "merged_progress.log" ]; then
-              local last_speed=$(grep -E "SPEED_TOO_SLOW" merged_progress.log | tail -1 | cut -d':' -f2)
-              if [ -n "$last_speed" ]; then
-                echo "$last_speed"
-                return
-              fi
-              
-              local last_progress=$(grep -E "UPLOAD_PROGRESS" merged_progress.log | tail -1)
-              if [ -n "$last_progress" ]; then
-                local speed=$(echo "$last_progress" | cut -d':' -f5)
-                if [ -n "$speed" ]; then
-                  echo "$speed"
-                  return
-                fi
-              fi
-            fi
-            echo "0"
-          }
-          
-          get_current_percent() {
-            if [ -f "merged_progress.log" ]; then
-              local last_progress=$(grep -E "UPLOAD_PROGRESS" merged_progress.log | tail -1)
-              if [ -n "$last_progress" ]; then
-                local percent=$(echo "$last_progress" | cut -d':' -f2)
-                if [ -n "$percent" ]; then
-                  echo "$percent"
-                  return
-                fi
-              fi
-            fi
-            echo "0"
-          }
-          
-          is_speed_too_slow() {
-            local speed=$(get_current_speed)
-            local percent=$(get_current_percent)
-            
-            if [ "$(echo "$percent > 10" | bc)" = "1" ] && [ "$(echo "$percent < 95" | bc)" = "1" ]; then
-              local min_speed="${MIN_UPLOAD_SPEED_MBPS:-0.5}"
-              if [ "$(echo "$speed < $min_speed" | bc)" = "1" ] && [ "$speed" != "0" ]; then
-                return 0
-              fi
-            fi
-            return 1
-          }
-          
-          restart_merged_upload() {
-            local restart_count=$1
-            echo ""
-            echo "========================================="
-            echo "🔄 RESTARTING MERGED UPLOAD (Attempt $restart_count)"
-            echo "========================================="
-            
-            if is_merged_running; then
-              echo "🛑 Killing existing upload process (PID: $MERGED_PID)"
-              kill -9 "$MERGED_PID" 2>/dev/null || true
-              sleep 2
-            fi
-            
-            if [ -f "merged_progress.log" ]; then
-              cp merged_progress.log "merged_progress_restart_${restart_count}.log"
-            fi
-            
-            echo "🚀 Starting new upload attempt..."
-            python3 -u upload_merged.py > merged_upload.log 2>&1 &
-            MERGED_PID=$!
-            echo "merged_pid=$MERGED_PID" >> $GITHUB_ENV
-            echo "✅ Restarted merged upload with PID: $MERGED_PID"
-            
-            sleep 5
-            
-            if is_merged_running; then
-              echo "✅ Restarted process is running"
-              echo "$restart_count" > "$RESTART_LOG"
-              return 0
-            else
-              echo "❌ Restarted process died immediately!"
-              return 1
-            fi
-          }
-          
+          # Function to parse progress from log files
           get_merged_progress() {
             if [ -f "merged_progress.log" ]; then
-              if grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log; then
-                echo "100|complete"
-                return
-              fi
+              # Check if upload is complete first
               if grep -q "UPLOAD_COMPLETE" merged_progress.log; then
                 echo "100|complete"
                 return
               fi
-              if grep -q "MERGED_UPLOAD_SUCCESS" merged_progress.log; then
+              
+              # Also check merged_upload.log for success
+              if [ -f "merged_upload.log" ] && grep -q "✅ Video sent to Telegram Channel!" merged_upload.log; then
                 echo "100|complete"
                 return
               fi
               
-              local last_progress=$(grep -E "UPLOAD_PROGRESS" merged_progress.log | tail -1)
+              # Look for progress lines
+              local last_progress=$(grep -E "[0-9]+\.[0-9]+%.*[0-9]+\.[0-9]+/[0-9]+\.[0-9]+ MB" merged_progress.log | tail -1)
               if [ -n "$last_progress" ]; then
-                local percent=$(echo "$last_progress" | cut -d':' -f2)
-                local uploaded=$(echo "$last_progress" | cut -d':' -f3)
-                local total=$(echo "$last_progress" | cut -d':' -f4)
-                echo "$percent|${uploaded}/${total}"
-                return
-              fi
-              
-              echo "0|0.0/0.0"
-            else
-              echo "0|0.0/0.0"
-            fi
-          }
-          
-          get_merged_status() {
-            if [ -f "merged_progress.log" ]; then
-              if grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log; then
-                echo "✅ COMPLETE"
-              elif grep -q "VIDEO_SENT" merged_progress.log; then
-                echo "📤 Video sent"
-              elif grep -q "UPLOAD_COMPLETE" merged_progress.log; then
-                echo "⬆️ Upload complete, sending..."
-              elif grep -q "SPEED_TOO_SLOW" merged_progress.log; then
-                local speed=$(get_current_speed)
-                echo "⚠️ SLOW: ${speed} MB/s"
-              elif grep -q "UPLOAD_PROGRESS" merged_progress.log; then
-                local last_percent=$(grep "UPLOAD_PROGRESS" merged_progress.log | tail -1 | cut -d':' -f2)
-                if [ -n "$last_percent" ]; then
-                  echo "⬆️ Uploading: ${last_percent}%"
-                else
-                  echo "⬆️ Uploading video..."
-                fi
-              elif grep -q "VIDEO_UPLOAD_STARTED" merged_progress.log; then
-                echo "⬆️ Starting video upload"
-              elif grep -q "POSTER_SENT" merged_progress.log; then
-                echo "✅ Poster sent, uploading video..."
-              elif grep -q "POSTER_WILL_BE_SENT" merged_progress.log; then
-                echo "🖼️ Sending poster..."
-              elif grep -q "UPLOAD_STARTED" merged_progress.log; then
-                echo "🔄 Connecting to Telegram..."
-              elif grep -q "Starting merged upload" merged_progress.log; then
-                echo "🔄 Initializing..."
+                # Extract percentage
+                local percent=$(echo "$last_progress" | grep -oE "[0-9.]+\%" | sed 's/%//')
+                # Extract uploaded and total
+                local uploaded=$(echo "$last_progress" | grep -oE "[0-9.]+\/[0-9.]+ MB" | sed 's/ MB//')
+                echo "$percent|$uploaded"
               else
-                echo "⏳ Waiting..."
+                echo "0|0.0/0.0"
               fi
             else
-              echo "⏳ Starting..."
+              echo "0|0.0/0.0"
             fi
           }
           
+          # Function to get episode upload progress
           get_episode_progress() {
             if [ -f "single_episodes_complete.txt" ]; then
               echo "100|complete"
@@ -2718,7 +2672,9 @@ jobs:
             fi
             
             if [ -f "episode_upload.log" ]; then
+              # Count total episodes
               local total_eps=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
+              # Count completed episodes
               local completed=$(grep -c "COMPLETE_EP_" episode_upload.log 2>/dev/null || echo "0")
               
               if [ "$total_eps" -gt 0 ]; then
@@ -2732,6 +2688,7 @@ jobs:
             fi
           }
           
+          # Function to calculate ETA
           calculate_eta() {
             local current=$1
             local total=$2
@@ -2742,52 +2699,63 @@ jobs:
               return
             fi
             
-            if command -v bc &> /dev/null; then
-              local percent=$(echo "scale=2; ($current / $total) * 100" | bc 2>/dev/null || echo "0")
-              if [ "$(echo "$percent > 0" | bc)" = "0" ]; then
-                echo "Calculating..."
-                return
-              fi
-              
-              local remaining_percent=$(echo "scale=2; 100 - $percent" | bc 2>/dev/null || echo "0")
-              if [ "$(echo "$remaining_percent <= 0" | bc)" = "1" ]; then
-                echo "0s"
-                return
-              fi
-              
-              local elapsed_seconds_float=$(echo "$elapsed_seconds" | bc -l 2>/dev/null || echo "1")
-              local rate=$(echo "scale=2; $current / $elapsed_seconds_float" | bc -l 2>/dev/null || echo "1")
-              if [ "$(echo "$rate < 0.001" | bc)" = "1" ]; then
-                echo "Calculating..."
-                return
-              fi
-              
-              local remaining_mb=$(echo "scale=2; $total - $current" | bc -l 2>/dev/null || echo "0")
-              local eta_seconds=$(echo "scale=0; $remaining_mb / $rate" | bc -l 2>/dev/null || echo "0")
-              
-              if [ "$eta_seconds" -lt 1 ]; then
-                echo "0s"
-              elif [ "$eta_seconds" -lt 60 ]; then
-                echo "${eta_seconds}s"
-              elif [ "$eta_seconds" -lt 3600 ]; then
-                local minutes=$((eta_seconds / 60))
-                local seconds=$((eta_seconds % 60))
-                echo "${minutes}m ${seconds}s"
-              else
-                local hours=$((eta_seconds / 3600))
-                local minutes=$(((eta_seconds % 3600) / 60))
-                echo "${hours}h ${minutes}m"
-              fi
-            else
+            local percent=$(echo "scale=2; ($current / $total) * 100" | bc 2>/dev/null || echo "0")
+            if [ "$(echo "$percent > 0" | bc)" = "0" ]; then
               echo "Calculating..."
+              return
+            fi
+            
+            local remaining_percent=$(echo "scale=2; 100 - $percent" | bc 2>/dev/null || echo "0")
+            if [ "$(echo "$remaining_percent <= 0" | bc)" = "1" ]; then
+              echo "0s"
+              return
+            fi
+            
+            local elapsed_seconds_float=$(echo "$elapsed_seconds" | bc -l 2>/dev/null || echo "1")
+            local rate=$(echo "scale=2; $current / $elapsed_seconds_float" | bc -l 2>/dev/null || echo "1")
+            if [ "$(echo "$rate < 0.001" | bc)" = "1" ]; then
+              echo "Calculating..."
+              return
+            fi
+            
+            local remaining_mb=$(echo "scale=2; $total - $current" | bc -l 2>/dev/null || echo "0")
+            local eta_seconds=$(echo "scale=0; $remaining_mb / $rate" | bc -l 2>/dev/null || echo "0")
+            
+            if [ "$eta_seconds" -lt 1 ]; then
+              echo "0s"
+            elif [ "$eta_seconds" -lt 60 ]; then
+              echo "${eta_seconds}s"
+            elif [ "$eta_seconds" -lt 3600 ]; then
+              local minutes=$((eta_seconds / 60))
+              local seconds=$((eta_seconds % 60))
+              echo "${minutes}m ${seconds}s"
+            else
+              local hours=$((eta_seconds / 3600))
+              local minutes=$(((eta_seconds % 3600) / 60))
+              echo "${hours}h ${minutes}m"
             fi
           }
           
+          # Function to get current episode
+          get_current_episode() {
+            if [ -f "episode_upload.log" ]; then
+              local current=$(grep "STARTING_EP_" episode_upload.log 2>/dev/null | tail -1 | grep -oE "[0-9]+" | head -1)
+              if [ -n "$current" ]; then
+                echo "$current"
+              else
+                echo "-"
+              fi
+            else
+              echo "-"
+            fi
+          }
+          
+          # Main monitoring loop
           START_TIME=$(date +%s)
           MERGED_COMPLETE=false
           EPISODES_COMPLETE=false
-          SLOW_SPEED_COUNT=0
-          MAX_SLOW_CHECKS=3
+          NO_PROGRESS_COUNT=0
+          LAST_MERGED_PERCENT=-1
           
           echo ""
           echo "🔄 Monitoring upload progress..."
@@ -2795,27 +2763,32 @@ jobs:
           echo ""
           
           while true; do
+            # Check if both are complete first
             if [ -f "single_episodes_complete.txt" ]; then
               EPISODES_COMPLETE=true
             fi
             
-            if [ -f "merged_progress.log" ]; then
-              if grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log; then
+            # Check merged completion - from log, process ended, or success in upload log
+            if [ -f "merged_progress.log" ] && grep -q "UPLOAD_COMPLETE" merged_progress.log; then
+              MERGED_COMPLETE=true
+            elif [ -f "merged_upload.log" ] && grep -q "✅ Video sent to Telegram Channel!" merged_upload.log; then
+              MERGED_COMPLETE=true
+              # Write completion marker if missing
+              if ! grep -q "UPLOAD_COMPLETE" merged_progress.log 2>/dev/null; then
+                echo "$(date): UPLOAD_COMPLETE" >> merged_progress.log
+              fi
+            elif ! is_merged_running && [ -f "merged_upload.log" ]; then
+              # Process ended, check if it was successful
+              if tail -20 merged_upload.log | grep -q "✅ Video sent to Telegram Channel!"; then
                 MERGED_COMPLETE=true
-              elif grep -q "UPLOAD_COMPLETE" merged_progress.log; then
-                MERGED_COMPLETE=true
-              elif grep -q "MERGED_UPLOAD_SUCCESS" merged_progress.log; then
-                MERGED_COMPLETE=true
-              elif ! is_merged_running && [ -f "merged_upload.log" ]; then
-                if tail -20 merged_upload.log | grep -q "✅ Merged video successfully posted to channel!"; then
-                  MERGED_COMPLETE=true
-                  if ! grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log 2>/dev/null; then
-                    echo "$(date): MERGED_UPLOAD_COMPLETE" >> merged_progress.log
-                  fi
+                # Write completion marker if missing
+                if ! grep -q "UPLOAD_COMPLETE" merged_progress.log 2>/dev/null; then
+                  echo "$(date): UPLOAD_COMPLETE" >> merged_progress.log
                 fi
               fi
             fi
             
+            # If both complete, break out of loop
             if [ "$MERGED_COMPLETE" = true ] && [ "$EPISODES_COMPLETE" = true ]; then
               echo ""
               echo "✅ ALL UPLOADS COMPLETED!"
@@ -2826,6 +2799,7 @@ jobs:
             CURRENT_TIME=$(date +%s)
             ELAPSED=$((CURRENT_TIME - START_TIME))
             
+            # Format elapsed time
             if [ $ELAPSED -lt 60 ]; then
               ELAPSED_STR="${ELAPSED}s"
             elif [ $ELAPSED -lt 3600 ]; then
@@ -2841,30 +2815,45 @@ jobs:
             echo "╠══════════════════════════════════════════════════════════════╣"
             echo "║ ⏱️  Elapsed Time: $(printf "%-40s" "$ELAPSED_STR")║"
             echo "║ 📺 Series: $(printf "%-47s" "${{ steps.fname.outputs.series_title }}")║"
-            echo "║ 🔄 Restarts: $(printf "%-42s" "$RESTART_COUNT/${{ env.RESTART_ATTEMPTS }}")║"
             echo "║                                                              ║"
             
+            # Merged Upload Progress
             MERGED_PROGRESS=$(get_merged_progress)
             MERGED_PERCENT=$(echo "$MERGED_PROGRESS" | cut -d'|' -f1)
             MERGED_DATA=$(echo "$MERGED_PROGRESS" | cut -d'|' -f2)
-            MERGE_STATUS=$(get_merged_status)
-            CURRENT_SPEED=$(get_current_speed)
             
-            echo "║ 📹 Merged Video:                                        ║"
+            # Check poster status from log
+            POSTER_STATUS=""
+            if [ -f "merged_upload.log" ]; then
+              if grep -q "✅ Poster posted with series info!" merged_upload.log; then
+                POSTER_STATUS="✅ Poster sent"
+              elif grep -q "🖼️ Poster will be sent with series info" merged_upload.log; then
+                POSTER_STATUS="🖼️ Poster sending..."
+              elif grep -q "ℹ️ Skipping poster" merged_upload.log; then
+                POSTER_STATUS="ℹ️ Poster skipped (missing info)"
+              elif grep -q "Poster skipped:" merged_upload.log; then
+                POSTER_STATUS="ℹ️ Poster skipped"
+              fi
+            fi
             
-            if [ "$MERGED_COMPLETE" = true ] || [ "$MERGED_DATA" = "complete" ] || [ "$MERGED_PERCENT" = "100" ]; then
+            if [ "$MERGED_COMPLETE" = true ] || [ "$MERGED_DATA" = "complete" ]; then
               MERGED_COMPLETE=true
+              echo "║ 📹 Merged Video:                                        ║"
               echo "║    Status: ✅ COMPLETE                                   ║"
               echo "║    Progress: 100%                                       ║"
               BAR_LENGTH=40
               BAR=""
               for ((i=0; i<$BAR_LENGTH; i++)); do BAR="${BAR}█"; done
               echo "║    [${BAR}] ║"
+              if [ -n "$POSTER_STATUS" ]; then
+                echo "║    $POSTER_STATUS                                    ║"
+              fi
               echo "║                                                              ║"
-            elif [ -n "$MERGED_PERCENT" ] && [ "$MERGED_PERCENT" != "0" ] && [ "$MERGED_PERCENT" != "100" ]; then
-              echo "║    Status: ${MERGE_STATUS}                                 ║"
+            elif [ "$MERGED_PERCENT" != "0" ] && [ "$MERGED_PERCENT" != "100" ]; then
+              echo "║ 📹 Merged Video:                                        ║"
               echo "║    Progress: $(printf "%-51s" "${MERGED_PERCENT}%")║"
               
+              # Create progress bar
               BAR_LENGTH=40
               FILLED=$(echo "scale=0; ($MERGED_PERCENT * $BAR_LENGTH) / 100" | bc 2>/dev/null || echo "0")
               BAR=""
@@ -2872,47 +2861,38 @@ jobs:
               for ((i=$FILLED; i<$BAR_LENGTH; i++)); do BAR="${BAR}░"; done
               echo "║    [${BAR}] ║"
               
-              if [ "$CURRENT_SPEED" != "0" ]; then
-                echo "║    Speed: $(printf "%-49s" "${CURRENT_SPEED} MB/s")║"
-              fi
-              
+              # ETA calculation
               if [[ "$MERGED_DATA" == *"/"* ]]; then
                 UPLOADED=$(echo "$MERGED_DATA" | cut -d'/' -f1)
                 TOTAL=$(echo "$MERGED_DATA" | cut -d'/' -f2)
                 
-                if [[ "$UPLOADED" =~ ^[0-9.]+$ ]] && [[ "$TOTAL" =~ ^[0-9.]+$ ]] && [ "$ELAPSED" -gt 2 ]; then
+                if [[ "$UPLOADED" =~ ^[0-9.]+$ ]] && [[ "$TOTAL" =~ ^[0-9.]+$ ]]; then
                   ETA=$(calculate_eta "$UPLOADED" "$TOTAL" "$ELAPSED")
+                  SPEED=$(echo "scale=2; $UPLOADED / $ELAPSED" | bc -l 2>/dev/null || echo "0")
+                  if [ "$SPEED" != "0" ] && [ "$SPEED" != ".00" ]; then
+                    echo "║    Speed: $(printf "%-49s" "${SPEED} MB/s")║"
+                  fi
                   echo "║    ETA: $(printf "%-51s" "$ETA")║"
                 fi
               fi
               
-              if is_speed_too_slow; then
-                echo "║    ⚠️  Speed below minimum (${MIN_UPLOAD_SPEED_MBPS} MB/s)    ║"
-                SLOW_SPEED_COUNT=$((SLOW_SPEED_COUNT + 1))
-                
-                if [ $SLOW_SPEED_COUNT -ge $MAX_SLOW_CHECKS ] && [ $RESTART_COUNT -lt ${{ env.RESTART_ATTEMPTS }} ]; then
-                  echo "║    🔄 Restarting due to slow speed...                    ║"
-                  SLOW_SPEED_COUNT=0
-                  RESTART_COUNT=$((RESTART_COUNT + 1))
-                  
-                  if restart_merged_upload "$RESTART_COUNT"; then
-                    echo "║    ✅ Restart successful                                ║"
-                  else
-                    echo "║    ❌ Restart failed                                   ║"
-                  fi
-                fi
-              else
-                SLOW_SPEED_COUNT=0
+              if [ -n "$POSTER_STATUS" ]; then
+                echo "║    $POSTER_STATUS                                    ║"
               fi
               echo "║                                                              ║"
             elif is_merged_running; then
-              echo "║    Status: ${MERGE_STATUS}                                 ║"
+              echo "║ 📹 Merged Video: Uploading...                           ║"
+              echo "║    Status: ⏳ In Progress                                 ║"
+              if [ -n "$POSTER_STATUS" ]; then
+                echo "║    $POSTER_STATUS                                    ║"
+              fi
               echo "║                                                              ║"
             else
-              echo "║    Status: ${MERGE_STATUS}                                 ║"
+              echo "║ 📹 Merged Video: Starting...                             ║"
               echo "║                                                              ║"
             fi
             
+            # Episode Upload Progress
             echo "║ 📺 Single Episodes:                                        ║"
             
             EP_PROGRESS=$(get_episode_progress)
@@ -2926,6 +2906,10 @@ jobs:
               BAR=""
               for ((i=0; i<$BAR_LENGTH; i++)); do BAR="${BAR}█"; done
               echo "║    [${BAR}] ║"
+              # Check if it was skipped
+              if [ -f "single_episodes_complete.txt" ] && grep -q "skipped" single_episodes_complete.txt 2>/dev/null; then
+                echo "║    ⏭️  Skipped by user request                           ║"
+              fi
             else
               TOTAL_EPISODES=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
               COMPLETED=$(echo "$EP_DATA" | cut -d'/' -f1 2>/dev/null || echo "0")
@@ -2933,6 +2917,7 @@ jobs:
               if [ "$TOTAL_EPISODES" -gt 0 ]; then
                 echo "║    Progress: $(printf "%-51s" "${EP_PERCENT}% (${COMPLETED}/${TOTAL_EPISODES} episodes)")║"
                 
+                # Create progress bar
                 BAR_LENGTH=40
                 FILLED=$((EP_PERCENT * BAR_LENGTH / 100))
                 BAR=""
@@ -2940,6 +2925,13 @@ jobs:
                 for ((i=$FILLED; i<$BAR_LENGTH; i++)); do BAR="${BAR}░"; done
                 echo "║    [${BAR}] ║"
                 
+                # Get current episode
+                CURRENT_EP=$(get_current_episode)
+                if [ "$CURRENT_EP" != "-" ]; then
+                  echo "║    Current: Episode $(printf "%-42s" "$CURRENT_EP")║"
+                fi
+                
+                # ETA for episodes
                 if [ "$COMPLETED" -gt 0 ] && [ "$ELAPSED" -gt 10 ]; then
                   AVG_TIME_PER_EP=$((ELAPSED / COMPLETED))
                   REMAINING=$((TOTAL_EPISODES - COMPLETED))
@@ -2960,13 +2952,34 @@ jobs:
             echo "║                                                              ║"
             echo "╚══════════════════════════════════════════════════════════════╝"
             
+            # Check for errors (brief check)
             if [ -f "merged_upload.log" ]; then
-              if tail -3 merged_upload.log 2>/dev/null | grep -q "❌"; then
+              if tail -5 merged_upload.log 2>/dev/null | grep -q "❌"; then
                 echo ""
-                echo "⚠️  Errors detected in merged upload log"
-                echo "   Last 5 lines:"
-                tail -5 merged_upload.log | sed 's/^/   /'
+                echo "⚠️  Warning: Possible errors detected in merged upload log"
+                echo "   Check merged_upload.log for details"
               fi
+            fi
+            
+            # If merged upload is at 100% but not marked complete for a while, force complete
+            if [ "$MERGED_PERCENT" = "100" ] && [ "$MERGED_COMPLETE" = false ]; then
+              NO_PROGRESS_COUNT=$((NO_PROGRESS_COUNT + 1))
+              if [ $NO_PROGRESS_COUNT -gt 6 ]; then  # After 30 seconds (6 * 5s)
+                echo ""
+                echo "⚠️  Merged upload at 100% but not marked complete..."
+                echo "   Checking if process is still running..."
+                
+                if ! is_merged_running; then
+                  echo "✅ Process ended, marking as complete..."
+                  echo "$(date): UPLOAD_COMPLETE" >> merged_progress.log
+                  MERGED_COMPLETE=true
+                else
+                  echo "⚠️  Process still running, waiting..."
+                  NO_PROGRESS_COUNT=0
+                fi
+              fi
+            else
+              NO_PROGRESS_COUNT=0
             fi
             
             sleep 5
@@ -2976,6 +2989,7 @@ jobs:
           echo "✅ ALL UPLOADS COMPLETED SUCCESSFULLY!"
           echo "========================================="
           
+          # Show final logs
           if [ -f "merged_upload.log" ]; then
             echo ""
             echo "📋 Final merged upload log:"
@@ -2989,22 +3003,26 @@ jobs:
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "⏱️  Total Time: $ELAPSED_STR"
-          echo "🔄 Total Restarts: $RESTART_COUNT"
           
+          # Get final merged file size
           if [ -f "merged_progress.log" ]; then
-            FINAL_SIZE=$(grep -E "UPLOAD_PROGRESS" merged_progress.log | tail -1 | cut -d':' -f4)
+            FINAL_SIZE=$(grep -E "[0-9]+\.[0-9]+/[0-9]+\.[0-9]+ MB" merged_progress.log | tail -1 | grep -oE "[0-9.]+\/[0-9.]+ MB" | tail -1)
             if [ -n "$FINAL_SIZE" ]; then
-              echo "📹 Merged Video Size: ${FINAL_SIZE} MB"
+              echo "📹 Merged Video Size: $FINAL_SIZE"
             fi
           fi
           
           EP_COUNT=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           if [ -f "single_episodes_complete.txt" ]; then
-            echo "📺 Episodes Uploaded: $EP_COUNT"
+            if grep -q "skipped" single_episodes_complete.txt 2>/dev/null; then
+              echo "📺 Episodes Upload: ⏭️ Skipped (user requested)"
+            else
+              echo "📺 Episodes Uploaded: $EP_COUNT"
+            fi
           fi
           
           echo "========================================="
-          if [ -f "single_episodes_complete.txt" ] && [ -f "merged_progress.log" ] && grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log; then
+          if [ -f "single_episodes_complete.txt" ] && [ -f "merged_progress.log" ] && grep -q "UPLOAD_COMPLETE" merged_progress.log; then
             echo "🎉 All uploads completed successfully!"
           fi
           echo "========================================="
