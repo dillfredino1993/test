@@ -19,7 +19,7 @@ permissions:
 # Change the default here, or override per run by sending
 # "download_delay": <seconds> in the repository_dispatch payload.
 env:
-  DOWNLOAD_DELAY: 15
+  DOWNLOAD_DELAY: 10
 
 jobs:
   upload:
@@ -1913,45 +1913,42 @@ jobs:
                   print(f"📸 Using thumbnail: {thumb}")
               
               # Upload poster together with the video as a media group (album)
+              # NOTE: We send the poster as its OWN photo message first, then the video
+              # with proper DocumentAttributeVideo(w,h). Sending [poster, video] via
+              # Telethon's album path DROPS the w/h attributes (Telethon guesses from
+              # the filename), which makes Telegram's player stretch the video on
+              # phones even though the saved file is correct.
               use_poster = False
               if poster_path and os.path.isfile(poster_path):
-                  print(f"🖼️ Poster found, uploading as album: {poster_path}")
+                  print(f"🖼️ Poster found, posting as separate photo message: {poster_path}")
                   use_poster = True
                   try:
-                      uploaded_poster = await fast_upload_file(
-                          client=client,
-                          file_path=poster_path,
-                          progress_callback=None
+                      # Only the caption header for the poster photo (no hashtag block)
+                      # Telegram caption limit is 1024 chars — truncate description to fit
+                      poster_cap_header = f"📺 {title}\n👤 {series_provider}\n📝 "
+                      max_pdesc = 1024 - len(poster_cap_header) - 2
+                      pdesc = series_description
+                      if len(pdesc) > max_pdesc:
+                          pdesc = pdesc[:max_pdesc - 1].rstrip() + "…"
+                      cap_header_only = f"{poster_cap_header}{pdesc}"
+                      await client.send_file(
+                          entity=entity,
+                          file=poster_path,
+                          caption=cap_header_only,
+                          force_document=False
                       )
-                      if uploaded_poster is None:
-                          print("⚠️ Poster upload failed, continuing with video only")
-                          use_poster = False
+                      print("✅ Poster photo posted")
+                      await asyncio.sleep(1)
                   except Exception as e:
-                      print(f"⚠️ Poster upload failed: {e}, continuing with video only")
-                      use_poster = False
+                      print(f"⚠️ Poster post failed: {e}, continuing with video only")
               
               try:
+                  result = await client.send_file(**kwargs)
                   if use_poster:
-                      try:
-                          result = await client.send_file(
-                              entity=entity,
-                              file=[uploaded_poster, uploaded_file],
-                              caption=caption,
-                              supports_streaming=True,
-                              force_document=False,
-                              allow_cache=True
-                          )
-                          print("✅ Poster + Video sent to Telegram Channel (album)!")
-                          return True, result
-                      except Exception as e:
-                          print(f"⚠️ Album send failed ({e}), falling back to video only")
-                          result = await client.send_file(**kwargs)
-                          print("✅ File sent to Telegram Channel!")
-                          return True, result
+                      print("✅ Poster photo + Video sent to Telegram Channel!")
                   else:
-                      result = await client.send_file(**kwargs)
                       print("✅ File sent to Telegram Channel!")
-                      return True, result
+                  return True, result
               except Exception as e:
                   print(f"❌ Send failed: {e}")
                   if "thumb" in kwargs:
@@ -2014,7 +2011,14 @@ jobs:
               if provider_clean == "NONE" or provider_clean == "":
                   provider_clean = "N/A"
               
-              caption = f"📺 {title}\n👤 {series_provider}\n📝 {series_description}\n\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}\n#{provider_clean}"
+              # Telegram caption limit is 1024 chars — truncate description to fit
+              cap_header = f"📺 {title}\n👤 {series_provider}\n📝 "
+              cap_hashtags = f"\n\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}\n#{provider_clean}"
+              max_desc = 1024 - len(cap_header) - len(cap_hashtags) - 1
+              if len(series_description) > max_desc:
+                  series_description = series_description[:max_desc - 1].rstrip() + "…"
+              
+              caption = f"{cap_header}{series_description}{cap_hashtags}"
               
               print(f"📤 Uploading merged video to channel...")
               print(f"📝 Caption: {caption[:50]}...")
@@ -2442,7 +2446,12 @@ jobs:
               
               # 📌 Post the poster + series info message in the topic first (if poster available)
               if topic_id and poster_path and os.path.isfile(poster_path):
-                  poster_caption = f"📺 {series_title}\n👤 {series_provider}\n📝 {series_description}"
+                  # Telegram caption limit is 1024 chars — truncate description to fit
+                  poster_header = f"📺 {series_title}\n👤 {series_provider}\n📝 "
+                  max_desc = 1024 - len(poster_header) - 2
+                  if len(series_description) > max_desc:
+                      series_description = series_description[:max_desc - 1].rstrip() + "…"
+                  poster_caption = f"{poster_header}{series_description}"
                   print(f"🖼️ Posting poster with series info into topic...")
                   try:
                       await client.send_file(
