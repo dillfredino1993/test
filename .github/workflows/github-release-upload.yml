@@ -20,8 +20,8 @@ permissions:
 # "download_delay": <seconds> in the repository_dispatch payload.
 env:
   DOWNLOAD_DELAY: 15
-  MIN_UPLOAD_SPEED_MBPS: 0.5  # Minimum speed in MB/s before considering slow
-  RESTART_ATTEMPTS: 3         # Max restart attempts
+  MIN_UPLOAD_SPEED_MBPS: 0.5
+  RESTART_ATTEMPTS: 3
 
 jobs:
   upload:
@@ -34,7 +34,6 @@ jobs:
           echo "📋 SERIES INFORMATION"
           echo "========================================="
           
-          # Extract series information from payload
           SERIES="${{ github.event.client_payload.series || github.event.client_payload.series_name || 'Unknown Series' }}"
           LABEL="${{ github.event.client_payload.label || 'NONE' }}"
           EPISODE_COUNT="${{ github.event.client_payload.episode_count || 'Unknown' }}"
@@ -45,11 +44,8 @@ jobs:
           echo "⏰ Started at: $(date)"
           echo "========================================="
           
-          # Store for later use
           echo "series_title=$SERIES" >> $GITHUB_ENV
           echo "label=$LABEL" >> $GITHUB_ENV
-          
-          # Create a file to track workflow progress
           echo "STARTED" > workflow_status.txt
 
       - name: Checkout Code
@@ -71,7 +67,6 @@ jobs:
           echo "🔧 INSTALLING TOOLS"
           echo "========================================="
           
-          # Prevent interactive debconf prompts and disable needrestart hangs
           export DEBIAN_FRONTEND=noninteractive
           export NEEDRESTART_MODE=a
           export NEEDRESTART_SUSPEND=1
@@ -82,7 +77,7 @@ jobs:
           echo "📦 Updating apt cache..."
           sudo apt-get update -qq -o Acquire::ForceIPv4=true -o Acquire::Retries=3 || true
           
-          echo "📦 Installing system packages (aria2, mkvtoolnix, mediainfo, exiftool, bc)..."
+          echo "📦 Installing system packages..."
           sudo apt-get install $APT_FLAGS ffmpeg aria2 mkvtoolnix mediainfo libimage-exiftool-perl bc jq || {
             echo "⚠️ Retrying package install individually..."
             for pkg in ffmpeg aria2 mkvtoolnix mediainfo libimage-exiftool-perl bc jq; do
@@ -112,7 +107,6 @@ jobs:
           echo "✅ INSTALLATION COMPLETE"
           echo "========================================="
           
-          # Show versions
           echo "📊 Tool versions:"
           ffmpeg -version | head -1 || echo "⚠️ ffmpeg not found"
           aria2c --version | head -1 || echo "⚠️ aria2 not found"
@@ -139,7 +133,6 @@ jobs:
           CLEAN_SERIES_TITLE=$(echo "$SERIES" | sed -e 's/[\/:*?"<>|]/_/g' -e 's/^ *//' -e 's/ *$//')
           CLEAN_SERIES_TAG=$(echo "$CLEAN_SERIES_TITLE" | tr ' ' '_')
           
-          # Use telegram date for the title/date (fallback to today's date if blank)
           TELEGRAM_DATE="${{ github.event.client_payload.telegramdate }}"
           if [ -z "$TELEGRAM_DATE" ] || [ "$TELEGRAM_DATE" = "null" ]; then
             TELEGRAM_DATE=$(date +'%Y-%m-%d')
@@ -158,39 +151,34 @@ jobs:
           echo "series_title=${CLEAN_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "clean_label=${CLEAN_LABEL}" >> $GITHUB_OUTPUT
 
-      - name: 📋 Extract Payload Fields (Telegram Date, Provider, Description, Poster)
+      - name: 📋 Extract Payload Fields
         id: payload
         run: |
           echo "========================================="
           echo "📋 EXTRACTING PAYLOAD FIELDS"
           echo "========================================="
           
-          # Telegram date (default to today's date)
           TELEGRAM_DATE="${{ github.event.client_payload.telegramdate }}"
           if [ -z "$TELEGRAM_DATE" ] || [ "$TELEGRAM_DATE" = "null" ]; then
             TELEGRAM_DATE=$(date +'%Y-%m-%d')
           fi
           echo "📅 Telegram Date: $TELEGRAM_DATE"
           
-          # Series provider (default to N/A)
           SERIES_PROVIDER="${{ github.event.client_payload.series_provider }}"
           if [ -z "$SERIES_PROVIDER" ] || [ "$SERIES_PROVIDER" = "null" ]; then
             SERIES_PROVIDER="N/A"
           fi
           echo "🏢 Series Provider: $SERIES_PROVIDER"
           
-          # Series description (default to N/A)
           SERIES_DESCRIPTION="${{ github.event.client_payload.series_description }}"
           if [ -z "$SERIES_DESCRIPTION" ] || [ "$SERIES_DESCRIPTION" = "null" ]; then
             SERIES_DESCRIPTION="N/A"
           fi
           echo "📝 Series Description: $SERIES_DESCRIPTION"
           
-          # Poster URL (can be blank; if blank, skip poster entirely)
           POSTER_URL="${{ github.event.client_payload.poster_url }}"
           echo "🖼️ Poster URL: $POSTER_URL"
           
-          # Provider tag for hashtags: strip non-alphanumerics, uppercase
           PROVIDER_TAG=$(echo "$SERIES_PROVIDER" | sed -e 's/[^a-zA-Z0-9]//g' | tr '[:lower:]' '[:upper:]')
           if [ -z "$PROVIDER_TAG" ]; then
             PROVIDER_TAG="N/A"
@@ -204,7 +192,7 @@ jobs:
           echo "poster_url=${POSTER_URL}" >> $GITHUB_OUTPUT
           echo "provider_tag=${PROVIDER_TAG}" >> $GITHUB_OUTPUT
 
-      - name: Parse URLs with jq (Clean & Uncorrupted)
+      - name: Parse URLs with jq
         env:
           CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
         run: |
@@ -216,13 +204,11 @@ jobs:
           
           mkdir -p downloads && cd downloads
           
-          # Extract URLs cleanly: remove \r carriage returns and trim whitespace
           echo "$CLIENT_PAYLOAD" | tr -d '\r' | jq -r '
             (.episodes[]?.url // .video_urls[]? // .video_url // .url // empty)
             | tostring | gsub("^\\s+|\\s+$"; "")
           ' > urls.txt
           
-          # Remove empty lines
           sed -i '/^$/d' urls.txt
           
           echo "========================================="
@@ -259,7 +245,6 @@ jobs:
           EP_INDEX=1
           FAILED_DOWNLOADS=""
 
-          # Resolve inter-episode delay: payload override > workflow default
           DELAY="${DOWNLOAD_DELAY:-30}"
           PAYLOAD_DELAY="${{ github.event.client_payload.download_delay || '' }}"
           if [ -n "$PAYLOAD_DELAY" ] && [[ "$PAYLOAD_DELAY" =~ ^[0-9]+$ ]]; then
@@ -267,13 +252,11 @@ jobs:
           fi
           echo "⏳ Inter-episode delay: ${DELAY}s"
           
-          # Store URLs in array for redownload if needed
           declare -a URL_ARRAY
           while IFS= read -r line; do
             URL_ARRAY+=("$line")
           done < urls.txt
           
-          # Function to check if file has video and audio
           check_file_validity() {
             local file="$1"
             if [ ! -f "$file" ] || [ ! -s "$file" ]; then
@@ -287,14 +270,12 @@ jobs:
               return 1
             fi
             
-            # Check for video stream
             local has_video=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null)
             if [ -z "$has_video" ] || [ "$has_video" != "video" ]; then
               echo "❌ No video stream in: $file"
               return 1
             fi
             
-            # Get resolution
             local width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$file" 2>/dev/null)
             local height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$file" 2>/dev/null)
             
@@ -312,7 +293,6 @@ jobs:
             fi
           }
           
-          # Function to download with yt-dlp and select highest quality
           download_with_ytdlp() {
             local url="$1"
             local output="$2"
@@ -320,7 +300,6 @@ jobs:
             
             echo "⬇️  Downloading episode $episode with yt-dlp..."
             
-            # Try multiple format strategies in order of preference
             local format_selectors=(
               "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
               "bestvideo+bestaudio/best"
@@ -356,7 +335,6 @@ jobs:
               fi
             done
             
-            # If all format strategies failed, try with explicit quality selection
             if [ "$success" = false ]; then
               echo "🔄 Trying with explicit quality selection..."
               
@@ -396,7 +374,6 @@ jobs:
               fi
             fi
             
-            # Final attempt: Use built-in best quality
             if [ "$success" = false ]; then
               echo "🔄 Final attempt: Using best quality fallback..."
               yt-dlp \
@@ -429,7 +406,6 @@ jobs:
             fi
           }
           
-          # Function to download with aria2c
           download_with_aria2c() {
             local url="$1"
             local output="$2"
@@ -461,12 +437,10 @@ jobs:
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
-            # Clean up any existing files
             rm -f "$OUT_FILE" "$TEMP_FILE" "$FIXED_FILE" 2>/dev/null
             
             DOWNLOAD_SUCCESS=false
             
-            # CHECK URL TYPE: HLS/m3u8 OR DIRECT VIDEO
             if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *".m3u"* ]] || [[ "$URL" == *"master.m3u8"* ]]; then
               echo "📺 HLS STREAM DETECTED - Selecting highest quality"
               
@@ -518,7 +492,6 @@ jobs:
               fi
             fi
             
-            # FINAL VERIFICATION
             if [ "$DOWNLOAD_SUCCESS" = true ] && [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
               FINAL_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
               FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
@@ -529,10 +502,8 @@ jobs:
               rm -f "$OUT_FILE" 2>/dev/null
             fi
             
-            # Clean up temp files
             rm -f "$TEMP_FILE" "$FIXED_FILE" 2>/dev/null
             
-            # DELAY BETWEEN EPISODE DOWNLOADS
             if [ "$EP_INDEX" -lt "$TOTAL_EPISODES" ] && [ "$DELAY" -gt 0 ] 2>/dev/null; then
               echo "⏳ Waiting ${DELAY}s before next episode..."
               sleep "$DELAY"
@@ -576,7 +547,7 @@ jobs:
           echo "✅ All $TOTAL_EPISODES episodes downloaded and verified successfully!"
           echo "========================================="
 
-      - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
+      - name: Compress Episodes Larger Than 80MB
         timeout-minutes: 240
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
@@ -1440,7 +1411,7 @@ jobs:
             fi
           fi
 
-      - name: 📥 Download Poster (for Telegram Uploads)
+      - name: 📥 Download Poster
         if: steps.verify.outputs.verify_success == 'true' && steps.payload.outputs.poster_url != ''
         env:
           POSTER_URL: ${{ steps.payload.outputs.poster_url }}
@@ -1565,7 +1536,6 @@ jobs:
           echo "merged_pid=$MERGED_PID" >> $GITHUB_ENV
           echo "✅ Merged upload started with PID: $MERGED_PID"
           
-          # Wait and verify process is running
           sleep 3
           if kill -0 $MERGED_PID 2>/dev/null; then
             echo "✅ Merged upload process is running (PID: $MERGED_PID)"
@@ -1577,7 +1547,7 @@ jobs:
             exit 1
           fi
 
-      - name: Upload Single Episodes (Fast Upload)
+      - name: Upload Single Episodes
         if: steps.verify.outputs.verify_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -1940,7 +1910,6 @@ jobs:
               print(f"📊 Found {len(ep_files)} episodes to upload to topic {topic_id}")
               count = 0
               
-              # Check if poster should be sent
               should_send_poster = False
               if poster_path and os.path.isfile(poster_path):
                   provider_valid = series_provider and series_provider != "N/A" and series_provider.strip()
@@ -1959,7 +1928,6 @@ jobs:
               else:
                   print("⚠️ No poster available for topic, skipping")
               
-              # Post poster + series info in topic (if valid)
               if topic_id and should_send_poster:
                   poster_caption = f"📺 {series_title}\n👤 {series_provider}\n📝 {series_description}"
                   print(f"🖼️ Posting poster with series info into topic...")
@@ -1975,7 +1943,6 @@ jobs:
                       print(f"⚠️ Poster post failed: {e}")
                   await asyncio.sleep(2)
               
-              # Upload episodes
               for ep_file in ep_files:
                   ep_match = re.search(r'EP(\d+)\.mp4', ep_file)
                   if not ep_match:
@@ -2086,22 +2053,19 @@ jobs:
           echo "🔄 Max Restarts: ${RESTART_ATTEMPTS}"
           echo "========================================="
           
-          # Initialize restart counter
           RESTART_COUNT=0
           RESTART_LOG="restart_log.txt"
           echo "0" > "$RESTART_LOG"
           
-          # Function to check if merged upload process is still running
           is_merged_running() {
             if [ -n "$MERGED_PID" ]; then
               if kill -0 "$MERGED_PID" 2>/dev/null; then
-                return 0  # Running
+                return 0
               fi
             fi
-            return 1  # Not running
+            return 1
           }
           
-          # Function to get current speed from progress log
           get_current_speed() {
             if [ -f "merged_progress.log" ]; then
               local last_speed=$(grep -E "SPEED_TOO_SLOW" merged_progress.log | tail -1 | cut -d':' -f2)
@@ -2122,7 +2086,6 @@ jobs:
             echo "0"
           }
           
-          # Function to get current percent
           get_current_percent() {
             if [ -f "merged_progress.log" ]; then
               local last_progress=$(grep -E "UPLOAD_PROGRESS" merged_progress.log | tail -1)
@@ -2137,22 +2100,19 @@ jobs:
             echo "0"
           }
           
-          # Function to check if speed is too slow
           is_speed_too_slow() {
             local speed=$(get_current_speed)
             local percent=$(get_current_percent)
             
-            # Only check speed if we're between 10% and 95% complete
             if [ "$(echo "$percent > 10" | bc)" = "1" ] && [ "$(echo "$percent < 95" | bc)" = "1" ]; then
               local min_speed="${MIN_UPLOAD_SPEED_MBPS:-0.5}"
               if [ "$(echo "$speed < $min_speed" | bc)" = "1" ] && [ "$speed" != "0" ]; then
-                return 0  # Speed is too slow
+                return 0
               fi
             fi
-            return 1  # Speed is acceptable
+            return 1
           }
           
-          # Function to restart merged upload
           restart_merged_upload() {
             local restart_count=$1
             echo ""
@@ -2160,29 +2120,24 @@ jobs:
             echo "🔄 RESTARTING MERGED UPLOAD (Attempt $restart_count)"
             echo "========================================="
             
-            # Kill existing process
             if is_merged_running; then
               echo "🛑 Killing existing upload process (PID: $MERGED_PID)"
               kill -9 "$MERGED_PID" 2>/dev/null || true
               sleep 2
             fi
             
-            # Backup old log
             if [ -f "merged_progress.log" ]; then
               cp merged_progress.log "merged_progress_restart_${restart_count}.log"
             fi
             
-            # Start new upload
             echo "🚀 Starting new upload attempt..."
             python3 -u upload_merged.py > merged_upload.log 2>&1 &
             MERGED_PID=$!
             echo "merged_pid=$MERGED_PID" >> $GITHUB_ENV
             echo "✅ Restarted merged upload with PID: $MERGED_PID"
             
-            # Wait for process to start
             sleep 5
             
-            # Check if process is running
             if is_merged_running; then
               echo "✅ Restarted process is running"
               echo "$restart_count" > "$RESTART_LOG"
@@ -2193,10 +2148,8 @@ jobs:
             fi
           }
           
-          # Function to parse progress from log files
           get_merged_progress() {
             if [ -f "merged_progress.log" ]; then
-              # Check for completion
               if grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log; then
                 echo "100|complete"
                 return
@@ -2210,7 +2163,6 @@ jobs:
                 return
               fi
               
-              # Check for progress
               local last_progress=$(grep -E "UPLOAD_PROGRESS" merged_progress.log | tail -1)
               if [ -n "$last_progress" ]; then
                 local percent=$(echo "$last_progress" | cut -d':' -f2)
@@ -2226,7 +2178,6 @@ jobs:
             fi
           }
           
-          # Function to get merged status
           get_merged_status() {
             if [ -f "merged_progress.log" ]; then
               if grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log; then
@@ -2263,7 +2214,6 @@ jobs:
             fi
           }
           
-          # Function to get episode progress
           get_episode_progress() {
             if [ -f "single_episodes_complete.txt" ]; then
               echo "100|complete"
@@ -2285,7 +2235,6 @@ jobs:
             fi
           }
           
-          # Function to calculate ETA
           calculate_eta() {
             local current=$1
             local total=$2
@@ -2337,7 +2286,6 @@ jobs:
             fi
           }
           
-          # Main monitoring loop
           START_TIME=$(date +%s)
           MERGED_COMPLETE=false
           EPISODES_COMPLETE=false
@@ -2350,12 +2298,10 @@ jobs:
           echo ""
           
           while true; do
-            # Check if episodes are complete
             if [ -f "single_episodes_complete.txt" ]; then
               EPISODES_COMPLETE=true
             fi
             
-            # Check merged completion
             if [ -f "merged_progress.log" ]; then
               if grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log; then
                 MERGED_COMPLETE=true
@@ -2373,7 +2319,6 @@ jobs:
               fi
             fi
             
-            # If both complete, break
             if [ "$MERGED_COMPLETE" = true ] && [ "$EPISODES_COMPLETE" = true ]; then
               echo ""
               echo "✅ ALL UPLOADS COMPLETED!"
@@ -2384,7 +2329,6 @@ jobs:
             CURRENT_TIME=$(date +%s)
             ELAPSED=$((CURRENT_TIME - START_TIME))
             
-            # Format elapsed time
             if [ $ELAPSED -lt 60 ]; then
               ELAPSED_STR="${ELAPSED}s"
             elif [ $ELAPSED -lt 3600 ]; then
@@ -2403,7 +2347,6 @@ jobs:
             echo "║ 🔄 Restarts: $(printf "%-42s" "$RESTART_COUNT/${{ env.RESTART_ATTEMPTS }}")║"
             echo "║                                                              ║"
             
-            # Merged Upload Progress
             MERGED_PROGRESS=$(get_merged_progress)
             MERGED_PERCENT=$(echo "$MERGED_PROGRESS" | cut -d'|' -f1)
             MERGED_DATA=$(echo "$MERGED_PROGRESS" | cut -d'|' -f2)
@@ -2432,7 +2375,6 @@ jobs:
               for ((i=$FILLED; i<$BAR_LENGTH; i++)); do BAR="${BAR}░"; done
               echo "║    [${BAR}] ║"
               
-              # Show speed and ETA
               if [ "$CURRENT_SPEED" != "0" ]; then
                 echo "║    Speed: $(printf "%-49s" "${CURRENT_SPEED} MB/s")║"
               fi
@@ -2447,18 +2389,15 @@ jobs:
                 fi
               fi
               
-              # Show speed warning if too slow
               if is_speed_too_slow; then
                 echo "║    ⚠️  Speed below minimum (${MIN_UPLOAD_SPEED_MBPS} MB/s)    ║"
                 SLOW_SPEED_COUNT=$((SLOW_SPEED_COUNT + 1))
                 
-                # Check if we should restart
                 if [ $SLOW_SPEED_COUNT -ge $MAX_SLOW_CHECKS ] && [ $RESTART_COUNT -lt ${{ env.RESTART_ATTEMPTS }} ]; then
                   echo "║    🔄 Restarting due to slow speed...                    ║"
                   SLOW_SPEED_COUNT=0
                   RESTART_COUNT=$((RESTART_COUNT + 1))
                   
-                  # Restart the upload
                   if restart_merged_upload "$RESTART_COUNT"; then
                     echo "║    ✅ Restart successful                                ║"
                   else
@@ -2477,7 +2416,6 @@ jobs:
               echo "║                                                              ║"
             fi
             
-            # Episode Upload Progress
             echo "║ 📺 Single Episodes:                                        ║"
             
             EP_PROGRESS=$(get_episode_progress)
@@ -2525,7 +2463,6 @@ jobs:
             echo "║                                                              ║"
             echo "╚══════════════════════════════════════════════════════════════╝"
             
-            # Check for errors in logs
             if [ -f "merged_upload.log" ]; then
               if tail -3 merged_upload.log 2>/dev/null | grep -q "❌"; then
                 echo ""
@@ -2542,7 +2479,6 @@ jobs:
           echo "✅ ALL UPLOADS COMPLETED SUCCESSFULLY!"
           echo "========================================="
           
-          # Show final logs
           if [ -f "merged_upload.log" ]; then
             echo ""
             echo "📋 Final merged upload log:"
@@ -2558,7 +2494,6 @@ jobs:
           echo "⏱️  Total Time: $ELAPSED_STR"
           echo "🔄 Total Restarts: $RESTART_COUNT"
           
-          # Get final merged file size
           if [ -f "merged_progress.log" ]; then
             FINAL_SIZE=$(grep -E "UPLOAD_PROGRESS" merged_progress.log | tail -1 | cut -d':' -f4)
             if [ -n "$FINAL_SIZE" ]; then
