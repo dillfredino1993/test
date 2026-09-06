@@ -2117,8 +2117,21 @@ jobs:
           echo "merged_pid=$MERGED_PID" >> $GITHUB_ENV
           echo "✅ Merged upload started with PID: $MERGED_PID"
 
+      - name: Skip Single Episodes Upload (skipsingleupload = yes)
+        if: steps.verify.outputs.verify_success == 'true' && github.event.client_payload.skipsingleupload == 'yes'
+        run: |
+          cd downloads
+          echo "========================================="
+          echo "⏭️ SKIPPING SINGLE EPISODES UPLOAD"
+          echo "========================================="
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+          echo "ℹ️  skipsingleupload = yes, skipping single episodes upload"
+          echo "========================================="
+          echo "Single episodes upload skipped due to skipsingleupload=yes" > single_episodes_complete.txt
+          echo "⏭️ Skipped by user request"
+
       - name: Upload Single Episodes (Fast Upload)
-        if: steps.verify.outputs.verify_success == 'true' && github.event.client_payload.skipsingleupload != 'yes'
+        if: steps.verify.outputs.verify_success == 'true' && (github.event.client_payload.skipsingleupload == '' || github.event.client_payload.skipsingleupload == null || github.event.client_payload.skipsingleupload != 'yes')
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -2187,6 +2200,7 @@ jobs:
           
           title = os.environ.get("TITLE")
           series_title = os.environ.get("SERIES_TITLE", "Series")
+          display_title = os.environ.get("DISPLAY_TITLE", series_title)
           label = os.environ.get("LABEL", "NONE")
           telegram_date = os.environ.get("TELEGRAM_DATE", datetime.date.today().strftime("%Y-%m-%d"))
           series_provider = os.environ.get("SERIES_PROVIDER", "N/A")
@@ -2597,19 +2611,6 @@ jobs:
           
           python3 upload_single.py
           touch single_episodes_complete.txt
-
-      - name: Skip Single Episodes Upload (skipsingleupload = yes)
-        if: steps.verify.outputs.verify_success == 'true' && github.event.client_payload.skipsingleupload == 'yes'
-        run: |
-          cd downloads
-          echo "========================================="
-          echo "⏭️ SKIPPING SINGLE EPISODES UPLOAD"
-          echo "========================================="
-          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
-          echo "ℹ️  skipsingleupload = yes, skipping single episodes upload"
-          echo "========================================="
-          echo "Single episodes upload skipped due to skipsingleupload=yes" > single_episodes_complete.txt
-          echo "⏭️ Skipped by user request"
 
       - name: Wait for All Uploads with Enhanced Progress Monitoring
         if: steps.verify.outputs.verify_success == 'true'
