@@ -770,8 +770,7 @@ jobs:
             echo "❌ FAILED COMPRESSIONS: $FAILED_COMPRESSIONS"
             echo "❌ Not all episodes compressed successfully!"
             echo "   This is an all-or-nothing workflow. Exiting."
-            exit 1
-          fi
+            exit 1          fi
           
           echo "✅ All episodes processed successfully!"
           echo "========================================="
@@ -1523,6 +1522,504 @@ jobs:
             echo "✅ Poster will be uploaded (provider and description present)"
           else
             echo "⚠️ Poster will be skipped (missing: provider=$PROVIDER_VALID, description=$DESCRIPTION_VALID)"
+          fi
+          
+          echo "========================================="
+          echo "🚀 Creating upload_merged.py script..."
+          echo "========================================="
+          
+          # Create the upload_merged.py script directly
+          cat > upload_merged.py << 'EOFUPLOAD'
+          import os
+          import sys
+          import glob
+          import re
+          import subprocess
+          import asyncio
+          import datetime
+          import traceback
+          import json
+          import math
+          import time
+
+          if hasattr(sys.stdout, "reconfigure"):
+              sys.stdout.reconfigure(line_buffering=True)
+              sys.stderr.reconfigure(line_buffering=True)
+
+          try:
+              from telethon import TelegramClient
+              from telethon.sessions import StringSession
+              from telethon.errors import FloodWaitError
+              from telethon.tl.functions.channels import JoinChannelRequest
+              from telethon.tl.functions.messages import ImportChatInviteRequest
+              from telethon.tl.types import DocumentAttributeVideo
+              import telethon
+              print(f"✅ Telethon version: {telethon.__version__}")
+          except ImportError as e:
+              print(f"❌ Import error: {e}")
+              sys.exit(1)
+
+          api_id = os.environ.get("TG_API_ID")
+          api_hash = os.environ.get("TG_API_HASH")
+          session_string = os.environ.get("TG_SESSION_STRING")
+          
+          chat_id_raw = os.environ.get("TG_MERGED_CHAT_ID")
+          chat_name = os.environ.get("TG_MERGED_NAME")
+          invite_link = os.environ.get("TG_MERGED_INVITE_LINK")
+          
+          video_path = os.environ.get("MERGED_PATH")
+          title = os.environ.get("TITLE")
+          series_title = os.environ.get("SERIES_TITLE", "Series")
+          label = os.environ.get("LABEL", "NONE")
+          telegram_date = os.environ.get("TELEGRAM_DATE", datetime.date.today().strftime("%Y-%m-%d"))
+          series_provider = os.environ.get("SERIES_PROVIDER", "N/A")
+          series_description = os.environ.get("SERIES_DESCRIPTION", "N/A")
+          provider_tag = os.environ.get("PROVIDER_TAG", "N/A")
+          poster_path = os.environ.get("POSTER_PATH", "") or ""
+
+          if not all([api_id, api_hash]):
+              print("❌ Missing Telegram API credentials.")
+              sys.exit(0)
+
+          if not session_string:
+              print("❌ Missing session string!")
+              sys.exit(0)
+
+          def parse_chat_id(val):
+              if not val:
+                  return None
+              val = str(val).strip().strip('"').strip("'")
+              try:
+                  return int(val)
+              except ValueError:
+                  return val
+
+          def get_video_metadata(file_path):
+              try:
+                  cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  if result and result.replace('.', '', 1).isdigit():
+                      duration = float(result)
+                  else:
+                      duration = 0
+                  
+                  cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", 
+                         "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  parts = result.split(',')
+                  
+                  if len(parts) >= 2:
+                      w = int(parts[0]) if parts[0].isdigit() else 1280
+                      h = int(parts[1]) if parts[1].isdigit() else 720
+                  else:
+                      w, h = 1280, 720
+                  
+                  print(f"📊 Metadata: duration={duration}, {w}x{h}")
+                  return int(duration), w, h
+                  
+              except Exception as e:
+                  print(f"⚠️ Error getting metadata: {e}")
+                  return 0, 1280, 720
+
+          def generate_thumbnail(file_path):
+              try:
+                  thumb_path = f"{file_path}_thumb.jpg"
+                  cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", 
+                         "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
+                  result = subprocess.check_output(cmd, text=True).strip()
+                  parts = result.split(',')
+                  
+                  if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                      w = int(parts[0])
+                      h = int(parts[1])
+                      ffmpeg_cmd = [
+                          "ffmpeg", "-y", "-ss", "00:00:01",
+                          "-i", file_path,
+                          "-vf", f"crop=min({w},{h}):min({w},{h}),scale=512:512:flags=lanczos",
+                          "-vframes", "1",
+                          "-q:v", "2",
+                          thumb_path
+                      ]
+                      subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                      return thumb_path if os.path.exists(thumb_path) else None
+              except:
+                  pass
+              return None
+
+          # Speed tracking variables
+          last_progress_time = time.time()
+          last_progress_bytes = 0
+          current_speed = 0
+          speed_samples = []
+
+          def progress_callback(current, total):
+              global last_progress_time, last_progress_bytes, current_speed, speed_samples
+              
+              percent = (current / total) * 100
+              mb_uploaded = current / (1024 * 1024)
+              mb_total = total / (1024 * 1024)
+              
+              current_time = time.time()
+              time_diff = current_time - last_progress_time
+              bytes_diff = current - last_progress_bytes
+              
+              if time_diff > 0:
+                  speed_mbps = (bytes_diff / (1024 * 1024)) / time_diff
+                  speed_samples.append(speed_mbps)
+                  if len(speed_samples) > 10:
+                      speed_samples.pop(0)
+                  current_speed = sum(speed_samples) / len(speed_samples)
+                  print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB) @ {current_speed:.2f} MB/s")
+                  
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: UPLOAD_PROGRESS:{percent:.1f}:{mb_uploaded:.1f}:{mb_total:.1f}:{current_speed:.2f}\n")
+                  
+                  with open("merged_upload_progress.txt", "w") as f:
+                      f.write(f"{percent:.1f}\n{mb_uploaded:.1f}\n{mb_total:.1f}\n{current_speed:.2f}")
+                  
+                  with open("merged_upload_speed.txt", "w") as f:
+                      f.write(f"{current_speed:.2f}")
+                  
+                  min_speed = float(os.environ.get("MIN_UPLOAD_SPEED_MBPS", 0.5))
+                  if percent > 10 and current_speed < min_speed and len(speed_samples) > 5:
+                      with open("merged_progress.log", "a") as f:
+                          f.write(f"{datetime.datetime.now()}: SPEED_TOO_SLOW:{current_speed:.2f}:{min_speed}\n")
+                      print(f"⚠️ Speed too slow: {current_speed:.2f} MB/s (min: {min_speed} MB/s)")
+              
+              last_progress_time = current_time
+              last_progress_bytes = current
+              sys.stdout.flush()
+
+          chat_id = parse_chat_id(chat_id_raw)
+
+          print("=" * 60)
+          print("📤 Uploading Merged Video to Channel")
+          print("=" * 60)
+          print(f"📺 Series: {series_title}")
+          print(f"📁 File: {video_path}")
+          print("=" * 60)
+
+          with open("merged_progress.log", "w") as f:
+              f.write(f"{datetime.datetime.now()}: Starting merged upload\n")
+
+          async def join_chat(client, invite_link):
+              if not invite_link:
+                  return None
+              try:
+                  return await client.get_entity(invite_link)
+              except:
+                  return None
+
+          async def resolve_chat(client, chat_id, invite_link, search_name):
+              if invite_link:
+                  entity = await join_chat(client, invite_link)
+                  if entity:
+                      return entity
+              if chat_id:
+                  try:
+                      return await client.get_entity(chat_id)
+                  except:
+                      pass
+              if search_name:
+                  async for dialog in client.iter_dialogs(limit=50):
+                      if search_name.lower() in str(dialog.name).lower():
+                          return dialog.entity
+              return None
+
+          async def fast_upload_file(client, file_path, progress_callback=None, attributes=None):
+              if not os.path.exists(file_path):
+                  print(f"❌ File not found: {file_path}")
+                  return None
+              
+              file_size = os.path.getsize(file_path)
+              print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
+              
+              try:
+                  return await client.upload_file(
+                      file_path,
+                      part_size_kb=512,
+                      file_name=os.path.basename(file_path),
+                      progress_callback=progress_callback,
+                      attributes=attributes
+                  )
+              except Exception as e:
+                  print(f"❌ Upload failed: {e}")
+                  raise
+
+          async def send_file_with_thumb(client, entity, file_path, caption, poster_path=None):
+              if not os.path.exists(file_path):
+                  print(f"❌ File not found: {file_path}")
+                  return False, None
+              
+              duration, w, h = get_video_metadata(file_path)
+              print(f"📊 Video duration: {duration} seconds, {w}x{h}")
+              
+              if w <= 0 or h <= 0:
+                  print("⚠️ Invalid dimensions detected, using ffprobe fallback...")
+                  try:
+                      cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", 
+                             "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      parts = result.split(',')
+                      if len(parts) >= 2:
+                          w = int(parts[0]) if parts[0].isdigit() else 1280
+                          h = int(parts[1]) if parts[1].isdigit() else 720
+                  except:
+                      w, h = 1280, 720
+                  print(f"📊 Using fallback dimensions: {w}x{h}")
+              
+              video_attr = DocumentAttributeVideo(
+                  duration=duration if duration > 0 else 60,
+                  w=w if w > 0 else 1280,
+                  h=h if h > 0 else 720,
+                  supports_streaming=True
+              )
+              
+              print(f"📐 Video attributes: {video_attr.w}x{video_attr.h}, duration: {video_attr.duration}s")
+              with open("merged_progress.log", "a") as f:
+                  f.write(f"{datetime.datetime.now()}: VIDEO_ATTRS: {video_attr.w}x{video_attr.h}, {video_attr.duration}s\n")
+              
+              thumb = generate_thumbnail(file_path)
+              
+              should_send_poster = False
+              if poster_path and os.path.isfile(poster_path):
+                  provider_valid = series_provider and series_provider != "N/A" and series_provider.strip()
+                  description_valid = series_description and series_description != "N/A" and series_description.strip()
+                  
+                  if provider_valid and description_valid:
+                      should_send_poster = True
+                      print("✅ Poster will be sent (provider and description present)")
+                      with open("merged_progress.log", "a") as f:
+                          f.write(f"{datetime.datetime.now()}: POSTER_WILL_BE_SENT\n")
+                  else:
+                      missing = []
+                      if not provider_valid:
+                          missing.append("provider")
+                      if not description_valid:
+                          missing.append("description")
+                      print(f"⚠️ Skipping poster - missing: {', '.join(missing)}")
+                      with open("merged_progress.log", "a") as f:
+                          f.write(f"{datetime.datetime.now()}: POSTER_SKIPPED - missing: {', '.join(missing)}\n")
+              else:
+                  print("⚠️ No poster available, skipping")
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: NO_POSTER_AVAILABLE\n")
+              
+              if should_send_poster:
+                  try:
+                      print("🖼️ Sending poster as separate full-size photo...")
+                      with open("merged_progress.log", "a") as f:
+                          f.write(f"{datetime.datetime.now()}: POSTER_SENDING_STARTED\n")
+                      
+                      poster_caption = f"📺 {title}\n👤 {series_provider}\n📝 {series_description}"
+                      
+                      await client.send_file(
+                          entity=entity,
+                          file=poster_path,
+                          caption=poster_caption,
+                          force_document=False
+                      )
+                      print("✅ Poster sent as full-size photo with title, provider, description")
+                      with open("merged_progress.log", "a") as f:
+                          f.write(f"{datetime.datetime.now()}: POSTER_SENT\n")
+                      await asyncio.sleep(1)
+                  except Exception as e:
+                      print(f"⚠️ Poster send failed: {e}")
+                      with open("merged_progress.log", "a") as f:
+                          f.write(f"{datetime.datetime.now()}: POSTER_FAILED: {e}\n")
+              
+              print("⬆️ Uploading video to Telegram...")
+              with open("merged_progress.log", "a") as f:
+                  f.write(f"{datetime.datetime.now()}: VIDEO_UPLOAD_STARTED\n")
+              
+              try:
+                  uploaded_file = await fast_upload_file(
+                      client=client,
+                      file_path=file_path,
+                      progress_callback=progress_callback,
+                      attributes=[video_attr]
+                  )
+                  
+                  if uploaded_file is None:
+                      print("❌ Upload returned None")
+                      with open("merged_progress.log", "a") as f:
+                          f.write(f"{datetime.datetime.now()}: UPLOAD_RETURNED_NONE\n")
+                      return False, None
+                      
+                  print("✅ Video upload complete!")
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: UPLOAD_COMPLETE\n")
+              except Exception as e:
+                  print(f"❌ Upload failed: {e}")
+                  traceback.print_exc()
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: UPLOAD_FAILED: {e}\n")
+                  return False, None
+              
+              now = datetime.datetime.now()
+              month_year = now.strftime("%B%Y").upper()
+              if telegram_date:
+                  try:
+                      tg_dt = datetime.datetime.strptime(str(telegram_date).strip(), "%Y-%m-%d")
+                      month_year = tg_dt.strftime("%B%Y").upper()
+                  except ValueError:
+                      pass
+              
+              clean_label = str(label).upper().replace("-", "").replace(" ", "").replace("_", "")
+              if clean_label == "NONE" or clean_label == "":
+                  clean_label = "NONE"
+              
+              provider_clean = str(provider_tag).upper().replace("-", "").replace(" ", "").replace("_", "")
+              if provider_clean == "NONE" or provider_clean == "":
+                  provider_clean = "N/A"
+              
+              video_caption = f"📺 {title}\n\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}\n#{provider_clean}"
+              
+              kwargs = {
+                  "entity": entity,
+                  "file": uploaded_file,
+                  "caption": video_caption,
+                  "attributes": [video_attr],
+                  "supports_streaming": True,
+                  "force_document": False,
+                  "allow_cache": True
+              }
+              
+              if thumb and os.path.exists(thumb):
+                  kwargs["thumb"] = thumb
+                  print(f"📸 Using thumbnail: {thumb}")
+              
+              print("📤 Sending video to channel...")
+              try:
+                  result = await client.send_file(**kwargs)
+                  print("✅ Video sent with Title + Hashtags!")
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: VIDEO_SENT\n")
+                      f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_COMPLETE\n")
+                  return True, result
+              except Exception as e:
+                  print(f"❌ Send failed: {e}")
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: SEND_FAILED: {e}\n")
+                  if "thumb" in kwargs:
+                      del kwargs["thumb"]
+                      try:
+                          result = await client.send_file(**kwargs)
+                          print("✅ Video sent with Title + Hashtags (without thumb)!")
+                          with open("merged_progress.log", "a") as f:
+                              f.write(f"{datetime.datetime.now()}: VIDEO_SENT_NO_THUMB\n")
+                              f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_COMPLETE\n")
+                          return True, result
+                      except Exception as e2:
+                          print(f"❌ Send failed without thumb: {e2}")
+                          with open("merged_progress.log", "a") as f:
+                              f.write(f"{datetime.datetime.now()}: SEND_FAILED_NO_THUMB: {e2}\n")
+                          return False, None
+                  return False, None
+              finally:
+                  if thumb and os.path.exists(thumb):
+                      try: os.remove(thumb)
+                      except: pass
+
+          async def upload_merged_video(client, entity):
+              video_path = os.environ.get("MERGED_PATH")
+              
+              if not video_path or not os.path.isfile(video_path):
+                  if os.path.exists("output.mp4"):
+                      video_path = os.path.abspath("output.mp4")
+                  elif os.path.exists("../output.mp4"):
+                      video_path = os.path.abspath("../output.mp4")
+                  else:
+                      video_files = glob.glob("*.mp4")
+                      if video_files:
+                          video_path = os.path.abspath(max(video_files, key=lambda f: os.path.getsize(f)))
+                      else:
+                          return False
+              
+              if not os.path.isfile(video_path):
+                  print(f"❌ Video file not found: {video_path}")
+                  return False
+              
+              file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+              print(f"💾 File size: {file_size_mb:.1f} MB")
+              
+              if file_size_mb > 2000:
+                  print(f"❌ File exceeds 2GB ({file_size_mb:.1f} MB)")
+                  return False
+              
+              print(f"📤 Uploading merged video to channel...")
+              with open("merged_progress.log", "a") as f:
+                  f.write(f"{datetime.datetime.now()}: UPLOAD_STARTED\n")
+              
+              try:
+                  success, result = await send_file_with_thumb(client, entity, video_path, "", poster_path=poster_path)
+                  if success:
+                      print("✅ Merged video successfully posted to channel!")
+                      with open("merged_progress.log", "a") as f:
+                          f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_SUCCESS\n")
+                      return True
+                  return False
+              except FloodWaitError as e:
+                  print(f"⏳ Rate limited: waiting {e.seconds}s")
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: FLOOD_WAIT: {e.seconds}s\n")
+                  await asyncio.sleep(e.seconds)
+                  return await send_file_with_thumb(client, entity, video_path, "", poster_path=poster_path)
+              except Exception as e:
+                  print(f"❌ Merged upload failed: {e}")
+                  traceback.print_exc()
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_FAILED: {e}\n")
+                  return False
+
+          async def main():
+              try:
+                  print("🔌 Connecting to Telegram...")
+                  client = TelegramClient(
+                      StringSession(session_string), 
+                      int(api_id), 
+                      api_hash,
+                      connection_retries=5,
+                      flood_sleep_threshold=180
+                  )
+                  await client.connect()
+                  
+                  if not await client.is_user_authorized():
+                      print("❌ Session invalid")
+                      return
+                  
+                  me = await client.get_me()
+                  print(f"✅ Logged in: {me.first_name}")
+                  
+                  entity = await resolve_chat(client, chat_id, invite_link, chat_name)
+                  if not entity:
+                      print("❌ Could not resolve channel for merged video!")
+                      return
+                  
+                  print(f"\n📤 Posting to Channel: {entity.title if hasattr(entity, 'title') else entity.id}")
+                  await upload_merged_video(client, entity)
+                  
+                  await client.disconnect()
+                  print("\n✅ Merged channel upload complete!")
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: SCRIPT_COMPLETE\n")
+              except Exception as e:
+                  print(f"❌ Error: {e}")
+                  traceback.print_exc()
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: SCRIPT_ERROR: {e}\n")
+
+          if __name__ == '__main__':
+              asyncio.run(main())
+          EOFUPLOAD
+          
+          # Verify the script was created
+          if [ -f "upload_merged.py" ]; then
+            echo "✅ upload_merged.py created successfully"
+            echo "📋 Script size: $(stat -c%s upload_merged.py 2>/dev/null || stat -f%z upload_merged.py 2>/dev/null || echo "unknown") bytes"
+          else
+            echo "❌ Failed to create upload_merged.py!"
+            exit 1
           fi
           
           echo "========================================="
