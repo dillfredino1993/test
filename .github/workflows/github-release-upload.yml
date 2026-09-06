@@ -257,7 +257,7 @@ jobs:
           EP_INDEX=1
           FAILED_DOWNLOADS=""
 
-          # Resolve inter-episode delay: payload override > workflow default
+          # Resolve inter-episode delay
           DELAY="${DOWNLOAD_DELAY:-30}"
           PAYLOAD_DELAY="${{ github.event.client_payload.download_delay || '' }}"
           if [ -n "$PAYLOAD_DELAY" ] && [[ "$PAYLOAD_DELAY" =~ ^[0-9]+$ ]]; then
@@ -265,11 +265,145 @@ jobs:
           fi
           echo "⏳ Inter-episode delay: ${DELAY}s"
           
-          # Store URLs in array for redownload if needed
+          # Function to check if file has video and audio
+          check_file_validity() {
+            local file="$1"
+            if [ ! -f "$file" ] || [ ! -s "$file" ]; then
+              echo "❌ File missing or empty: $file"
+              return 1
+            fi
+            
+            local file_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo "0")
+            if [ "$file_size" -lt 100000 ]; then
+              echo "❌ File too small (${file_size} bytes): $file"
+              return 1
+            fi
+            
+            # Check for video stream
+            local has_video=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null)
+            if [ -z "$has_video" ] || [ "$has_video" != "video" ]; then
+              echo "❌ No video stream in: $file"
+              return 1
+            fi
+            
+            # Get resolution
+            local width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$file" 2>/dev/null)
+            local height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$file" 2>/dev/null)
+            
+            if [ -n "$width" ] && [ "$width" != "0" ] && [ -n "$height" ] && [ "$height" != "0" ]; then
+              local has_audio=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null)
+              if [ -n "$has_audio" ] && [ "$has_audio" = "audio" ]; then
+                echo "✅ ${file}: ${width}x${height}, $(($file_size/1024/1024))MB, with audio"
+              else
+                echo "⚠️ ${file}: ${width}x${height}, $(($file_size/1024/1024))MB, NO AUDIO"
+              fi
+              return 0
+            else
+              echo "❌ Invalid resolution (${width}x${height}) in: $file"
+              return 1
+            fi
+          }
+          
+          # Store URLs in array
           declare -a URL_ARRAY
           while IFS= read -r line; do
             URL_ARRAY+=("$line")
           done < urls.txt
+          
+          # Function to download with yt-dlp and select highest quality
+          download_with_ytdlp() {
+            local url="$1"
+            local output="$2"
+            local episode="$3"
+            
+            echo "⬇️  Downloading episode $episode with yt-dlp..."
+            
+            # Try multiple format strategies in order of preference
+            # Strategy 1: Best video + best audio, preferring MP4 containers
+            # This picks the highest resolution available
+            local format_selectors=(
+              "bestvideo[ext=mp4][height>=?]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
+              "bestvideo+bestaudio/best"
+              "best[ext=mp4]/best"
+            )
+            
+            local success=false
+            
+            for format_selector in "${format_selectors[@]}"; do
+              if [ "$success" = false ]; then
+                yt-dlp \
+                  --extractor-args "generic:impersonate" \
+                  --impersonate chrome \
+                  -f "$format_selector" \
+                  --merge-output-format mp4 \
+                  --no-warnings \
+                  --progress \
+                  --newline \
+                  --geo-bypass \
+                  --no-check-certificates \
+                  --socket-timeout 300 \
+                  --retries 5 \
+                  --fragment-retries 5 \
+                  -o "$output" \
+                  "$url" 2>&1 | grep -E "(Downloading|Merging|file size|Destination|height|[0-9]+x[0-9]+)" || true
+                
+                if [ ${PIPESTATUS[0]} -eq 0 ] && [ -f "$output" ] && [ -s "$output" ]; then
+                  success=true
+                else
+                  rm -f "$output" 2>/dev/null
+                fi
+              fi
+            done
+            
+            # If all format strategies failed, try with aria2c external downloader
+            if [ "$success" = false ]; then
+              echo "🔄 Trying with aria2c external downloader..."
+              yt-dlp \
+                --extractor-args "generic:impersonate" \
+                --impersonate chrome \
+                -f "bestvideo+bestaudio/best" \
+                --merge-output-format mp4 \
+                --external-downloader aria2c \
+                --external-downloader-args "-x 16 -s 16 -k 1M" \
+                --no-warnings \
+                --progress \
+                --newline \
+                --geo-bypass \
+                --no-check-certificates \
+                --socket-timeout 300 \
+                --retries 5 \
+                --fragment-retries 5 \
+                -o "$output" \
+                "$url" 2>&1 | grep -E "(Downloading|Merging|file size|Destination)" || true
+              
+              if [ ${PIPESTATUS[0]} -eq 0 ] && [ -f "$output" ] && [ -s "$output" ]; then
+                success=true
+              fi
+            fi
+            
+            if [ "$success" = true ]; then
+              return 0
+            else
+              return 1
+            fi
+          }
+          
+          # Function to download with aria2c
+          download_with_aria2c() {
+            local url="$1"
+            local output="$2"
+            local episode="$3"
+            
+            echo "⬇️  Downloading episode $episode with aria2c..."
+            
+            aria2c -x 16 -s 16 -k 1M --continue=true \
+              --console-log-level=error \
+              --summary-interval=0 \
+              --download-result=default \
+              -o "$output" "$url" 2>&1 | grep -E "(Downloading|Saved|ERROR)" || true
+            
+            return ${PIPESTATUS[0]}
+          }
           
           while IFS= read -u 3 -r URL || [ -n "$URL" ]; do
             URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
@@ -281,8 +415,8 @@ jobs:
             FIXED_FILE="EP${EP_NUM}_fixed.mp4"
             
             echo "========================================="
-            echo "📥 Downloading Episode $EP_INDEX/$TOTAL_EPISODES"
-            echo "📎 URL: $URL"
+            echo "📥 Episode $EP_INDEX/$TOTAL_EPISODES"
+            echo "📎 URL: $(echo "$URL" | cut -c1-60)..."
             echo "💾 Output: $OUT_FILE"
             echo "========================================="
             
@@ -290,10 +424,109 @@ jobs:
             rm -f "$OUT_FILE" "$TEMP_FILE" "$FIXED_FILE" 2>/dev/null
             
             DOWNLOAD_SUCCESS=false
-            DOWNLOADED_FILE=""
             
-            # [DOWNLOAD LOGIC REMAINS THE SAME - KEEP EXISTING CODE]
-            # ... (keeping the existing download logic as it works)
+            # ------------------------------------------------------------
+            # CHECK URL TYPE: HLS/m3u8 OR DIRECT VIDEO
+            # ------------------------------------------------------------
+            if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *".m3u"* ]] || [[ "$URL" == *"master.m3u8"* ]]; then
+              echo "📺 HLS STREAM DETECTED - Selecting highest quality"
+              
+              # Try yt-dlp with quality selection
+              if download_with_ytdlp "$URL" "$OUT_FILE" "$EP_INDEX"; then
+                if check_file_validity "$OUT_FILE"; then
+                  DOWNLOAD_SUCCESS=true
+                  echo "✅ HLS download successful (highest quality)"
+                else
+                  echo "⚠️ HLS download produced invalid file, trying fallback..."
+                  rm -f "$OUT_FILE" 2>/dev/null
+                fi
+              fi
+              
+              # If yt-dlp failed, try aria2c
+              if [ "$DOWNLOAD_SUCCESS" != true ]; then
+                echo "🔄 Trying aria2c fallback for HLS..."
+                if download_with_aria2c "$URL" "$OUT_FILE" "$EP_INDEX"; then
+                  if check_file_validity "$OUT_FILE"; then
+                    DOWNLOAD_SUCCESS=true
+                    echo "✅ HLS download with aria2c successful"
+                  else
+                    rm -f "$OUT_FILE" 2>/dev/null
+                  fi
+                fi
+              fi
+              
+            else
+              # ------------------------------------------------------------
+              # DIRECT VIDEO URL
+              # ------------------------------------------------------------
+              echo "🎬 DIRECT VIDEO DETECTED"
+              
+              # Try aria2c first (faster for direct downloads)
+              if download_with_aria2c "$URL" "$OUT_FILE" "$EP_INDEX"; then
+                if check_file_validity "$OUT_FILE"; then
+                  DOWNLOAD_SUCCESS=true
+                  echo "✅ Direct download with aria2c successful"
+                else
+                  echo "⚠️ aria2c download produced invalid file, trying fallback..."
+                  rm -f "$OUT_FILE" 2>/dev/null
+                fi
+              fi
+              
+              # If aria2c failed, try yt-dlp
+              if [ "$DOWNLOAD_SUCCESS" != true ]; then
+                echo "🔄 Trying yt-dlp fallback..."
+                if download_with_ytdlp "$URL" "$OUT_FILE" "$EP_INDEX"; then
+                  if check_file_validity "$OUT_FILE"; then
+                    DOWNLOAD_SUCCESS=true
+                    echo "✅ Direct download with yt-dlp successful"
+                  else
+                    rm -f "$OUT_FILE" 2>/dev/null
+                  fi
+                fi
+              fi
+            fi
+            
+            # ------------------------------------------------------------
+            # ULTIMATE FALLBACK: yt-dlp with aria2c external
+            # ------------------------------------------------------------
+            if [ "$DOWNLOAD_SUCCESS" != true ]; then
+              echo "🔄 Trying ultimate fallback: yt-dlp with aria2c..."
+              rm -f "$OUT_FILE" 2>/dev/null
+              
+              yt-dlp \
+                --extractor-args "generic:impersonate" \
+                --impersonate chrome \
+                -f "bestvideo+bestaudio/best" \
+                --merge-output-format mp4 \
+                --remux-video mp4 \
+                --external-downloader aria2c \
+                --external-downloader-args "-x 16 -s 16 -k 1M" \
+                --no-progress \
+                --no-warnings \
+                --geo-bypass \
+                -o "$OUT_FILE" \
+                "$URL" 2>&1 | grep -E "(Merging|Destination)" || true
+              
+              if check_file_validity "$OUT_FILE"; then
+                DOWNLOAD_SUCCESS=true
+                echo "✅ Download with yt-dlp+aria2c successful"
+              else
+                rm -f "$OUT_FILE" 2>/dev/null
+              fi
+            fi
+            
+            # ------------------------------------------------------------
+            # FINAL VERIFICATION
+            # ------------------------------------------------------------
+            if [ "$DOWNLOAD_SUCCESS" = true ] && [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
+              FINAL_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || stat -f%z "$OUT_FILE" 2>/dev/null || echo "0")
+              FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
+              echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FINAL_SIZE_MB}MB)"
+            else
+              echo "❌ Download failed for Episode $EP_INDEX"
+              FAILED_DOWNLOADS="$FAILED_DOWNLOADS $EP_NUM"
+              rm -f "$OUT_FILE" 2>/dev/null
+            fi
             
             # Clean up temp files
             rm -f "$TEMP_FILE" "$FIXED_FILE" 2>/dev/null
@@ -302,7 +535,7 @@ jobs:
             # ⏳ DELAY BETWEEN EPISODE DOWNLOADS
             # ────────────────────────────────────────────────
             if [ "$EP_INDEX" -lt "$TOTAL_EPISODES" ] && [ "$DELAY" -gt 0 ] 2>/dev/null; then
-              echo "⏳ Waiting ${DELAY}s before downloading episode $((EP_INDEX + 1))/$TOTAL_EPISODES..."
+              echo "⏳ Waiting ${DELAY}s before next episode..."
               sleep "$DELAY"
             fi
             
@@ -315,6 +548,16 @@ jobs:
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "📊 Expected: $TOTAL_EPISODES episodes"
+          
+          # Show detailed info for all downloaded files
+          echo ""
+          echo "📋 Downloaded files:"
+          for f in EP*.mp4; do
+            if [ -f "$f" ]; then
+              check_file_validity "$f"
+            fi
+          done
+          echo ""
           
           TOTAL_FILES=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           echo "✅ Downloaded: $TOTAL_FILES/$TOTAL_EPISODES episodes"
@@ -329,38 +572,6 @@ jobs:
           if [ "$TOTAL_FILES" -ne "$TOTAL_EPISODES" ]; then
             echo "❌ Expected $TOTAL_EPISODES episodes, but only $TOTAL_FILES downloaded!"
             echo "❌ Exiting - all episodes required."
-            exit 1
-          fi
-          
-          # Final verification of all files
-          echo ""
-          echo "🔍 Final verification of all episodes..."
-          ALL_GOOD=true
-          for f in EP*.mp4; do
-            if [ -f "$f" ]; then
-              # Check file size first
-              FILE_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
-              if [ "$FILE_SIZE" -lt 100000 ]; then
-                echo "❌ $f is too small (${FILE_SIZE} bytes) - likely corrupt!"
-                ALL_GOOD=false
-                continue
-              fi
-              
-              HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$f" 2>/dev/null)
-              if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
-                echo "❌ $f has no video stream!"
-                ALL_GOOD=false
-              else
-                W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$f" 2>/dev/null)
-                H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null)
-                echo "✅ $f: ${W}x${H}"
-              fi
-            fi
-          done
-          
-          if [ "$ALL_GOOD" != true ]; then
-            echo "❌ Some episodes are missing video streams or are corrupt!"
-            echo "❌ Exiting - all episodes must have valid video."
             exit 1
           fi
           
@@ -1361,7 +1572,7 @@ jobs:
               from telethon.errors import FloodWaitError
               from telethon.tl.functions.channels import JoinChannelRequest
               from telethon.tl.functions.messages import ImportChatInviteRequest
-              from telethon.tl.types import DocumentAttributeVideo, InputMediaUploadedPhoto, InputMediaUploadedDocument
+              from telethon.tl.types import DocumentAttributeVideo
               import telethon
               print(f"✅ Telethon version: {telethon.__version__}")
           except ImportError as e:
@@ -1521,153 +1732,111 @@ jobs:
                   print(f"❌ Upload failed: {e}")
                   raise
 
-          async def send_album_with_video_attributes(client, entity, video_path, poster_path, caption):
-              """Send poster + video as an album with proper video attributes"""
+          async def send_file_with_thumb(client, entity, file_path, caption, poster_path=None):
+              if not os.path.exists(file_path):
+                  print(f"❌ File not found: {file_path}")
+                  return False, None
               
-              # Get video metadata
-              duration, w, h = get_video_metadata(video_path)
-              print(f"📊 Video: {duration}s, {w}x{h}")
+              duration, w, h = get_video_metadata(file_path)
+              print(f"📊 Video duration: {duration} seconds, {w}x{h}")
+              thumb = generate_thumbnail(file_path)
               
-              # Use actual dimensions, fallback to safe defaults
-              actual_w = w if w > 0 else 1280
-              actual_h = h if h > 0 else 720
-              
-              # Create video attributes with correct dimensions
-              video_attr = DocumentAttributeVideo(
-                  duration=duration if duration > 0 else 60,
-                  w=actual_w,
-                  h=actual_h,
-                  supports_streaming=True
-              )
-              
-              thumb = generate_thumbnail(video_path)
-              print(f"📸 Thumbnail: {'created' if thumb else 'not created'}")
-              
-              # Prepare media group (album)
-              media_group = []
-              
-              # 1. Upload poster (if available)
-              if poster_path and os.path.isfile(poster_path):
-                  try:
-                      poster_uploaded = await client.upload_file(
-                          poster_path,
-                          part_size_kb=512,
-                          file_name=os.path.basename(poster_path)
-                      )
-                      if poster_uploaded:
-                          media_group.append(InputMediaUploadedPhoto(poster_uploaded))
-                          print("✅ Poster added to album")
-                  except Exception as e:
-                      print(f"⚠️ Poster upload failed: {e}")
-              
-              # 2. Upload video with attributes
+              print(f"⬆️ Uploading to channel...")
               try:
-                  print(f"⬆️ Uploading video with attributes ({actual_w}x{actual_h})...")
-                  
-                  # Upload the video file with attributes attached
-                  uploaded_file = await client.upload_file(
-                      video_path,
-                      part_size_kb=512,
-                      file_name=os.path.basename(video_path),
-                      attributes=[video_attr]  # This is key for aspect ratio!
+                  uploaded_file = await fast_upload_file(
+                      client=client,
+                      file_path=file_path,
+                      progress_callback=progress_callback
                   )
                   
                   if uploaded_file is None:
                       print("❌ Upload returned None")
                       return False, None
-                  
-                  # Create the media with video attributes
-                  video_media = InputMediaUploadedDocument(
-                      file=uploaded_file,
-                      thumb=thumb if thumb and os.path.exists(thumb) else None,
-                      mime_type="video/mp4",
-                      attributes=[video_attr],
-                      supports_streaming=True,
-                      force_document=False
-                  )
-                  media_group.append(video_media)
-                  print("✅ Video uploaded with attributes")
-                  
+                      
+                  print("✅ Upload complete!")
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: UPLOAD_COMPLETE\n")
               except Exception as e:
-                  print(f"❌ Video upload failed: {e}")
+                  print(f"❌ Upload failed: {e}")
                   traceback.print_exc()
                   return False, None
               
-              # 3. Send the album
-              try:
-                  print(f"📤 Sending album ({len(media_group)} items) to channel...")
-                  result = await client.send_file(
-                      entity=entity,
-                      file=media_group,
-                      caption=caption
-                  )
-                  
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: UPLOAD_COMPLETE\n")
-                  
-                  print("✅ Album sent with proper video attributes!")
-                  return True, result
-                  
-              except Exception as e:
-                  print(f"❌ Album send failed: {e}")
-                  
-                  # Fallback: Send separately
-                  print("🔄 Fallback: Sending separately...")
-                  return await send_video_separately(client, entity, video_path, poster_path, caption, video_attr, thumb)
-
-          async def send_video_separately(client, entity, video_path, poster_path, caption, video_attr, thumb):
-              """Fallback: Send poster and video separately with attributes"""
+              video_attr = DocumentAttributeVideo(
+                  duration=duration,
+                  w=w,
+                  h=h,
+                  supports_streaming=True
+              )
               
-              # Send poster if available
+              kwargs = {
+                  "entity": entity,
+                  "file": uploaded_file,
+                  "caption": caption,
+                  "attributes": [video_attr],
+                  "supports_streaming": True,
+                  "force_document": False,
+                  "allow_cache": True
+              }
+              
+              if thumb and os.path.exists(thumb):
+                  kwargs["thumb"] = thumb
+                  print(f"📸 Using thumbnail: {thumb}")
+              
+              # Upload poster together with the video as a media group (album)
+              use_poster = False
               if poster_path and os.path.isfile(poster_path):
+                  print(f"🖼️ Poster found, uploading as album: {poster_path}")
+                  use_poster = True
                   try:
-                      # Truncate description for poster caption
-                      cap_header = f"📺 {title}\n👤 {series_provider}\n📝 "
-                      max_desc = 1024 - len(cap_header) - 2
-                      pdesc = series_description if series_description else "N/A"
-                      if len(pdesc) > max_desc:
-                          pdesc = pdesc[:max_desc - 1].rstrip() + "…"
-                      poster_caption = f"{cap_header}{pdesc}"
-                      
-                      await client.send_file(
-                          entity=entity,
-                          file=poster_path,
-                          caption=poster_caption,
-                          force_document=False
+                      uploaded_poster = await fast_upload_file(
+                          client=client,
+                          file_path=poster_path,
+                          progress_callback=None
                       )
-                      print("✅ Poster sent separately")
-                      await asyncio.sleep(1)
+                      if uploaded_poster is None:
+                          print("⚠️ Poster upload failed, continuing with video only")
+                          use_poster = False
                   except Exception as e:
-                      print(f"⚠️ Poster fallback failed: {e}")
+                      print(f"⚠️ Poster upload failed: {e}, continuing with video only")
+                      use_poster = False
               
-              # Send video with attributes
               try:
-                  uploaded_file = await client.upload_file(
-                      video_path,
-                      part_size_kb=512,
-                      file_name=os.path.basename(video_path),
-                      attributes=[video_attr]  # Still critical!
-                  )
-                  
-                  kwargs = {
-                      "entity": entity,
-                      "file": uploaded_file,
-                      "caption": caption,
-                      "attributes": [video_attr],
-                      "supports_streaming": True,
-                      "force_document": False
-                  }
-                  
-                  if thumb and os.path.exists(thumb):
-                      kwargs["thumb"] = thumb
-                  
-                  result = await client.send_file(**kwargs)
-                  print("✅ Video sent separately with attributes!")
-                  return True, result
-                  
+                  if use_poster:
+                      try:
+                          result = await client.send_file(
+                              entity=entity,
+                              file=[uploaded_poster, uploaded_file],
+                              caption=caption,
+                              supports_streaming=True,
+                              force_document=False,
+                              allow_cache=True
+                          )
+                          print("✅ Poster + Video sent to Telegram Channel (album)!")
+                          return True, result
+                      except Exception as e:
+                          print(f"⚠️ Album send failed ({e}), falling back to video only")
+                          result = await client.send_file(**kwargs)
+                          print("✅ File sent to Telegram Channel!")
+                          return True, result
+                  else:
+                      result = await client.send_file(**kwargs)
+                      print("✅ File sent to Telegram Channel!")
+                      return True, result
               except Exception as e:
-                  print(f"❌ Video send failed: {e}")
+                  print(f"❌ Send failed: {e}")
+                  if "thumb" in kwargs:
+                      del kwargs["thumb"]
+                      try:
+                          result = await client.send_file(**kwargs)
+                          return True, result
+                      except Exception as e2:
+                          print(f"❌ Send failed without thumb: {e2}")
+                          return False, None
                   return False, None
+              finally:
+                  if thumb and os.path.exists(thumb):
+                      try: os.remove(thumb)
+                      except: pass
 
           async def upload_merged_video(client, entity):
               video_path = os.environ.get("MERGED_PATH")
@@ -1715,21 +1884,13 @@ jobs:
               if provider_clean == "NONE" or provider_clean == "":
                   provider_clean = "N/A"
               
-              # Telegram caption limit is 1024 chars — truncate description to fit
-              cap_header = f"📺 {title}\n👤 {series_provider}\n📝 "
-              cap_hashtags = f"\n\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}\n#{provider_clean}"
-              max_desc = 1024 - len(cap_header) - len(cap_hashtags) - 1
-              desc = series_description if series_description else "N/A"
-              if len(desc) > max_desc:
-                  desc = desc[:max_desc - 1].rstrip() + "…"
-              
-              caption = f"{cap_header}{desc}{cap_hashtags}"
+              caption = f"📺 {title}\n👤 {series_provider}\n📝 {series_description}\n\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}\n#{provider_clean}"
               
               print(f"📤 Uploading merged video to channel...")
-              print(f"📝 Caption length: {len(caption)} chars")
+              print(f"📝 Caption: {caption[:50]}...")
               
               try:
-                  success, result = await send_album_with_video_attributes(client, entity, video_path, poster_path, caption)
+                  success, result = await send_file_with_thumb(client, entity, video_path, caption, poster_path=poster_path)
                   if success:
                       print("✅ Merged video successfully posted to channel!")
                       return True
@@ -1737,7 +1898,7 @@ jobs:
               except FloodWaitError as e:
                   print(f"⏳ Rate limited: waiting {e.seconds}s")
                   await asyncio.sleep(e.seconds)
-                  return await send_album_with_video_attributes(client, entity, video_path, poster_path, caption)
+                  return await send_file_with_thumb(client, entity, video_path, caption, poster_path=poster_path)
               except Exception as e:
                   print(f"❌ Merged upload failed: {e}")
                   traceback.print_exc()
@@ -2139,9 +2300,6 @@ jobs:
                       except: pass
 
           async def upload_episodes(client, entity, topic_id=None):
-              # Get series_description from environment
-              series_description = os.environ.get("SERIES_DESCRIPTION", "N/A")
-              
               ep_files = sorted(glob.glob("EP*.mp4"), 
                   key=lambda f: int(re.search(r'EP(\d+)\.mp4', f).group(1)) if re.search(r'EP(\d+)\.mp4', f) else 0)
               
@@ -2154,13 +2312,7 @@ jobs:
               
               # 📌 Post the poster + series info message in the topic first (if poster available)
               if topic_id and poster_path and os.path.isfile(poster_path):
-                  # Telegram caption limit is 1024 chars — truncate description to fit
-                  poster_header = f"📺 {series_title}\n👤 {series_provider}\n📝 "
-                  max_desc = 1024 - len(poster_header) - 2
-                  desc = series_description if series_description else "N/A"
-                  if len(desc) > max_desc:
-                      desc = desc[:max_desc - 1].rstrip() + "…"
-                  poster_caption = f"{poster_header}{desc}"
+                  poster_caption = f"📺 {series_title}\n👤 {series_provider}\n📝 {series_description}"
                   print(f"🖼️ Posting poster with series info into topic...")
                   try:
                       await client.send_file(
@@ -2416,6 +2568,13 @@ jobs:
             # Check if both are complete first
             if [ -f "single_episodes_complete.txt" ]; then
               EPISODES_COMPLETE=true
+            elif [ -f "episode_upload.log" ]; then
+              chk_total=0
+              chk_done="0"
+              if [ "" -gt 0 ] && [ "" -ge "" ]; then
+                EPISODES_COMPLETE=true
+                touch single_episodes_complete.txt
+              fi
             fi
             
             # Check merged completion - either from log or process ended
@@ -2423,7 +2582,7 @@ jobs:
               MERGED_COMPLETE=true
             elif ! is_merged_running && [ -f "merged_upload.log" ]; then
               # Process ended, check if it was successful
-              if tail -20 merged_upload.log | grep -q "✅ Album sent with proper video attributes!"; then
+              if tail -20 merged_upload.log | grep -q "✅ Merged video uploaded!"; then
                 MERGED_COMPLETE=true
                 # Write completion marker if missing
                 if ! grep -q "UPLOAD_COMPLETE" merged_progress.log 2>/dev/null; then
