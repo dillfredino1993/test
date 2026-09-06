@@ -20,6 +20,8 @@ permissions:
 # "download_delay": <seconds> in the repository_dispatch payload.
 env:
   DOWNLOAD_DELAY: 15
+  MIN_UPLOAD_SPEED_MBPS: 0.5  # Minimum speed in MB/s before considering slow
+  RESTART_ATTEMPTS: 3         # Max restart attempts
 
 jobs:
   upload:
@@ -257,13 +259,19 @@ jobs:
           EP_INDEX=1
           FAILED_DOWNLOADS=""
 
-          # Resolve inter-episode delay
+          # Resolve inter-episode delay: payload override > workflow default
           DELAY="${DOWNLOAD_DELAY:-30}"
           PAYLOAD_DELAY="${{ github.event.client_payload.download_delay || '' }}"
           if [ -n "$PAYLOAD_DELAY" ] && [[ "$PAYLOAD_DELAY" =~ ^[0-9]+$ ]]; then
             DELAY="$PAYLOAD_DELAY"
           fi
           echo "⏳ Inter-episode delay: ${DELAY}s"
+          
+          # Store URLs in array for redownload if needed
+          declare -a URL_ARRAY
+          while IFS= read -r line; do
+            URL_ARRAY+=("$line")
+          done < urls.txt
           
           # Function to check if file has video and audio
           check_file_validity() {
@@ -303,12 +311,6 @@ jobs:
               return 1
             fi
           }
-          
-          # Store URLs in array
-          declare -a URL_ARRAY
-          while IFS= read -r line; do
-            URL_ARRAY+=("$line")
-          done < urls.txt
           
           # Function to download with yt-dlp and select highest quality
           download_with_ytdlp() {
@@ -1458,7 +1460,7 @@ jobs:
             echo "poster_path=" >> $GITHUB_ENV
           fi
 
-      - name: Start Merged Upload (Background with Fast Upload)
+      - name: Start Merged Upload with Speed Monitoring
         if: steps.verify.outputs.verify_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -1476,14 +1478,18 @@ jobs:
           SERIES_DESCRIPTION: ${{ steps.payload.outputs.series_description }}
           PROVIDER_TAG: ${{ steps.payload.outputs.provider_tag }}
           POSTER_PATH: ${{ env.poster_path }}
+          MIN_UPLOAD_SPEED_MBPS: ${{ env.MIN_UPLOAD_SPEED_MBPS }}
+          RESTART_ATTEMPTS: ${{ env.RESTART_ATTEMPTS }}
         run: |
           cd downloads
           
           echo "========================================="
-          echo "📤 STARTING MERGED UPLOAD TO CHANNEL"
+          echo "📤 STARTING MERGED UPLOAD WITH SPEED MONITORING"
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "📁 File: ${{ env.merged_file_path }}"
+          echo "⚡ Min Speed: ${MIN_UPLOAD_SPEED_MBPS} MB/s"
+          echo "🔄 Max Restarts: ${RESTART_ATTEMPTS}"
           echo "========================================="
           
           if [ ! -f "${{ env.merged_file_path }}" ] && [ ! -f "output.mp4" ]; then
@@ -1498,471 +1504,78 @@ jobs:
             echo "⚠️ Using fallback path: $MERGED_PATH"
           fi
           
-          python3 -c "import sys, textwrap; open('upload_merged.py', 'w').write(textwrap.dedent(sys.stdin.read()))" << 'EOFUPLOAD'
-          import os
-          import sys
-          import glob
-          import re
-          import subprocess
-          import asyncio
-          import datetime
-          import traceback
-          import json
-          import math
-
-          if hasattr(sys.stdout, "reconfigure"):
-              sys.stdout.reconfigure(line_buffering=True)
-              sys.stderr.reconfigure(line_buffering=True)
-
-          try:
-              from telethon import TelegramClient
-              from telethon.sessions import StringSession
-              from telethon.errors import FloodWaitError
-              from telethon.tl.functions.channels import JoinChannelRequest
-              from telethon.tl.functions.messages import ImportChatInviteRequest
-              from telethon.tl.types import DocumentAttributeVideo
-              import telethon
-              print(f"✅ Telethon version: {telethon.__version__}")
-          except ImportError as e:
-              print(f"❌ Import error: {e}")
-              sys.exit(1)
-
-          api_id = os.environ.get("TG_API_ID")
-          api_hash = os.environ.get("TG_API_HASH")
-          session_string = os.environ.get("TG_SESSION_STRING")
+          # Validate output file
+          if [ -f "output.mp4" ]; then
+            FILE_SIZE=$(stat -c%s "output.mp4" 2>/dev/null || stat -f%z "output.mp4" 2>/dev/null || echo "0")
+            FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+            echo "📊 Merged file size: ${FILE_SIZE_MB} MB"
+            
+            if [ "$FILE_SIZE" -lt 100000 ]; then
+              echo "❌ output.mp4 is too small (${FILE_SIZE} bytes)!"
+              exit 1
+            fi
+            
+            HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "output.mp4" 2>/dev/null)
+            if [ -z "$HAS_VIDEO" ] || [ "$HAS_VIDEO" != "video" ]; then
+              echo "❌ output.mp4 has no video stream!"
+              exit 1
+            fi
+            
+            W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "output.mp4" 2>/dev/null)
+            H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "output.mp4" 2>/dev/null)
+            echo "✅ output.mp4: ${W}x${H}, ${FILE_SIZE_MB}MB"
+          else
+            echo "❌ output.mp4 not found!"
+            exit 1
+          fi
           
-          chat_id_raw = os.environ.get("TG_MERGED_CHAT_ID")
-          chat_name = os.environ.get("TG_MERGED_NAME")
-          invite_link = os.environ.get("TG_MERGED_INVITE_LINK")
+          # Check poster availability
+          if [ -f "${{ env.poster_path }}" ]; then
+            POSTER_EXISTS=true
+            echo "✅ Poster exists: ${{ env.poster_path }}"
+          else
+            POSTER_EXISTS=false
+            echo "⚠️ No poster available"
+          fi
           
-          video_path = os.environ.get("MERGED_PATH")
-          title = os.environ.get("TITLE")
-          series_title = os.environ.get("SERIES_TITLE", "Series")
-          label = os.environ.get("LABEL", "NONE")
-          telegram_date = os.environ.get("TELEGRAM_DATE", datetime.date.today().strftime("%Y-%m-%d"))
-          series_provider = os.environ.get("SERIES_PROVIDER", "N/A")
-          series_description = os.environ.get("SERIES_DESCRIPTION", "N/A")
-          provider_tag = os.environ.get("PROVIDER_TAG", "N/A")
-          poster_path = os.environ.get("POSTER_PATH", "") or ""
-
-          if not all([api_id, api_hash]):
-              print("❌ Missing Telegram API credentials.")
-              sys.exit(0)
-
-          if not session_string:
-              print("❌ Missing session string!")
-              sys.exit(0)
-
-          def parse_chat_id(val):
-              if not val:
-                  return None
-              val = str(val).strip().strip('"').strip("'")
-              try:
-                  return int(val)
-              except ValueError:
-                  return val
-
-          def get_video_metadata(file_path):
-              """Get accurate video metadata using ffprobe as primary method"""
-              try:
-                  cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
-                  result = subprocess.check_output(cmd, text=True).strip()
-                  if result and result.replace('.', '', 1).isdigit():
-                      duration = float(result)
-                  else:
-                      duration = 0
-                  
-                  cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", 
-                         "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
-                  result = subprocess.check_output(cmd, text=True).strip()
-                  parts = result.split(',')
-                  
-                  if len(parts) >= 2:
-                      w = int(parts[0]) if parts[0].isdigit() else 1280
-                      h = int(parts[1]) if parts[1].isdigit() else 720
-                  else:
-                      cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
-                      result = subprocess.check_output(cmd, text=True).strip()
-                      parts = result.split('|')
-                      
-                      if len(parts) >= 2:
-                          w = int(parts[0]) if parts[0].isdigit() else 1280
-                          h = int(parts[1]) if parts[1].isdigit() else 720
-                      else:
-                          w, h = 1280, 720
-                  
-                  print(f"📊 Metadata: duration={duration}, {w}x{h}")
-                  return int(duration), w, h
-                  
-              except Exception as e:
-                  print(f"⚠️ Error getting metadata: {e}")
-                  return 0, 1280, 720
-
-          def generate_thumbnail(file_path):
-              try:
-                  thumb_path = f"{file_path}_thumb.jpg"
-                  cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", 
-                         "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
-                  result = subprocess.check_output(cmd, text=True).strip()
-                  parts = result.split(',')
-                  
-                  if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-                      w = int(parts[0])
-                      h = int(parts[1])
-                      ffmpeg_cmd = [
-                          "ffmpeg", "-y", "-ss", "00:00:01",
-                          "-i", file_path,
-                          "-vf", f"crop=min({w},{h}):min({w},{h}),scale=512:512:flags=lanczos",
-                          "-vframes", "1",
-                          "-q:v", "2",
-                          thumb_path
-                      ]
-                      subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                      return thumb_path if os.path.exists(thumb_path) else None
-              except:
-                  pass
-              return None
-
-          def progress_callback(current, total):
-              percent = (current / total) * 100
-              mb_uploaded = current / (1024 * 1024)
-              mb_total = total / (1024 * 1024)
-              if int(percent) % 5 == 0 or int(percent) == 100:
-                  print(f"📤 Upload: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)")
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: {percent:.1f}% ({mb_uploaded:.1f}/{mb_total:.1f} MB)\n")
-
-          chat_id = parse_chat_id(chat_id_raw)
-
-          print("=" * 60)
-          print("📤 Uploading Merged Video to Channel")
-          print("=" * 60)
-          print(f"📺 Series: {series_title}")
-          print(f"📁 File: {video_path}")
-          print("=" * 60)
-
-          with open("merged_progress.log", "w") as f:
-              f.write(f"{datetime.datetime.now()}: Starting merged upload\n")
-
-          async def join_chat(client, invite_link):
-              if not invite_link:
-                  return None
-              try:
-                  return await client.get_entity(invite_link)
-              except:
-                  return None
-
-          async def resolve_chat(client, chat_id, invite_link, search_name):
-              if invite_link:
-                  entity = await join_chat(client, invite_link)
-                  if entity:
-                      return entity
-              if chat_id:
-                  try:
-                      return await client.get_entity(chat_id)
-                  except:
-                      pass
-              if search_name:
-                  async for dialog in client.iter_dialogs(limit=50):
-                      if search_name.lower() in str(dialog.name).lower():
-                          return dialog.entity
-              return None
-
-          async def fast_upload_file(client, file_path, progress_callback=None, attributes=None):
-              if not os.path.exists(file_path):
-                  print(f"❌ File not found: {file_path}")
-                  return None
-              
-              file_size = os.path.getsize(file_path)
-              print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
-              
-              try:
-                  return await client.upload_file(
-                      file_path,
-                      part_size_kb=512,
-                      file_name=os.path.basename(file_path),
-                      progress_callback=progress_callback,
-                      attributes=attributes
-                  )
-              except Exception as e:
-                  print(f"❌ Upload failed: {e}")
-                  raise
-
-          async def send_file_with_thumb(client, entity, file_path, caption, poster_path=None):
-              if not os.path.exists(file_path):
-                  print(f"❌ File not found: {file_path}")
-                  return False, None
-              
-              # Get accurate video metadata
-              duration, w, h = get_video_metadata(file_path)
-              print(f"📊 Video duration: {duration} seconds, {w}x{h}")
-              
-              # Ensure we have valid dimensions
-              if w <= 0 or h <= 0:
-                  print("⚠️ Invalid dimensions detected, using ffprobe fallback...")
-                  try:
-                      cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", 
-                             "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
-                      result = subprocess.check_output(cmd, text=True).strip()
-                      parts = result.split(',')
-                      if len(parts) >= 2:
-                          w = int(parts[0]) if parts[0].isdigit() else 1280
-                          h = int(parts[1]) if parts[1].isdigit() else 720
-                  except:
-                      w, h = 1280, 720
-                  print(f"📊 Using fallback dimensions: {w}x{h}")
-              
-              # Create video attributes with correct dimensions
-              video_attr = DocumentAttributeVideo(
-                  duration=duration if duration > 0 else 60,
-                  w=w if w > 0 else 1280,
-                  h=h if h > 0 else 720,
-                  supports_streaming=True
-              )
-              
-              print(f"📐 Video attributes: {video_attr.w}x{video_attr.h}, duration: {video_attr.duration}s")
-              
-              thumb = generate_thumbnail(file_path)
-              
-              # Step 1: Check if poster should be sent
-              should_send_poster = False
-              if poster_path and os.path.isfile(poster_path):
-                  provider_valid = series_provider and series_provider != "N/A" and series_provider.strip()
-                  description_valid = series_description and series_description != "N/A" and series_description.strip()
-                  
-                  if provider_valid and description_valid:
-                      should_send_poster = True
-                      print("✅ Poster will be sent (provider and description present)")
-                      with open("merged_progress.log", "a") as f:
-                          f.write(f"{datetime.datetime.now()}: POSTER_WILL_BE_SENT\n")
-                  else:
-                      missing = []
-                      if not provider_valid:
-                          missing.append("provider")
-                      if not description_valid:
-                          missing.append("description")
-                      print(f"⚠️ Skipping poster - missing: {', '.join(missing)}")
-                      with open("merged_progress.log", "a") as f:
-                          f.write(f"{datetime.datetime.now()}: POSTER_SKIPPED - missing: {', '.join(missing)}\n")
-              else:
-                  print("⚠️ No poster available, skipping")
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: NO_POSTER_AVAILABLE\n")
-              
-              # Step 2: Send poster if valid
-              if should_send_poster:
-                  try:
-                      print("🖼️ Sending poster as separate full-size photo...")
-                      poster_caption = f"📺 {title}\n👤 {series_provider}\n📝 {series_description}"
-                      
-                      await client.send_file(
-                          entity=entity,
-                          file=poster_path,
-                          caption=poster_caption,
-                          force_document=False
-                      )
-                      print("✅ Poster sent as full-size photo with title, provider, description")
-                      with open("merged_progress.log", "a") as f:
-                          f.write(f"{datetime.datetime.now()}: POSTER_SENT\n")
-                      await asyncio.sleep(1)
-                  except Exception as e:
-                      print(f"⚠️ Poster send failed: {e}")
-                      with open("merged_progress.log", "a") as f:
-                          f.write(f"{datetime.datetime.now()}: POSTER_FAILED: {e}\n")
-              
-              # Step 3: Upload video with attributes
-              print(f"⬆️ Uploading video to Telegram...")
-              with open("merged_progress.log", "a") as f:
-                  f.write(f"{datetime.datetime.now()}: VIDEO_UPLOAD_STARTED\n")
-              
-              try:
-                  uploaded_file = await fast_upload_file(
-                      client=client,
-                      file_path=file_path,
-                      progress_callback=progress_callback,
-                      attributes=[video_attr]
-                  )
-                  
-                  if uploaded_file is None:
-                      print("❌ Upload returned None")
-                      with open("merged_progress.log", "a") as f:
-                          f.write(f"{datetime.datetime.now()}: UPLOAD_RETURNED_NONE\n")
-                      return False, None
-                      
-                  print("✅ Video upload complete!")
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: UPLOAD_COMPLETE\n")
-              except Exception as e:
-                  print(f"❌ Upload failed: {e}")
-                  traceback.print_exc()
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: UPLOAD_FAILED: {e}\n")
-                  return False, None
-              
-              # Step 4: Build video caption with hashtags
-              now = datetime.datetime.now()
-              month_year = now.strftime("%B%Y").upper()
-              if telegram_date:
-                  try:
-                      tg_dt = datetime.datetime.strptime(str(telegram_date).strip(), "%Y-%m-%d")
-                      month_year = tg_dt.strftime("%B%Y").upper()
-                  except ValueError:
-                      pass
-              
-              clean_label = str(label).upper().replace("-", "").replace(" ", "").replace("_", "")
-              if clean_label == "NONE" or clean_label == "":
-                  clean_label = "NONE"
-              
-              provider_clean = str(provider_tag).upper().replace("-", "").replace(" ", "").replace("_", "")
-              if provider_clean == "NONE" or provider_clean == "":
-                  provider_clean = "N/A"
-              
-              # Video caption: Title + Hashtags ONLY
-              video_caption = f"📺 {title}\n\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}\n#{provider_clean}"
-              
-              kwargs = {
-                  "entity": entity,
-                  "file": uploaded_file,
-                  "caption": video_caption,
-                  "attributes": [video_attr],
-                  "supports_streaming": True,
-                  "force_document": False,
-                  "allow_cache": True
-              }
-              
-              if thumb and os.path.exists(thumb):
-                  kwargs["thumb"] = thumb
-                  print(f"📸 Using thumbnail: {thumb}")
-              
-              # Step 5: Send video
-              try:
-                  result = await client.send_file(**kwargs)
-                  print("✅ Video sent with Title + Hashtags!")
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: VIDEO_SENT\n")
-                      f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_COMPLETE\n")
-                  return True, result
-              except Exception as e:
-                  print(f"❌ Send failed: {e}")
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: SEND_FAILED: {e}\n")
-                  if "thumb" in kwargs:
-                      del kwargs["thumb"]
-                      try:
-                          result = await client.send_file(**kwargs)
-                          print("✅ Video sent with Title + Hashtags (without thumb)!")
-                          with open("merged_progress.log", "a") as f:
-                              f.write(f"{datetime.datetime.now()}: VIDEO_SENT_NO_THUMB\n")
-                              f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_COMPLETE\n")
-                          return True, result
-                      except Exception as e2:
-                          print(f"❌ Send failed without thumb: {e2}")
-                          with open("merged_progress.log", "a") as f:
-                              f.write(f"{datetime.datetime.now()}: SEND_FAILED_NO_THUMB: {e2}\n")
-                          return False, None
-                  return False, None
-              finally:
-                  if thumb and os.path.exists(thumb):
-                      try: os.remove(thumb)
-                      except: pass
-
-          async def upload_merged_video(client, entity):
-              video_path = os.environ.get("MERGED_PATH")
-              
-              if not video_path or not os.path.isfile(video_path):
-                  if os.path.exists("output.mp4"):
-                      video_path = os.path.abspath("output.mp4")
-                  elif os.path.exists("../output.mp4"):
-                      video_path = os.path.abspath("../output.mp4")
-                  else:
-                      video_files = glob.glob("*.mp4")
-                      if video_files:
-                          video_path = os.path.abspath(max(video_files, key=lambda f: os.path.getsize(f)))
-                      else:
-                          return False
-              
-              if not os.path.isfile(video_path):
-                  print(f"❌ Video file not found: {video_path}")
-                  return False
-              
-              file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-              print(f"💾 File size: {file_size_mb:.1f} MB")
-              
-              if file_size_mb > 2000:
-                  print(f"❌ File exceeds 2GB ({file_size_mb:.1f} MB)")
-                  return False
-              
-              print(f"📤 Uploading merged video to channel...")
-              with open("merged_progress.log", "a") as f:
-                  f.write(f"{datetime.datetime.now()}: UPLOAD_STARTED\n")
-              
-              try:
-                  success, result = await send_file_with_thumb(client, entity, video_path, "", poster_path=poster_path)
-                  if success:
-                      print("✅ Merged video successfully posted to channel!")
-                      with open("merged_progress.log", "a") as f:
-                          f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_SUCCESS\n")
-                      return True
-                  return False
-              except FloodWaitError as e:
-                  print(f"⏳ Rate limited: waiting {e.seconds}s")
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: FLOOD_WAIT: {e.seconds}s\n")
-                  await asyncio.sleep(e.seconds)
-                  return await send_file_with_thumb(client, entity, video_path, "", poster_path=poster_path)
-              except Exception as e:
-                  print(f"❌ Merged upload failed: {e}")
-                  traceback.print_exc()
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_FAILED: {e}\n")
-                  return False
-
-          async def main():
-              try:
-                  print("🔌 Connecting to Telegram...")
-                  client = TelegramClient(
-                      StringSession(session_string), 
-                      int(api_id), 
-                      api_hash,
-                      connection_retries=5,
-                      flood_sleep_threshold=180
-                  )
-                  await client.connect()
-                  
-                  if not await client.is_user_authorized():
-                      print("❌ Session invalid")
-                      return
-                  
-                  me = await client.get_me()
-                  print(f"✅ Logged in: {me.first_name}")
-                  
-                  entity = await resolve_chat(client, chat_id, invite_link, chat_name)
-                  if not entity:
-                      print("❌ Could not resolve channel for merged video!")
-                      return
-                  
-                  print(f"\n📤 Posting to Channel: {entity.title if hasattr(entity, 'title') else entity.id}")
-                  await upload_merged_video(client, entity)
-                  
-                  await client.disconnect()
-                  print("\n✅ Merged channel upload complete!")
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: SCRIPT_COMPLETE\n")
-              except Exception as e:
-                  print(f"❌ Error: {e}")
-                  traceback.print_exc()
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: SCRIPT_ERROR: {e}\n")
-
-          if __name__ == '__main__':
-              asyncio.run(main())
-          EOFUPLOAD
+          # Check if provider and description are valid
+          PROVIDER_VALID=false
+          DESCRIPTION_VALID=false
+          if [ -n "$SERIES_PROVIDER" ] && [ "$SERIES_PROVIDER" != "N/A" ] && [ -n "$(echo "$SERIES_PROVIDER" | tr -d ' ')" ]; then
+            PROVIDER_VALID=true
+          fi
+          if [ -n "$SERIES_DESCRIPTION" ] && [ "$SERIES_DESCRIPTION" != "N/A" ] && [ -n "$(echo "$SERIES_DESCRIPTION" | tr -d ' ')" ]; then
+            DESCRIPTION_VALID=true
+          fi
           
+          if [ "$POSTER_EXISTS" = true ] && [ "$PROVIDER_VALID" = true ] && [ "$DESCRIPTION_VALID" = true ]; then
+            echo "✅ Poster will be uploaded (provider and description present)"
+          else
+            echo "⚠️ Poster will be skipped (missing: provider=$PROVIDER_VALID, description=$DESCRIPTION_VALID)"
+          fi
+          
+          echo "========================================="
           echo "🚀 Starting upload to channel in background..."
-          python3 upload_merged.py > merged_upload.log 2>&1 &
+          echo "📤 Step 1: Uploading poster (if available)"
+          echo "📤 Step 2: Uploading video"
+          echo "========================================="
+          
+          python3 -u upload_merged.py > merged_upload.log 2>&1 &
           MERGED_PID=$!
           echo "merged_pid=$MERGED_PID" >> $GITHUB_ENV
           echo "✅ Merged upload started with PID: $MERGED_PID"
+          
+          # Wait and verify process is running
+          sleep 3
+          if kill -0 $MERGED_PID 2>/dev/null; then
+            echo "✅ Merged upload process is running (PID: $MERGED_PID)"
+            echo "📋 Check merged_progress.log for status updates"
+          else
+            echo "❌ Merged upload process died immediately!"
+            echo "📋 Error log:"
+            cat merged_upload.log
+            exit 1
+          fi
 
       - name: Upload Single Episodes (Fast Upload)
         if: steps.verify.outputs.verify_success == 'true'
@@ -2327,7 +1940,7 @@ jobs:
               print(f"📊 Found {len(ep_files)} episodes to upload to topic {topic_id}")
               count = 0
               
-              # Step 1: Check if poster should be sent
+              # Check if poster should be sent
               should_send_poster = False
               if poster_path and os.path.isfile(poster_path):
                   provider_valid = series_provider and series_provider != "N/A" and series_provider.strip()
@@ -2346,7 +1959,7 @@ jobs:
               else:
                   print("⚠️ No poster available for topic, skipping")
               
-              # Step 2: Post poster + series info in topic (if valid)
+              # Post poster + series info in topic (if valid)
               if topic_id and should_send_poster:
                   poster_caption = f"📺 {series_title}\n👤 {series_provider}\n📝 {series_description}"
                   print(f"🖼️ Posting poster with series info into topic...")
@@ -2362,7 +1975,7 @@ jobs:
                       print(f"⚠️ Poster post failed: {e}")
                   await asyncio.sleep(2)
               
-              # Step 3: Upload episodes
+              # Upload episodes
               for ep_file in ep_files:
                   ep_match = re.search(r'EP(\d+)\.mp4', ep_file)
                   if not ep_match:
@@ -2456,17 +2069,27 @@ jobs:
           python3 upload_single.py
           touch single_episodes_complete.txt
 
-      - name: Wait for All Uploads with Enhanced Progress Monitoring
+      - name: Wait for All Uploads with Speed Monitoring and Auto-Restart
         if: steps.verify.outputs.verify_success == 'true'
         timeout-minutes: 240
+        env:
+          MIN_UPLOAD_SPEED_MBPS: ${{ env.MIN_UPLOAD_SPEED_MBPS }}
+          RESTART_ATTEMPTS: ${{ env.RESTART_ATTEMPTS }}
         run: |
           cd downloads
           
           echo "========================================="
-          echo "⏳ MONITORING UPLOAD PROGRESS"
+          echo "⏳ MONITORING UPLOAD PROGRESS WITH SPEED CHECK"
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+          echo "⚡ Min Speed: ${MIN_UPLOAD_SPEED_MBPS} MB/s"
+          echo "🔄 Max Restarts: ${RESTART_ATTEMPTS}"
           echo "========================================="
+          
+          # Initialize restart counter
+          RESTART_COUNT=0
+          RESTART_LOG="restart_log.txt"
+          echo "0" > "$RESTART_LOG"
           
           # Function to check if merged upload process is still running
           is_merged_running() {
@@ -2478,10 +2101,102 @@ jobs:
             return 1  # Not running
           }
           
+          # Function to get current speed from progress log
+          get_current_speed() {
+            if [ -f "merged_progress.log" ]; then
+              local last_speed=$(grep -E "SPEED_TOO_SLOW" merged_progress.log | tail -1 | cut -d':' -f2)
+              if [ -n "$last_speed" ]; then
+                echo "$last_speed"
+                return
+              fi
+              
+              local last_progress=$(grep -E "UPLOAD_PROGRESS" merged_progress.log | tail -1)
+              if [ -n "$last_progress" ]; then
+                local speed=$(echo "$last_progress" | cut -d':' -f5)
+                if [ -n "$speed" ]; then
+                  echo "$speed"
+                  return
+                fi
+              fi
+            fi
+            echo "0"
+          }
+          
+          # Function to get current percent
+          get_current_percent() {
+            if [ -f "merged_progress.log" ]; then
+              local last_progress=$(grep -E "UPLOAD_PROGRESS" merged_progress.log | tail -1)
+              if [ -n "$last_progress" ]; then
+                local percent=$(echo "$last_progress" | cut -d':' -f2)
+                if [ -n "$percent" ]; then
+                  echo "$percent"
+                  return
+                fi
+              fi
+            fi
+            echo "0"
+          }
+          
+          # Function to check if speed is too slow
+          is_speed_too_slow() {
+            local speed=$(get_current_speed)
+            local percent=$(get_current_percent)
+            
+            # Only check speed if we're between 10% and 95% complete
+            if [ "$(echo "$percent > 10" | bc)" = "1" ] && [ "$(echo "$percent < 95" | bc)" = "1" ]; then
+              local min_speed="${MIN_UPLOAD_SPEED_MBPS:-0.5}"
+              if [ "$(echo "$speed < $min_speed" | bc)" = "1" ] && [ "$speed" != "0" ]; then
+                return 0  # Speed is too slow
+              fi
+            fi
+            return 1  # Speed is acceptable
+          }
+          
+          # Function to restart merged upload
+          restart_merged_upload() {
+            local restart_count=$1
+            echo ""
+            echo "========================================="
+            echo "🔄 RESTARTING MERGED UPLOAD (Attempt $restart_count)"
+            echo "========================================="
+            
+            # Kill existing process
+            if is_merged_running; then
+              echo "🛑 Killing existing upload process (PID: $MERGED_PID)"
+              kill -9 "$MERGED_PID" 2>/dev/null || true
+              sleep 2
+            fi
+            
+            # Backup old log
+            if [ -f "merged_progress.log" ]; then
+              cp merged_progress.log "merged_progress_restart_${restart_count}.log"
+            fi
+            
+            # Start new upload
+            echo "🚀 Starting new upload attempt..."
+            python3 -u upload_merged.py > merged_upload.log 2>&1 &
+            MERGED_PID=$!
+            echo "merged_pid=$MERGED_PID" >> $GITHUB_ENV
+            echo "✅ Restarted merged upload with PID: $MERGED_PID"
+            
+            # Wait for process to start
+            sleep 5
+            
+            # Check if process is running
+            if is_merged_running; then
+              echo "✅ Restarted process is running"
+              echo "$restart_count" > "$RESTART_LOG"
+              return 0
+            else
+              echo "❌ Restarted process died immediately!"
+              return 1
+            fi
+          }
+          
           # Function to parse progress from log files
           get_merged_progress() {
             if [ -f "merged_progress.log" ]; then
-              # Check if upload is complete first
+              # Check for completion
               if grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log; then
                 echo "100|complete"
                 return
@@ -2495,23 +2210,60 @@ jobs:
                 return
               fi
               
-              # Look for progress lines
-              local last_progress=$(grep -E "[0-9]+\.[0-9]+%.*[0-9]+\.[0-9]+/[0-9]+\.[0-9]+ MB" merged_progress.log | tail -1)
+              # Check for progress
+              local last_progress=$(grep -E "UPLOAD_PROGRESS" merged_progress.log | tail -1)
               if [ -n "$last_progress" ]; then
-                # Extract percentage
-                local percent=$(echo "$last_progress" | grep -oE "[0-9.]+\%" | sed 's/%//')
-                # Extract uploaded and total
-                local uploaded=$(echo "$last_progress" | grep -oE "[0-9.]+\/[0-9.]+ MB" | sed 's/ MB//')
-                echo "$percent|$uploaded"
-              else
-                echo "0|0.0/0.0"
+                local percent=$(echo "$last_progress" | cut -d':' -f2)
+                local uploaded=$(echo "$last_progress" | cut -d':' -f3)
+                local total=$(echo "$last_progress" | cut -d':' -f4)
+                echo "$percent|${uploaded}/${total}"
+                return
               fi
+              
+              echo "0|0.0/0.0"
             else
               echo "0|0.0/0.0"
             fi
           }
           
-          # Function to get episode upload progress
+          # Function to get merged status
+          get_merged_status() {
+            if [ -f "merged_progress.log" ]; then
+              if grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log; then
+                echo "✅ COMPLETE"
+              elif grep -q "VIDEO_SENT" merged_progress.log; then
+                echo "📤 Video sent"
+              elif grep -q "UPLOAD_COMPLETE" merged_progress.log; then
+                echo "⬆️ Upload complete, sending..."
+              elif grep -q "SPEED_TOO_SLOW" merged_progress.log; then
+                local speed=$(get_current_speed)
+                echo "⚠️ SLOW: ${speed} MB/s"
+              elif grep -q "UPLOAD_PROGRESS" merged_progress.log; then
+                local last_percent=$(grep "UPLOAD_PROGRESS" merged_progress.log | tail -1 | cut -d':' -f2)
+                if [ -n "$last_percent" ]; then
+                  echo "⬆️ Uploading: ${last_percent}%"
+                else
+                  echo "⬆️ Uploading video..."
+                fi
+              elif grep -q "VIDEO_UPLOAD_STARTED" merged_progress.log; then
+                echo "⬆️ Starting video upload"
+              elif grep -q "POSTER_SENT" merged_progress.log; then
+                echo "✅ Poster sent, uploading video..."
+              elif grep -q "POSTER_WILL_BE_SENT" merged_progress.log; then
+                echo "🖼️ Sending poster..."
+              elif grep -q "UPLOAD_STARTED" merged_progress.log; then
+                echo "🔄 Connecting to Telegram..."
+              elif grep -q "Starting merged upload" merged_progress.log; then
+                echo "🔄 Initializing..."
+              else
+                echo "⏳ Waiting..."
+              fi
+            else
+              echo "⏳ Starting..."
+            fi
+          }
+          
+          # Function to get episode progress
           get_episode_progress() {
             if [ -f "single_episodes_complete.txt" ]; then
               echo "100|complete"
@@ -2519,9 +2271,7 @@ jobs:
             fi
             
             if [ -f "episode_upload.log" ]; then
-              # Count total episodes
               local total_eps=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
-              # Count completed episodes
               local completed=$(grep -c "COMPLETE_EP_" episode_upload.log 2>/dev/null || echo "0")
               
               if [ "$total_eps" -gt 0 ]; then
@@ -2546,54 +2296,44 @@ jobs:
               return
             fi
             
-            local percent=$(echo "scale=2; ($current / $total) * 100" | bc 2>/dev/null || echo "0")
-            if [ "$(echo "$percent > 0" | bc)" = "0" ]; then
-              echo "Calculating..."
-              return
-            fi
-            
-            local remaining_percent=$(echo "scale=2; 100 - $percent" | bc 2>/dev/null || echo "0")
-            if [ "$(echo "$remaining_percent <= 0" | bc)" = "1" ]; then
-              echo "0s"
-              return
-            fi
-            
-            local elapsed_seconds_float=$(echo "$elapsed_seconds" | bc -l 2>/dev/null || echo "1")
-            local rate=$(echo "scale=2; $current / $elapsed_seconds_float" | bc -l 2>/dev/null || echo "1")
-            if [ "$(echo "$rate < 0.001" | bc)" = "1" ]; then
-              echo "Calculating..."
-              return
-            fi
-            
-            local remaining_mb=$(echo "scale=2; $total - $current" | bc -l 2>/dev/null || echo "0")
-            local eta_seconds=$(echo "scale=0; $remaining_mb / $rate" | bc -l 2>/dev/null || echo "0")
-            
-            if [ "$eta_seconds" -lt 1 ]; then
-              echo "0s"
-            elif [ "$eta_seconds" -lt 60 ]; then
-              echo "${eta_seconds}s"
-            elif [ "$eta_seconds" -lt 3600 ]; then
-              local minutes=$((eta_seconds / 60))
-              local seconds=$((eta_seconds % 60))
-              echo "${minutes}m ${seconds}s"
-            else
-              local hours=$((eta_seconds / 3600))
-              local minutes=$(((eta_seconds % 3600) / 60))
-              echo "${hours}h ${minutes}m"
-            fi
-          }
-          
-          # Function to get current episode
-          get_current_episode() {
-            if [ -f "episode_upload.log" ]; then
-              local current=$(grep "STARTING_EP_" episode_upload.log 2>/dev/null | tail -1 | grep -oE "[0-9]+" | head -1)
-              if [ -n "$current" ]; then
-                echo "$current"
+            if command -v bc &> /dev/null; then
+              local percent=$(echo "scale=2; ($current / $total) * 100" | bc 2>/dev/null || echo "0")
+              if [ "$(echo "$percent > 0" | bc)" = "0" ]; then
+                echo "Calculating..."
+                return
+              fi
+              
+              local remaining_percent=$(echo "scale=2; 100 - $percent" | bc 2>/dev/null || echo "0")
+              if [ "$(echo "$remaining_percent <= 0" | bc)" = "1" ]; then
+                echo "0s"
+                return
+              fi
+              
+              local elapsed_seconds_float=$(echo "$elapsed_seconds" | bc -l 2>/dev/null || echo "1")
+              local rate=$(echo "scale=2; $current / $elapsed_seconds_float" | bc -l 2>/dev/null || echo "1")
+              if [ "$(echo "$rate < 0.001" | bc)" = "1" ]; then
+                echo "Calculating..."
+                return
+              fi
+              
+              local remaining_mb=$(echo "scale=2; $total - $current" | bc -l 2>/dev/null || echo "0")
+              local eta_seconds=$(echo "scale=0; $remaining_mb / $rate" | bc -l 2>/dev/null || echo "0")
+              
+              if [ "$eta_seconds" -lt 1 ]; then
+                echo "0s"
+              elif [ "$eta_seconds" -lt 60 ]; then
+                echo "${eta_seconds}s"
+              elif [ "$eta_seconds" -lt 3600 ]; then
+                local minutes=$((eta_seconds / 60))
+                local seconds=$((eta_seconds % 60))
+                echo "${minutes}m ${seconds}s"
               else
-                echo "-"
+                local hours=$((eta_seconds / 3600))
+                local minutes=$(((eta_seconds % 3600) / 60))
+                echo "${hours}h ${minutes}m"
               fi
             else
-              echo "-"
+              echo "Calculating..."
             fi
           }
           
@@ -2601,8 +2341,8 @@ jobs:
           START_TIME=$(date +%s)
           MERGED_COMPLETE=false
           EPISODES_COMPLETE=false
-          NO_PROGRESS_COUNT=0
-          LAST_MERGED_PERCENT=-1
+          SLOW_SPEED_COUNT=0
+          MAX_SLOW_CHECKS=3
           
           echo ""
           echo "🔄 Monitoring upload progress..."
@@ -2610,12 +2350,12 @@ jobs:
           echo ""
           
           while true; do
-            # Check if both are complete first
+            # Check if episodes are complete
             if [ -f "single_episodes_complete.txt" ]; then
               EPISODES_COMPLETE=true
             fi
             
-            # Check merged completion - multiple markers
+            # Check merged completion
             if [ -f "merged_progress.log" ]; then
               if grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log; then
                 MERGED_COMPLETE=true
@@ -2626,25 +2366,14 @@ jobs:
               elif ! is_merged_running && [ -f "merged_upload.log" ]; then
                 if tail -20 merged_upload.log | grep -q "✅ Merged video successfully posted to channel!"; then
                   MERGED_COMPLETE=true
-                  # Write completion marker if missing
-                  if ! grep -q "UPLOAD_COMPLETE" merged_progress.log 2>/dev/null; then
-                    echo "$(date): UPLOAD_COMPLETE" >> merged_progress.log
-                  fi
                   if ! grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log 2>/dev/null; then
                     echo "$(date): MERGED_UPLOAD_COMPLETE" >> merged_progress.log
                   fi
                 fi
               fi
-            else
-              # If log doesn't exist yet, check if process is running
-              if ! is_merged_running && [ -f "merged_upload.log" ]; then
-                if tail -20 merged_upload.log | grep -q "✅ Merged video successfully posted to channel!"; then
-                  MERGED_COMPLETE=true
-                fi
-              fi
             fi
             
-            # If both complete, break out of loop
+            # If both complete, break
             if [ "$MERGED_COMPLETE" = true ] && [ "$EPISODES_COMPLETE" = true ]; then
               echo ""
               echo "✅ ALL UPLOADS COMPLETED!"
@@ -2671,16 +2400,20 @@ jobs:
             echo "╠══════════════════════════════════════════════════════════════╣"
             echo "║ ⏱️  Elapsed Time: $(printf "%-40s" "$ELAPSED_STR")║"
             echo "║ 📺 Series: $(printf "%-47s" "${{ steps.fname.outputs.series_title }}")║"
+            echo "║ 🔄 Restarts: $(printf "%-42s" "$RESTART_COUNT/${{ env.RESTART_ATTEMPTS }}")║"
             echo "║                                                              ║"
             
             # Merged Upload Progress
             MERGED_PROGRESS=$(get_merged_progress)
             MERGED_PERCENT=$(echo "$MERGED_PROGRESS" | cut -d'|' -f1)
             MERGED_DATA=$(echo "$MERGED_PROGRESS" | cut -d'|' -f2)
+            MERGE_STATUS=$(get_merged_status)
+            CURRENT_SPEED=$(get_current_speed)
             
-            if [ "$MERGED_COMPLETE" = true ] || [ "$MERGED_DATA" = "complete" ]; then
+            echo "║ 📹 Merged Video:                                        ║"
+            
+            if [ "$MERGED_COMPLETE" = true ] || [ "$MERGED_DATA" = "complete" ] || [ "$MERGED_PERCENT" = "100" ]; then
               MERGED_COMPLETE=true
-              echo "║ 📹 Merged Video:                                        ║"
               echo "║    Status: ✅ COMPLETE                                   ║"
               echo "║    Progress: 100%                                       ║"
               BAR_LENGTH=40
@@ -2688,11 +2421,10 @@ jobs:
               for ((i=0; i<$BAR_LENGTH; i++)); do BAR="${BAR}█"; done
               echo "║    [${BAR}] ║"
               echo "║                                                              ║"
-            elif [ "$MERGED_PERCENT" != "0" ] && [ "$MERGED_PERCENT" != "100" ]; then
-              echo "║ 📹 Merged Video:                                        ║"
+            elif [ -n "$MERGED_PERCENT" ] && [ "$MERGED_PERCENT" != "0" ] && [ "$MERGED_PERCENT" != "100" ]; then
+              echo "║    Status: ${MERGE_STATUS}                                 ║"
               echo "║    Progress: $(printf "%-51s" "${MERGED_PERCENT}%")║"
               
-              # Create progress bar
               BAR_LENGTH=40
               FILLED=$(echo "scale=0; ($MERGED_PERCENT * $BAR_LENGTH) / 100" | bc 2>/dev/null || echo "0")
               BAR=""
@@ -2700,27 +2432,48 @@ jobs:
               for ((i=$FILLED; i<$BAR_LENGTH; i++)); do BAR="${BAR}░"; done
               echo "║    [${BAR}] ║"
               
-              # ETA calculation
+              # Show speed and ETA
+              if [ "$CURRENT_SPEED" != "0" ]; then
+                echo "║    Speed: $(printf "%-49s" "${CURRENT_SPEED} MB/s")║"
+              fi
+              
               if [[ "$MERGED_DATA" == *"/"* ]]; then
                 UPLOADED=$(echo "$MERGED_DATA" | cut -d'/' -f1)
                 TOTAL=$(echo "$MERGED_DATA" | cut -d'/' -f2)
                 
-                if [[ "$UPLOADED" =~ ^[0-9.]+$ ]] && [[ "$TOTAL" =~ ^[0-9.]+$ ]]; then
+                if [[ "$UPLOADED" =~ ^[0-9.]+$ ]] && [[ "$TOTAL" =~ ^[0-9.]+$ ]] && [ "$ELAPSED" -gt 2 ]; then
                   ETA=$(calculate_eta "$UPLOADED" "$TOTAL" "$ELAPSED")
-                  SPEED=$(echo "scale=2; $UPLOADED / $ELAPSED" | bc -l 2>/dev/null || echo "0")
-                  if [ "$SPEED" != "0" ] && [ "$SPEED" != ".00" ]; then
-                    echo "║    Speed: $(printf "%-49s" "${SPEED} MB/s")║"
-                  fi
                   echo "║    ETA: $(printf "%-51s" "$ETA")║"
                 fi
               fi
+              
+              # Show speed warning if too slow
+              if is_speed_too_slow; then
+                echo "║    ⚠️  Speed below minimum (${MIN_UPLOAD_SPEED_MBPS} MB/s)    ║"
+                SLOW_SPEED_COUNT=$((SLOW_SPEED_COUNT + 1))
+                
+                # Check if we should restart
+                if [ $SLOW_SPEED_COUNT -ge $MAX_SLOW_CHECKS ] && [ $RESTART_COUNT -lt ${{ env.RESTART_ATTEMPTS }} ]; then
+                  echo "║    🔄 Restarting due to slow speed...                    ║"
+                  SLOW_SPEED_COUNT=0
+                  RESTART_COUNT=$((RESTART_COUNT + 1))
+                  
+                  # Restart the upload
+                  if restart_merged_upload "$RESTART_COUNT"; then
+                    echo "║    ✅ Restart successful                                ║"
+                  else
+                    echo "║    ❌ Restart failed                                   ║"
+                  fi
+                fi
+              else
+                SLOW_SPEED_COUNT=0
+              fi
               echo "║                                                              ║"
             elif is_merged_running; then
-              echo "║ 📹 Merged Video: Uploading...                           ║"
-              echo "║    Status: ⏳ In Progress                                 ║"
+              echo "║    Status: ${MERGE_STATUS}                                 ║"
               echo "║                                                              ║"
             else
-              echo "║ 📹 Merged Video: Starting...                             ║"
+              echo "║    Status: ${MERGE_STATUS}                                 ║"
               echo "║                                                              ║"
             fi
             
@@ -2745,7 +2498,6 @@ jobs:
               if [ "$TOTAL_EPISODES" -gt 0 ]; then
                 echo "║    Progress: $(printf "%-51s" "${EP_PERCENT}% (${COMPLETED}/${TOTAL_EPISODES} episodes)")║"
                 
-                # Create progress bar
                 BAR_LENGTH=40
                 FILLED=$((EP_PERCENT * BAR_LENGTH / 100))
                 BAR=""
@@ -2753,13 +2505,6 @@ jobs:
                 for ((i=$FILLED; i<$BAR_LENGTH; i++)); do BAR="${BAR}░"; done
                 echo "║    [${BAR}] ║"
                 
-                # Get current episode
-                CURRENT_EP=$(get_current_episode)
-                if [ "$CURRENT_EP" != "-" ]; then
-                  echo "║    Current: Episode $(printf "%-42s" "$CURRENT_EP")║"
-                fi
-                
-                # ETA for episodes
                 if [ "$COMPLETED" -gt 0 ] && [ "$ELAPSED" -gt 10 ]; then
                   AVG_TIME_PER_EP=$((ELAPSED / COMPLETED))
                   REMAINING=$((TOTAL_EPISODES - COMPLETED))
@@ -2780,22 +2525,13 @@ jobs:
             echo "║                                                              ║"
             echo "╚══════════════════════════════════════════════════════════════╝"
             
-            # Check for errors (brief check)
+            # Check for errors in logs
             if [ -f "merged_upload.log" ]; then
-              if tail -5 merged_upload.log 2>/dev/null | grep -q "❌"; then
+              if tail -3 merged_upload.log 2>/dev/null | grep -q "❌"; then
                 echo ""
-                echo "⚠️  Warning: Possible errors detected in merged upload log"
-                echo "   Check merged_upload.log for details"
-              fi
-            fi
-            
-            # If merged upload is stuck but process ended, check logs
-            if [ "$MERGED_PERCENT" = "0" ] && [ $ELAPSED -gt 30 ]; then
-              if ! is_merged_running && [ -f "merged_upload.log" ]; then
-                echo ""
-                echo "⚠️  Merged upload process ended but not marked complete..."
-                echo "   Checking logs for errors..."
-                tail -10 merged_upload.log
+                echo "⚠️  Errors detected in merged upload log"
+                echo "   Last 5 lines:"
+                tail -5 merged_upload.log | sed 's/^/   /'
               fi
             fi
             
@@ -2820,12 +2556,13 @@ jobs:
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "⏱️  Total Time: $ELAPSED_STR"
+          echo "🔄 Total Restarts: $RESTART_COUNT"
           
           # Get final merged file size
           if [ -f "merged_progress.log" ]; then
-            FINAL_SIZE=$(grep -E "[0-9]+\.[0-9]+/[0-9]+\.[0-9]+ MB" merged_progress.log | tail -1 | grep -oE "[0-9.]+\/[0-9.]+ MB" | tail -1)
+            FINAL_SIZE=$(grep -E "UPLOAD_PROGRESS" merged_progress.log | tail -1 | cut -d':' -f4)
             if [ -n "$FINAL_SIZE" ]; then
-              echo "📹 Merged Video Size: $FINAL_SIZE"
+              echo "📹 Merged Video Size: ${FINAL_SIZE} MB"
             fi
           fi
           
@@ -2836,8 +2573,6 @@ jobs:
           
           echo "========================================="
           if [ -f "single_episodes_complete.txt" ] && [ -f "merged_progress.log" ] && grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log; then
-            echo "🎉 All uploads completed successfully!"
-          elif [ -f "single_episodes_complete.txt" ] && [ -f "merged_progress.log" ] && grep -q "UPLOAD_COMPLETE" merged_progress.log; then
             echo "🎉 All uploads completed successfully!"
           fi
           echo "========================================="
