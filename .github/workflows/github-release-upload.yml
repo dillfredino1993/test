@@ -1725,10 +1725,6 @@ jobs:
               thumb = generate_thumbnail(file_path)
               
               # Step 1: Check if poster should be sent
-              # Only send poster if ALL of these conditions are met:
-              # 1. poster_path exists and is a valid file
-              # 2. series_provider is not "N/A" or empty
-              # 3. series_description is not "N/A" or empty
               should_send_poster = False
               if poster_path and os.path.isfile(poster_path):
                   provider_valid = series_provider and series_provider != "N/A" and series_provider.strip()
@@ -1737,6 +1733,8 @@ jobs:
                   if provider_valid and description_valid:
                       should_send_poster = True
                       print("✅ Poster will be sent (provider and description present)")
+                      with open("merged_progress.log", "a") as f:
+                          f.write(f"{datetime.datetime.now()}: POSTER_WILL_BE_SENT\n")
                   else:
                       missing = []
                       if not provider_valid:
@@ -1744,15 +1742,17 @@ jobs:
                       if not description_valid:
                           missing.append("description")
                       print(f"⚠️ Skipping poster - missing: {', '.join(missing)}")
+                      with open("merged_progress.log", "a") as f:
+                          f.write(f"{datetime.datetime.now()}: POSTER_SKIPPED - missing: {', '.join(missing)}\n")
               else:
                   print("⚠️ No poster available, skipping")
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: NO_POSTER_AVAILABLE\n")
               
               # Step 2: Send poster if valid
               if should_send_poster:
                   try:
                       print("🖼️ Sending poster as separate full-size photo...")
-                      
-                      # Poster caption: Title, Provider, Description (NO HASHTAGS)
                       poster_caption = f"📺 {title}\n👤 {series_provider}\n📝 {series_description}"
                       
                       await client.send_file(
@@ -1762,12 +1762,19 @@ jobs:
                           force_document=False
                       )
                       print("✅ Poster sent as full-size photo with title, provider, description")
+                      with open("merged_progress.log", "a") as f:
+                          f.write(f"{datetime.datetime.now()}: POSTER_SENT\n")
                       await asyncio.sleep(1)
                   except Exception as e:
                       print(f"⚠️ Poster send failed: {e}")
+                      with open("merged_progress.log", "a") as f:
+                          f.write(f"{datetime.datetime.now()}: POSTER_FAILED: {e}\n")
               
               # Step 3: Upload video with attributes
               print(f"⬆️ Uploading video to Telegram...")
+              with open("merged_progress.log", "a") as f:
+                  f.write(f"{datetime.datetime.now()}: VIDEO_UPLOAD_STARTED\n")
+              
               try:
                   uploaded_file = await fast_upload_file(
                       client=client,
@@ -1778,6 +1785,8 @@ jobs:
                   
                   if uploaded_file is None:
                       print("❌ Upload returned None")
+                      with open("merged_progress.log", "a") as f:
+                          f.write(f"{datetime.datetime.now()}: UPLOAD_RETURNED_NONE\n")
                       return False, None
                       
                   print("✅ Video upload complete!")
@@ -1786,9 +1795,11 @@ jobs:
               except Exception as e:
                   print(f"❌ Upload failed: {e}")
                   traceback.print_exc()
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: UPLOAD_FAILED: {e}\n")
                   return False, None
               
-              # Step 4: Send video with Title + Hashtags ONLY (no description/provider)
+              # Step 4: Build video caption with hashtags
               now = datetime.datetime.now()
               month_year = now.strftime("%B%Y").upper()
               if telegram_date:
@@ -1823,19 +1834,31 @@ jobs:
                   kwargs["thumb"] = thumb
                   print(f"📸 Using thumbnail: {thumb}")
               
+              # Step 5: Send video
               try:
                   result = await client.send_file(**kwargs)
                   print("✅ Video sent with Title + Hashtags!")
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: VIDEO_SENT\n")
+                      f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_COMPLETE\n")
                   return True, result
               except Exception as e:
                   print(f"❌ Send failed: {e}")
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: SEND_FAILED: {e}\n")
                   if "thumb" in kwargs:
                       del kwargs["thumb"]
                       try:
                           result = await client.send_file(**kwargs)
+                          print("✅ Video sent with Title + Hashtags (without thumb)!")
+                          with open("merged_progress.log", "a") as f:
+                              f.write(f"{datetime.datetime.now()}: VIDEO_SENT_NO_THUMB\n")
+                              f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_COMPLETE\n")
                           return True, result
                       except Exception as e2:
                           print(f"❌ Send failed without thumb: {e2}")
+                          with open("merged_progress.log", "a") as f:
+                              f.write(f"{datetime.datetime.now()}: SEND_FAILED_NO_THUMB: {e2}\n")
                           return False, None
                   return False, None
               finally:
@@ -1870,20 +1893,28 @@ jobs:
                   return False
               
               print(f"📤 Uploading merged video to channel...")
+              with open("merged_progress.log", "a") as f:
+                  f.write(f"{datetime.datetime.now()}: UPLOAD_STARTED\n")
               
               try:
                   success, result = await send_file_with_thumb(client, entity, video_path, "", poster_path=poster_path)
                   if success:
                       print("✅ Merged video successfully posted to channel!")
+                      with open("merged_progress.log", "a") as f:
+                          f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_SUCCESS\n")
                       return True
                   return False
               except FloodWaitError as e:
                   print(f"⏳ Rate limited: waiting {e.seconds}s")
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: FLOOD_WAIT: {e.seconds}s\n")
                   await asyncio.sleep(e.seconds)
                   return await send_file_with_thumb(client, entity, video_path, "", poster_path=poster_path)
               except Exception as e:
                   print(f"❌ Merged upload failed: {e}")
                   traceback.print_exc()
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: MERGED_UPLOAD_FAILED: {e}\n")
                   return False
 
           async def main():
@@ -1915,9 +1946,13 @@ jobs:
                   
                   await client.disconnect()
                   print("\n✅ Merged channel upload complete!")
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: SCRIPT_COMPLETE\n")
               except Exception as e:
                   print(f"❌ Error: {e}")
                   traceback.print_exc()
+                  with open("merged_progress.log", "a") as f:
+                      f.write(f"{datetime.datetime.now()}: SCRIPT_ERROR: {e}\n")
 
           if __name__ == '__main__':
               asyncio.run(main())
@@ -2293,10 +2328,6 @@ jobs:
               count = 0
               
               # Step 1: Check if poster should be sent
-              # Only send poster if ALL of these conditions are met:
-              # 1. poster_path exists and is a valid file
-              # 2. series_provider is not "N/A" or empty
-              # 3. series_description is not "N/A" or empty
               should_send_poster = False
               if poster_path and os.path.isfile(poster_path):
                   provider_valid = series_provider and series_provider != "N/A" and series_provider.strip()
@@ -2315,7 +2346,7 @@ jobs:
               else:
                   print("⚠️ No poster available for topic, skipping")
               
-              # Step 2: Post the poster + series info message in the topic first (if valid)
+              # Step 2: Post poster + series info in topic (if valid)
               if topic_id and should_send_poster:
                   poster_caption = f"📺 {series_title}\n👤 {series_provider}\n📝 {series_description}"
                   print(f"🖼️ Posting poster with series info into topic...")
@@ -2439,8 +2470,8 @@ jobs:
           
           # Function to check if merged upload process is still running
           is_merged_running() {
-            if [ -n "${{ env.merged_pid }}" ]; then
-              if kill -0 ${{ env.merged_pid }} 2>/dev/null; then
+            if [ -n "$MERGED_PID" ]; then
+              if kill -0 "$MERGED_PID" 2>/dev/null; then
                 return 0  # Running
               fi
             fi
@@ -2451,7 +2482,15 @@ jobs:
           get_merged_progress() {
             if [ -f "merged_progress.log" ]; then
               # Check if upload is complete first
+              if grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log; then
+                echo "100|complete"
+                return
+              fi
               if grep -q "UPLOAD_COMPLETE" merged_progress.log; then
+                echo "100|complete"
+                return
+              fi
+              if grep -q "MERGED_UPLOAD_SUCCESS" merged_progress.log; then
                 echo "100|complete"
                 return
               fi
@@ -2576,16 +2615,31 @@ jobs:
               EPISODES_COMPLETE=true
             fi
             
-            # Check merged completion - either from log or process ended
-            if [ -f "merged_progress.log" ] && grep -q "UPLOAD_COMPLETE" merged_progress.log; then
-              MERGED_COMPLETE=true
-            elif ! is_merged_running && [ -f "merged_upload.log" ]; then
-              # Process ended, check if it was successful
-              if tail -20 merged_upload.log | grep -q "✅ Merged video successfully posted to channel!"; then
+            # Check merged completion - multiple markers
+            if [ -f "merged_progress.log" ]; then
+              if grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log; then
                 MERGED_COMPLETE=true
-                # Write completion marker if missing
-                if ! grep -q "UPLOAD_COMPLETE" merged_progress.log 2>/dev/null; then
-                  echo "$(date): UPLOAD_COMPLETE" >> merged_progress.log
+              elif grep -q "UPLOAD_COMPLETE" merged_progress.log; then
+                MERGED_COMPLETE=true
+              elif grep -q "MERGED_UPLOAD_SUCCESS" merged_progress.log; then
+                MERGED_COMPLETE=true
+              elif ! is_merged_running && [ -f "merged_upload.log" ]; then
+                if tail -20 merged_upload.log | grep -q "✅ Merged video successfully posted to channel!"; then
+                  MERGED_COMPLETE=true
+                  # Write completion marker if missing
+                  if ! grep -q "UPLOAD_COMPLETE" merged_progress.log 2>/dev/null; then
+                    echo "$(date): UPLOAD_COMPLETE" >> merged_progress.log
+                  fi
+                  if ! grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log 2>/dev/null; then
+                    echo "$(date): MERGED_UPLOAD_COMPLETE" >> merged_progress.log
+                  fi
+                fi
+              fi
+            else
+              # If log doesn't exist yet, check if process is running
+              if ! is_merged_running && [ -f "merged_upload.log" ]; then
+                if tail -20 merged_upload.log | grep -q "✅ Merged video successfully posted to channel!"; then
+                  MERGED_COMPLETE=true
                 fi
               fi
             fi
@@ -2735,25 +2789,14 @@ jobs:
               fi
             fi
             
-            # If merged upload is at 100% but not marked complete for a while, force complete
-            if [ "$MERGED_PERCENT" = "100" ] && [ "$MERGED_COMPLETE" = false ]; then
-              NO_PROGRESS_COUNT=$((NO_PROGRESS_COUNT + 1))
-              if [ $NO_PROGRESS_COUNT -gt 6 ]; then  # After 30 seconds (6 * 5s)
+            # If merged upload is stuck but process ended, check logs
+            if [ "$MERGED_PERCENT" = "0" ] && [ $ELAPSED -gt 30 ]; then
+              if ! is_merged_running && [ -f "merged_upload.log" ]; then
                 echo ""
-                echo "⚠️  Merged upload at 100% but not marked complete..."
-                echo "   Checking if process is still running..."
-                
-                if ! is_merged_running; then
-                  echo "✅ Process ended, marking as complete..."
-                  echo "$(date): UPLOAD_COMPLETE" >> merged_progress.log
-                  MERGED_COMPLETE=true
-                else
-                  echo "⚠️  Process still running, waiting..."
-                  NO_PROGRESS_COUNT=0
-                fi
+                echo "⚠️  Merged upload process ended but not marked complete..."
+                echo "   Checking logs for errors..."
+                tail -10 merged_upload.log
               fi
-            else
-              NO_PROGRESS_COUNT=0
             fi
             
             sleep 5
@@ -2792,7 +2835,9 @@ jobs:
           fi
           
           echo "========================================="
-          if [ -f "single_episodes_complete.txt" ] && [ -f "merged_progress.log" ] && grep -q "UPLOAD_COMPLETE" merged_progress.log; then
+          if [ -f "single_episodes_complete.txt" ] && [ -f "merged_progress.log" ] && grep -q "MERGED_UPLOAD_COMPLETE" merged_progress.log; then
+            echo "🎉 All uploads completed successfully!"
+          elif [ -f "single_episodes_complete.txt" ] && [ -f "merged_progress.log" ] && grep -q "UPLOAD_COMPLETE" merged_progress.log; then
             echo "🎉 All uploads completed successfully!"
           fi
           echo "========================================="
