@@ -1724,8 +1724,31 @@ jobs:
               
               thumb = generate_thumbnail(file_path)
               
-              # Step 1: Send poster separately FIRST (full size) with Title, Provider, Description
+              # Step 1: Check if poster should be sent
+              # Only send poster if ALL of these conditions are met:
+              # 1. poster_path exists and is a valid file
+              # 2. series_provider is not "N/A" or empty
+              # 3. series_description is not "N/A" or empty
+              should_send_poster = False
               if poster_path and os.path.isfile(poster_path):
+                  provider_valid = series_provider and series_provider != "N/A" and series_provider.strip()
+                  description_valid = series_description and series_description != "N/A" and series_description.strip()
+                  
+                  if provider_valid and description_valid:
+                      should_send_poster = True
+                      print("✅ Poster will be sent (provider and description present)")
+                  else:
+                      missing = []
+                      if not provider_valid:
+                          missing.append("provider")
+                      if not description_valid:
+                          missing.append("description")
+                      print(f"⚠️ Skipping poster - missing: {', '.join(missing)}")
+              else:
+                  print("⚠️ No poster available, skipping")
+              
+              # Step 2: Send poster if valid
+              if should_send_poster:
                   try:
                       print("🖼️ Sending poster as separate full-size photo...")
                       
@@ -1743,7 +1766,7 @@ jobs:
                   except Exception as e:
                       print(f"⚠️ Poster send failed: {e}")
               
-              # Step 2: Upload video with attributes
+              # Step 3: Upload video with attributes
               print(f"⬆️ Uploading video to Telegram...")
               try:
                   uploaded_file = await fast_upload_file(
@@ -1765,7 +1788,7 @@ jobs:
                   traceback.print_exc()
                   return False, None
               
-              # Step 3: Send video with Title + Hashtags ONLY (no description/provider)
+              # Step 4: Send video with Title + Hashtags ONLY (no description/provider)
               now = datetime.datetime.now()
               month_year = now.strftime("%B%Y").upper()
               if telegram_date:
@@ -2269,8 +2292,31 @@ jobs:
               print(f"📊 Found {len(ep_files)} episodes to upload to topic {topic_id}")
               count = 0
               
-              # Post poster + series info in topic first
-              if topic_id and poster_path and os.path.isfile(poster_path):
+              # Step 1: Check if poster should be sent
+              # Only send poster if ALL of these conditions are met:
+              # 1. poster_path exists and is a valid file
+              # 2. series_provider is not "N/A" or empty
+              # 3. series_description is not "N/A" or empty
+              should_send_poster = False
+              if poster_path and os.path.isfile(poster_path):
+                  provider_valid = series_provider and series_provider != "N/A" and series_provider.strip()
+                  description_valid = series_description and series_description != "N/A" and series_description.strip()
+                  
+                  if provider_valid and description_valid:
+                      should_send_poster = True
+                      print("✅ Poster will be sent to topic (provider and description present)")
+                  else:
+                      missing = []
+                      if not provider_valid:
+                          missing.append("provider")
+                      if not description_valid:
+                          missing.append("description")
+                      print(f"⚠️ Skipping poster in topic - missing: {', '.join(missing)}")
+              else:
+                  print("⚠️ No poster available for topic, skipping")
+              
+              # Step 2: Post the poster + series info message in the topic first (if valid)
+              if topic_id and should_send_poster:
                   poster_caption = f"📺 {series_title}\n👤 {series_provider}\n📝 {series_description}"
                   print(f"🖼️ Posting poster with series info into topic...")
                   try:
@@ -2285,6 +2331,7 @@ jobs:
                       print(f"⚠️ Poster post failed: {e}")
                   await asyncio.sleep(2)
               
+              # Step 3: Upload episodes
               for ep_file in ep_files:
                   ep_match = re.search(r'EP(\d+)\.mp4', ep_file)
                   if not ep_match:
