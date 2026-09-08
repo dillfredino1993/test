@@ -242,7 +242,7 @@ jobs:
           
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
-       - name: Download All Episodes First
+      - name: Download All Episodes First
         timeout-minutes: 120
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
@@ -310,7 +310,7 @@ jobs:
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                                -f "bestvideo[ext=mp4]+bestaudio[language^=en]/bestvideo+bestaudio/best[ext=mp4]/best" \
+                -f "bestvideo[ext=mp4]+bestaudio[language^=en]/bestvideo+bestaudio/best[ext=mp4]/best" \
                 --merge-output-format mp4 \
                 --no-progress \
                 --no-warnings \
@@ -504,7 +504,7 @@ jobs:
                 yt-dlp \
                   --extractor-args "generic:impersonate" \
                   --impersonate chrome \
-                                  -f "bestvideo[ext=mp4]+bestaudio[language^=en]/bestvideo+bestaudio/best[ext=mp4]/best" \
+                  -f "bestvideo[ext=mp4]+bestaudio[language^=en]/bestvideo+bestaudio/best[ext=mp4]/best" \
                   --merge-output-format mp4 \
                   --no-progress \
                   --no-warnings \
@@ -539,7 +539,7 @@ jobs:
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                                -f "bestvideo[language^=en]+bestaudio[language^=en]/bestvideo+bestaudio/best" \
+                -f "bestvideo[language^=en]+bestaudio[language^=en]/bestvideo+bestaudio/best" \
                 --merge-output-format mp4 \
                 --remux-video mp4 \
                 --external-downloader aria2c \
@@ -2934,7 +2934,8 @@ jobs:
             EP_PERCENT=$(echo "$EP_PROGRESS" | cut -d'|' -f1)
             EP_DATA=$(echo "$EP_PROGRESS" | cut -d'|' -f2)
             
-            if [ "$EPISODES_COMPLETE" = true ] || [ "$EP_DATA" = "complete" ]; then              EPISODES_COMPLETE=true
+            if [ "$EPISODES_COMPLETE" = true ] || [ "$EP_DATA" = "complete" ]; then
+              EPISODES_COMPLETE=true
               echo "║    Status: ✅ COMPLETE                                     ║"
               BAR_LENGTH=40
               BAR=""
