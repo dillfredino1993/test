@@ -27,6 +27,7 @@ jobs:
     
     steps:
       - name: 📋 Series Information & Setup
+        id: setup
         run: |
           echo "========================================="
           echo "📋 SERIES INFORMATION"
@@ -46,6 +47,71 @@ jobs:
           # Store for later use
           echo "series_title=$SERIES" >> $GITHUB_ENV
           echo "label=$LABEL" >> $GITHUB_ENV
+          
+          # Extract Telegram date (default to today's date)
+          TELEGRAM_DATE="${{ github.event.client_payload.telegramdate }}"
+          if [ -z "$TELEGRAM_DATE" ] || [ "$TELEGRAM_DATE" = "null" ]; then
+            TELEGRAM_DATE=$(date +'%Y-%m-%d')
+          fi
+          echo "📅 Telegram Date: $TELEGRAM_DATE"
+          
+          # Extract Series provider (default to N/A)
+          SERIES_PROVIDER="${{ github.event.client_payload.series_provider }}"
+          if [ -z "$SERIES_PROVIDER" ] || [ "$SERIES_PROVIDER" = "null" ]; then
+            SERIES_PROVIDER="N/A"
+          fi
+          echo "🏢 Series Provider: $SERIES_PROVIDER"
+          
+          # Extract Series description (default to N/A)
+          SERIES_DESCRIPTION="${{ github.event.client_payload.series_description }}"
+          if [ -z "$SERIES_DESCRIPTION" ] || [ "$SERIES_DESCRIPTION" = "null" ]; then
+            SERIES_DESCRIPTION="N/A"
+          fi
+          echo "📝 Series Description: $SERIES_DESCRIPTION"
+          
+          # Extract Poster URL (can be blank; if blank, skip poster entirely)
+          POSTER_URL="${{ github.event.client_payload.poster_url }}"
+          echo "🖼️ Poster URL: $POSTER_URL"
+          
+          # Extract skipsingleupload flag (default to 'no' if not present)
+          SKIP_SINGLE_UPLOAD="${{ github.event.client_payload.skipsingleupload }}"
+          if [ -z "$SKIP_SINGLE_UPLOAD" ] || [ "$SKIP_SINGLE_UPLOAD" = "null" ]; then
+            SKIP_SINGLE_UPLOAD="no"
+          fi
+          echo "⏭️ Skip Single Episodes Upload: $SKIP_SINGLE_UPLOAD"
+          
+          # Extract skipmergedupload flag (default to 'no' if not present)
+          SKIP_MERGED_UPLOAD="${{ github.event.client_payload.skipmergedupload }}"
+          if [ -z "$SKIP_MERGED_UPLOAD" ] || [ "$SKIP_MERGED_UPLOAD" = "null" ]; then
+            SKIP_MERGED_UPLOAD="no"
+          fi
+          echo "⏭️ Skip Merged Upload: $SKIP_MERGED_UPLOAD"
+          
+          # Provider tag for hashtags: strip non-alphanumerics, uppercase
+          PROVIDER_TAG=$(echo "$SERIES_PROVIDER" | sed -e 's/[^a-zA-Z0-9]//g' | tr '[:lower:]' '[:upper:]')
+          if [ -z "$PROVIDER_TAG" ]; then
+            PROVIDER_TAG="N/A"
+          fi
+          echo "🏷️  Provider Tag: $PROVIDER_TAG"
+          
+          echo "========================================="
+          echo "📋 FINAL SETTINGS SUMMARY"
+          echo "========================================="
+          echo "📺 Series: $SERIES"
+          echo "🏷️  Label: $LABEL"
+          echo "📅 Date: $TELEGRAM_DATE"
+          echo "⏭️ Skip Single Upload: $SKIP_SINGLE_UPLOAD"
+          echo "⏭️ Skip Merged Upload: $SKIP_MERGED_UPLOAD"
+          echo "========================================="
+          
+          # Store all extracted values for later use
+          echo "telegram_date=${TELEGRAM_DATE}" >> $GITHUB_OUTPUT
+          echo "series_provider=${SERIES_PROVIDER}" >> $GITHUB_OUTPUT
+          echo "series_description=${SERIES_DESCRIPTION}" >> $GITHUB_OUTPUT
+          echo "poster_url=${POSTER_URL}" >> $GITHUB_OUTPUT
+          echo "provider_tag=${PROVIDER_TAG}" >> $GITHUB_OUTPUT
+          echo "skip_single_upload=${SKIP_SINGLE_UPLOAD}" >> $GITHUB_OUTPUT
+          echo "skip_merged_upload=${SKIP_MERGED_UPLOAD}" >> $GITHUB_OUTPUT
           
           # Create a file to track workflow progress
           echo "STARTED" > workflow_status.txt
@@ -140,72 +206,35 @@ jobs:
           # Store display title with spaces for Telegram messages
           DISPLAY_SERIES_TITLE=$(echo "$SERIES" | sed -e 's/[\/:*?"<>|]/_/g' -e 's/^ *//' -e 's/ *$//')
           
-          # Use telegram date for the title/date (fallback to today's date if blank)
-          TELEGRAM_DATE="${{ github.event.client_payload.telegramdate }}"
+          # Use telegram date from setup step
+          TELEGRAM_DATE="${{ steps.setup.outputs.telegram_date }}"
           if [ -z "$TELEGRAM_DATE" ] || [ "$TELEGRAM_DATE" = "null" ]; then
             TELEGRAM_DATE=$(date +'%Y-%m-%d')
           fi
           DATE_STR="${TELEGRAM_DATE}"
           
+          # For display/Telegram: Use brackets for visual clarity
           TAG_NAME="${DATE_STR}-${CLEAN_LABEL}-${CLEAN_SERIES_TAG}"
           FORMATTED_TITLE="[${DATE_STR}]-[${CLEAN_LABEL}]-${CLEAN_SERIES_TITLE}"
           
-          echo "📄 Formatted Title: $FORMATTED_TITLE"
+          # For filename: Keep brackets but ensure proper escaping for GitHub/shell
+          SAFE_FILENAME_TITLE="${FORMATTED_TITLE}"
+          
+          # Additional safety: Ensure no spaces in filename
+          SAFE_FILENAME_TITLE=$(echo "$SAFE_FILENAME_TITLE" | tr ' ' '_')
+          
+          echo "📄 Formatted Title (Display): $FORMATTED_TITLE"
+          echo "📄 Formatted Title (Filename): $SAFE_FILENAME_TITLE"
           echo "📄 Display Title (with spaces): $DISPLAY_SERIES_TITLE"
           echo "🏷️  Tag Name: $TAG_NAME"
           echo "========================================="
           
           echo "formatted_title=${FORMATTED_TITLE}" >> $GITHUB_OUTPUT
+          echo "safe_filename_title=${SAFE_FILENAME_TITLE}" >> $GITHUB_OUTPUT
           echo "display_title=${DISPLAY_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
           echo "series_title=${CLEAN_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "clean_label=${CLEAN_LABEL}" >> $GITHUB_OUTPUT
-
-      - name: 📋 Extract Payload Fields (Telegram Date, Provider, Description, Poster)
-        id: payload
-        run: |
-          echo "========================================="
-          echo "📋 EXTRACTING PAYLOAD FIELDS"
-          echo "========================================="
-          
-          # Telegram date (default to today's date)
-          TELEGRAM_DATE="${{ github.event.client_payload.telegramdate }}"
-          if [ -z "$TELEGRAM_DATE" ] || [ "$TELEGRAM_DATE" = "null" ]; then
-            TELEGRAM_DATE=$(date +'%Y-%m-%d')
-          fi
-          echo "📅 Telegram Date: $TELEGRAM_DATE"
-          
-          # Series provider (default to N/A)
-          SERIES_PROVIDER="${{ github.event.client_payload.series_provider }}"
-          if [ -z "$SERIES_PROVIDER" ] || [ "$SERIES_PROVIDER" = "null" ]; then
-            SERIES_PROVIDER="N/A"
-          fi
-          echo "🏢 Series Provider: $SERIES_PROVIDER"
-          
-          # Series description (default to N/A)
-          SERIES_DESCRIPTION="${{ github.event.client_payload.series_description }}"
-          if [ -z "$SERIES_DESCRIPTION" ] || [ "$SERIES_DESCRIPTION" = "null" ]; then
-            SERIES_DESCRIPTION="N/A"
-          fi
-          echo "📝 Series Description: $SERIES_DESCRIPTION"
-          
-          # Poster URL (can be blank; if blank, skip poster entirely)
-          POSTER_URL="${{ github.event.client_payload.poster_url }}"
-          echo "🖼️ Poster URL: $POSTER_URL"
-          
-          # Provider tag for hashtags: strip non-alphanumerics, uppercase
-          PROVIDER_TAG=$(echo "$SERIES_PROVIDER" | sed -e 's/[^a-zA-Z0-9]//g' | tr '[:lower:]' '[:upper:]')
-          if [ -z "$PROVIDER_TAG" ]; then
-            PROVIDER_TAG="N/A"
-          fi
-          echo "🏷️  Provider Tag: $PROVIDER_TAG"
-          echo "========================================="
-          
-          echo "telegram_date=${TELEGRAM_DATE}" >> $GITHUB_OUTPUT
-          echo "series_provider=${SERIES_PROVIDER}" >> $GITHUB_OUTPUT
-          echo "series_description=${SERIES_DESCRIPTION}" >> $GITHUB_OUTPUT
-          echo "poster_url=${POSTER_URL}" >> $GITHUB_OUTPUT
-          echo "provider_tag=${PROVIDER_TAG}" >> $GITHUB_OUTPUT
 
       - name: Parse URLs with jq (Clean & Uncorrupted)
         env:
@@ -304,9 +333,6 @@ jobs:
               echo "📺 HLS STREAM DETECTED - Using yt-dlp"
               
               # Use yt-dlp for HLS streams with proper format selection
-              # NOTE: --hls-use-mpegts intentionally removed. The native HLS path
-              # (m3u8_native) writes a proper fragmented MP4. Forcing MPEG-TS into an
-              # .mp4 is what caused "video track not detected".
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
@@ -347,7 +373,7 @@ jobs:
                 if [ "$NEEDS_FIXUP" = true ]; then
                   echo "🔧 Fixing MPEG-TS to MP4 container..."
                   
-                  # Use ffmpeg to fix the file (similar to smart merge approach)
+                  # Use ffmpeg to fix the file
                   ffmpeg -y -err_detect ignore_err -i "$OUT_FILE" \
                     -c:v libx264 -preset veryfast -crf 23 \
                     -c:a aac -b:a 128k -ar 44100 \
@@ -534,8 +560,6 @@ jobs:
               
               rm -f "$OUT_FILE" 2>/dev/null
               
-              # Kept: with an external downloader, TS is written. --remux-video mp4
-              # converts TS -> MP4 after download so the output stays a real MP4.
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
@@ -617,8 +641,6 @@ jobs:
               echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FINAL_SIZE_MB}MB)"
               
               # Quick verify with mediainfo
-              # Use ffprobe for the definitive check (mediainfo parses MPEG-TS
-              # correctly even when the file is TS-in-MP4, so it can misreport)
               HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
               if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
                 echo "   📹 Video track confirmed (ffprobe)"
@@ -640,13 +662,7 @@ jobs:
             # Clean up temp files
             rm -f "$TEMP_FILE" "$FIXED_FILE" 2>/dev/null
             
-            # ────────────────────────────────────────────────
             # ⏳ DELAY BETWEEN EPISODE DOWNLOADS
-            # If more episodes remain, pause before starting the
-            # next one so we don't hammer the server back-to-back.
-            # Configure via env.DOWNLOAD_DELAY or the 'download_delay'
-            # payload value. Set to 0 to disable.
-            # ────────────────────────────────────────────────
             if [ "$EP_INDEX" -lt "$TOTAL_EPISODES" ] && [ "$DELAY" -gt 0 ] 2>/dev/null; then
               echo "⏳ Waiting ${DELAY}s before downloading episode $((EP_INDEX + 1))/$TOTAL_EPISODES..."
               sleep "$DELAY"
@@ -684,7 +700,6 @@ jobs:
           ALL_GOOD=true
           for f in EP*.mp4; do
             if [ -f "$f" ]; then
-              # Check file size first
               FILE_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
               if [ "$FILE_SIZE" -lt 100000 ]; then
                 echo "❌ $f is too small (${FILE_SIZE} bytes) - likely corrupt!"
@@ -982,6 +997,23 @@ jobs:
           echo "📊 Episodes: $(ls -1 EP*.mp4 2>/dev/null | wc -l)"
           echo "========================================="
           
+          # Get the safe filename with brackets
+          SAFE_TITLE="${{ steps.fname.outputs.safe_filename_title }}"
+          DISPLAY_TITLE="${{ steps.fname.outputs.formatted_title }}"
+          
+          # Ensure the safe title is not empty
+          if [ -z "$SAFE_TITLE" ]; then
+            SAFE_TITLE="merged_video"
+          fi
+          
+          # Escape brackets for shell safety when using in commands
+          ESCAPED_TITLE=$(echo "$SAFE_TITLE" | sed 's/\[/\\[/g' | sed 's/\]/\\]/g')
+          MERGED_OUTPUT="${SAFE_TITLE}.mp4"
+          
+          echo "📄 Merged file will be: $MERGED_OUTPUT"
+          echo "📄 Display title (for Telegram): $DISPLAY_TITLE"
+          echo "📄 Escaped title for shell: $ESCAPED_TITLE"
+          
           EP_COUNT=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           if [ "$EP_COUNT" -eq 0 ]; then
             echo "❌ No episodes to merge!"
@@ -989,16 +1021,18 @@ jobs:
           fi
           
           if [ "$EP_COUNT" -eq 1 ]; then
-            echo "📦 Only 1 episode - skipping merge"
+            echo "📦 Only 1 episode - copying to merged file"
             SINGLE_FILE=$(ls EP*.mp4 | head -1)
+            # Use escaped title in ffmpeg command
             ffmpeg -i "$SINGLE_FILE" -c copy -movflags +faststart \
-              -metadata title="$TITLE" \
+              -metadata title="$DISPLAY_TITLE" \
               -metadata series="$SERIES_TITLE" \
               -metadata label="$LABEL" \
               -metadata year="$(date +%Y)" \
               -metadata date="$(date +%Y-%m-%d)" \
-              "output.mp4" 2>/dev/null
-            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
+              "$MERGED_OUTPUT" 2>/dev/null
+            echo "merged_file_path=$(pwd)/$MERGED_OUTPUT" >> $GITHUB_ENV
+            echo "merged_filename=$MERGED_OUTPUT" >> $GITHUB_ENV
             echo "has_merged=true" >> $GITHUB_ENV
             echo "merge_success=true" >> $GITHUB_OUTPUT
             exit 0
@@ -1360,8 +1394,9 @@ jobs:
           
           if [ $FILE_COUNT -lt 2 ]; then
             echo "📦 Less than 2 valid files, copying single file..."
-            cp "${MERGE_FILES_ARRAY[0]}" "output.mp4"
-            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
+            cp "${MERGE_FILES_ARRAY[0]}" "$MERGED_OUTPUT"
+            echo "merged_file_path=$(pwd)/$MERGED_OUTPUT" >> $GITHUB_ENV
+            echo "merged_filename=$MERGED_OUTPUT" >> $GITHUB_ENV
             echo "has_merged=true" >> $GITHUB_ENV
             echo "merge_success=true" >> $GITHUB_OUTPUT
             exit 0
@@ -1404,35 +1439,36 @@ jobs:
           ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
             -c copy \
             -movflags +faststart \
-            -metadata title="$TITLE" \
+            -metadata title="$DISPLAY_TITLE" \
             -metadata series="$SERIES_TITLE" \
             -metadata label="$LABEL" \
             -metadata year="$(date +%Y)" \
             -metadata date="$(date +%Y-%m-%d)" \
-            "output.mp4" 2>/dev/null
+            "$MERGED_OUTPUT" 2>/dev/null
           
-          if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
+          if [ -f "$MERGED_OUTPUT" ] && [ -s "$MERGED_OUTPUT" ]; then
             echo "✅ Merge successful!"
             
             # Verify duration
-            MERGED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
+            MERGED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$MERGED_OUTPUT" 2>/dev/null || echo "0")
             MERGED_DURATION_INT=${MERGED_DURATION%.*}
             echo "📊 Merged file duration: ${MERGED_DURATION_INT} seconds"
             
             # Generate thumbnails
             echo "🖼️ Generating thumbnails..."
-            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
+            ffmpeg -i "$MERGED_OUTPUT" -ss 00:00:01 -vframes 1 \
               -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
               -q:v 2 "thumb.jpg" 2>/dev/null
             
-            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
+            ffmpeg -i "$MERGED_OUTPUT" -ss 00:00:01 -vframes 1 \
               -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
               -q:v 2 "square_thumb.jpg" 2>/dev/null
             
             # Cleanup
             rm -f normalized_*.mp4 concat_list.txt
             
-            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
+            echo "merged_file_path=$(pwd)/$MERGED_OUTPUT" >> $GITHUB_ENV
+            echo "merged_filename=$MERGED_OUTPUT" >> $GITHUB_ENV
             echo "has_merged=true" >> $GITHUB_ENV
             echo "merge_success=true" >> $GITHUB_OUTPUT
             
@@ -1441,8 +1477,8 @@ jobs:
             echo "📊 FINAL MERGED FILE"
             echo "========================================="
             echo "📺 Series: $SERIES_TITLE"
-            echo "📁 File: output.mp4"
-            ls -lh output.mp4
+            echo "📁 File: $MERGED_OUTPUT"
+            ls -lh "$MERGED_OUTPUT"
             echo "========================================="
           else
             echo "❌ Merge failed!"
@@ -1462,12 +1498,18 @@ jobs:
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "========================================="
           
-          if [ ! -f "output.mp4" ]; then
-            echo "❌ output.mp4 not found!"
+          # Get the merged filename from env
+          MERGED_FILENAME="${{ env.merged_filename }}"
+          if [ -z "$MERGED_FILENAME" ]; then
+            MERGED_FILENAME="output.mp4"
+          fi
+          
+          if [ ! -f "$MERGED_FILENAME" ]; then
+            echo "❌ $MERGED_FILENAME not found!"
             exit 1
           fi
           
-          FILE_SIZE_BYTES=$(stat -c%s "output.mp4" 2>/dev/null || stat -f%z "output.mp4" 2>/dev/null || echo "0")
+          FILE_SIZE_BYTES=$(stat -c%s "$MERGED_FILENAME" 2>/dev/null || stat -f%z "$MERGED_FILENAME" 2>/dev/null || echo "0")
           FILE_SIZE_MB=$((FILE_SIZE_BYTES / 1024 / 1024))
           
           echo "📊 File size: ${FILE_SIZE_MB} MB"
@@ -1476,7 +1518,7 @@ jobs:
             echo "⚠️ File exceeds 1.8GB (${FILE_SIZE_MB} MB)"
             echo "🔧 Compressing file with veryfast preset..."
             
-            DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "output.mp4" 2>/dev/null || echo "0")
+            DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$MERGED_FILENAME" 2>/dev/null || echo "0")
             DURATION_INT=${DURATION%.*}
             
             if [ "$DURATION_INT" -gt 0 ]; then
@@ -1492,7 +1534,7 @@ jobs:
             
             echo "🔧 Compressing with veryfast preset..."
             
-            ffmpeg -y -i "output.mp4" \
+            ffmpeg -y -i "$MERGED_FILENAME" \
               -c:v libx264 -preset veryfast -b:v ${TARGET_BITRATE}k -maxrate ${TARGET_BITRATE}k \
               -c:a aac -b:a 128k -ar 44100 \
               -movflags +faststart \
@@ -1501,20 +1543,20 @@ jobs:
               -metadata label="$LABEL" \
               -metadata year="$(date +%Y)" \
               -metadata date="$(date +%Y-%m-%d)" \
-              "output_compressed.mp4" 2>/dev/null
+              "${MERGED_FILENAME}_compressed" 2>/dev/null
             
-            if [ -f "output_compressed.mp4" ] && [ -s "output_compressed.mp4" ]; then
-              NEW_SIZE=$(stat -c%s "output_compressed.mp4" 2>/dev/null || stat -f%z "output_compressed.mp4" 2>/dev/null || echo "0")
+            if [ -f "${MERGED_FILENAME}_compressed" ] && [ -s "${MERGED_FILENAME}_compressed" ]; then
+              NEW_SIZE=$(stat -c%s "${MERGED_FILENAME}_compressed" 2>/dev/null || stat -f%z "${MERGED_FILENAME}_compressed" 2>/dev/null || echo "0")
               NEW_SIZE_MB=$((NEW_SIZE / 1024 / 1024))
               
               if [ $NEW_SIZE_MB -lt 1800 ]; then
-                mv output_compressed.mp4 output.mp4
+                mv "${MERGED_FILENAME}_compressed" "$MERGED_FILENAME"
                 echo "✅ File compressed! New size: ${NEW_SIZE_MB} MB"
                 echo "compressed=true" >> $GITHUB_OUTPUT
               else
                 echo "⚠️ Compression didn't reduce enough (${NEW_SIZE_MB} MB), trying CRF..."
                 
-                ffmpeg -y -i "output.mp4" \
+                ffmpeg -y -i "$MERGED_FILENAME" \
                   -c:v libx264 -preset veryfast -crf 28 \
                   -c:a aac -b:a 96k -ar 44100 \
                   -movflags +faststart \
@@ -1523,19 +1565,19 @@ jobs:
                   -metadata label="$LABEL" \
                   -metadata year="$(date +%Y)" \
                   -metadata date="$(date +%Y-%m-%d)" \
-                  "output_compressed.mp4" 2>/dev/null
+                  "${MERGED_FILENAME}_compressed" 2>/dev/null
                 
-                if [ -f "output_compressed.mp4" ] && [ -s "output_compressed.mp4" ]; then
-                  NEW_SIZE=$(stat -c%s "output_compressed.mp4" 2>/dev/null || stat -f%z "output_compressed.mp4" 2>/dev/null || echo "0")
+                if [ -f "${MERGED_FILENAME}_compressed" ] && [ -s "${MERGED_FILENAME}_compressed" ]; then
+                  NEW_SIZE=$(stat -c%s "${MERGED_FILENAME}_compressed" 2>/dev/null || stat -f%z "${MERGED_FILENAME}_compressed" 2>/dev/null || echo "0")
                   NEW_SIZE_MB=$((NEW_SIZE / 1024 / 1024))
                   
                   if [ $NEW_SIZE_MB -lt 1800 ]; then
-                    mv output_compressed.mp4 output.mp4
+                    mv "${MERGED_FILENAME}_compressed" "$MERGED_FILENAME"
                     echo "✅ File compressed! New size: ${NEW_SIZE_MB} MB"
                     echo "compressed=true" >> $GITHUB_OUTPUT
                   else
                     echo "❌ Compression failed to reduce file size"
-                    rm -f output_compressed.mp4
+                    rm -f "${MERGED_FILENAME}_compressed"
                     echo "compressed=false" >> $GITHUB_OUTPUT
                   fi
                 fi
@@ -1549,40 +1591,40 @@ jobs:
             echo "compressed=false" >> $GITHUB_OUTPUT
           fi
           
-          if [ -f "output.mp4" ] && [ -s "output.mp4" ]; then
+          if [ -f "$MERGED_FILENAME" ] && [ -s "$MERGED_FILENAME" ]; then
             echo "🖼️ Regenerating thumbnails..."
-            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
+            ffmpeg -i "$MERGED_FILENAME" -ss 00:00:01 -vframes 1 \
               -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" \
               -q:v 2 "thumb.jpg" 2>/dev/null
             
-            ffmpeg -i "output.mp4" -ss 00:00:01 -vframes 1 \
+            ffmpeg -i "$MERGED_FILENAME" -ss 00:00:01 -vframes 1 \
               -vf "crop=min(iw\,ih):min(iw\,ih),scale=512:512:flags=lanczos" \
               -q:v 2 "square_thumb.jpg" 2>/dev/null
           fi
           
           echo "🔧 Fixing duration metadata..."
-          ffmpeg -i output.mp4 -c copy -map_metadata 0 -movflags +faststart output_fixed.mp4 2>/dev/null
+          ffmpeg -i "$MERGED_FILENAME" -c copy -map_metadata 0 -movflags +faststart "${MERGED_FILENAME}_fixed" 2>/dev/null
           
-          if [ -f "output_fixed.mp4" ] && [ -s "output_fixed.mp4" ]; then
-            mv output_fixed.mp4 output.mp4
+          if [ -f "${MERGED_FILENAME}_fixed" ] && [ -s "${MERGED_FILENAME}_fixed" ]; then
+            mv "${MERGED_FILENAME}_fixed" "$MERGED_FILENAME"
             echo "✅ Duration metadata fixed"
           fi
           
-          if mediainfo output.mp4 > /dev/null 2>&1; then
+          if mediainfo "$MERGED_FILENAME" > /dev/null 2>&1; then
             echo "✅ MediaInfo can read the file"
             echo ""
-            mediainfo output.mp4
+            mediainfo "$MERGED_FILENAME"
             echo ""
             
-            DURATION=$(mediainfo --Inform="General;%Duration/String3%" output.mp4 2>/dev/null)
-            FINAL_SIZE=$(stat -c%s "output.mp4" 2>/dev/null || stat -f%z "output.mp4" 2>/dev/null || echo "0")
+            DURATION=$(mediainfo --Inform="General;%Duration/String3%" "$MERGED_FILENAME" 2>/dev/null)
+            FINAL_SIZE=$(stat -c%s "$MERGED_FILENAME" 2>/dev/null || stat -f%z "$MERGED_FILENAME" 2>/dev/null || echo "0")
             FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
             
             echo "📝 Duration: $DURATION"
             echo "💾 Final size: ${FINAL_SIZE_MB} MB"
             echo "✅ File is valid"
             echo "verify_success=true" >> $GITHUB_OUTPUT
-            echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
+            echo "merged_file_path=$(pwd)/$MERGED_FILENAME" >> $GITHUB_ENV
             
             if [ $FINAL_SIZE_MB -gt 2000 ]; then
               echo "❌ File exceeds 2GB (${FINAL_SIZE_MB} MB)"
@@ -1595,7 +1637,7 @@ jobs:
             echo "❌ MediaInfo cannot read the file!"
             echo "🔧 Attempting to repair..."
             
-            ffmpeg -y -err_detect ignore_err -i output.mp4 \
+            ffmpeg -y -err_detect ignore_err -i "$MERGED_FILENAME" \
               -c:v libx264 -preset veryfast -crf 23 \
               -c:a aac -b:a 128k -ar 44100 \
               -movflags +faststart \
@@ -1604,19 +1646,19 @@ jobs:
               -metadata label="$LABEL" \
               -metadata year="$(date +%Y)" \
               -metadata date="$(date +%Y-%m-%d)" \
-              "output_repaired.mp4" 2>/dev/null
+              "${MERGED_FILENAME}_repaired" 2>/dev/null
             
-            if [ -f "output_repaired.mp4" ]; then
-              REPAIR_SIZE=$(stat -c%s "output_repaired.mp4" 2>/dev/null || echo "0")
+            if [ -f "${MERGED_FILENAME}_repaired" ]; then
+              REPAIR_SIZE=$(stat -c%s "${MERGED_FILENAME}_repaired" 2>/dev/null || echo "0")
               REPAIR_SIZE_MB=$((REPAIR_SIZE / 1024 / 1024))
               if [ "$REPAIR_SIZE" -gt 1000000 ] && [ $REPAIR_SIZE_MB -lt 2000 ]; then
-                mv output_repaired.mp4 output.mp4
+                mv "${MERGED_FILENAME}_repaired" "$MERGED_FILENAME"
                 echo "✅ File repaired!"
                 echo "verify_success=true" >> $GITHUB_OUTPUT
-                echo "merged_file_path=$(pwd)/output.mp4" >> $GITHUB_ENV
+                echo "merged_file_path=$(pwd)/$MERGED_FILENAME" >> $GITHUB_ENV
               else
                 echo "❌ Repair failed or file still too large"
-                rm -f output_repaired.mp4
+                rm -f "${MERGED_FILENAME}_repaired"
                 exit 1
               fi
             else
@@ -1626,9 +1668,9 @@ jobs:
           fi
 
       - name: 📥 Download Poster (for Telegram Uploads)
-        if: steps.verify.outputs.verify_success == 'true' && steps.payload.outputs.poster_url != ''
+        if: steps.verify.outputs.verify_success == 'true' && steps.setup.outputs.poster_url != ''
         env:
-          POSTER_URL: ${{ steps.payload.outputs.poster_url }}
+          POSTER_URL: ${{ steps.setup.outputs.poster_url }}
         run: |
           cd downloads
           if [ -n "$POSTER_URL" ] && curl -f -sSL --connect-timeout 20 --max-time 120 -o poster.jpg "$POSTER_URL"; then
@@ -1645,8 +1687,24 @@ jobs:
             echo "poster_path=" >> $GITHUB_ENV
           fi
 
+      - name: Skip Merged Upload (skipmergedupload = yes)
+        if: steps.verify.outputs.verify_success == 'true' && steps.setup.outputs.skip_merged_upload == 'yes'
+        run: |
+          cd downloads
+          echo "========================================="
+          echo "⏭️ SKIPPING MERGED UPLOAD"
+          echo "========================================="
+          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+          echo "ℹ️  skipmergedupload = yes, skipping merged upload"
+          echo "========================================="
+          echo "Merged upload skipped due to skipmergedupload=yes" > merged_upload_skipped.txt
+          echo "⏭️ Merged upload skipped by user request"
+          # Create a dummy progress file so the monitoring step works
+          echo "$(date): SKIPPED" > merged_progress.log
+          echo "$(date): VIDEO_SENT" >> merged_progress.log
+
       - name: Start Merged Upload (Background with Fast Upload)
-        if: steps.verify.outputs.verify_success == 'true'
+        if: steps.verify.outputs.verify_success == 'true' && (steps.setup.outputs.skip_merged_upload == '' || steps.setup.outputs.skip_merged_upload == 'no' || steps.setup.outputs.skip_merged_upload == null)
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -1659,10 +1717,10 @@ jobs:
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
           DISPLAY_TITLE: ${{ steps.fname.outputs.display_title }}
           LABEL: ${{ steps.fname.outputs.clean_label }}
-          TELEGRAM_DATE: ${{ steps.payload.outputs.telegram_date }}
-          SERIES_PROVIDER: ${{ steps.payload.outputs.series_provider }}
-          SERIES_DESCRIPTION: ${{ steps.payload.outputs.series_description }}
-          PROVIDER_TAG: ${{ steps.payload.outputs.provider_tag }}
+          TELEGRAM_DATE: ${{ steps.setup.outputs.telegram_date }}
+          SERIES_PROVIDER: ${{ steps.setup.outputs.series_provider }}
+          SERIES_DESCRIPTION: ${{ steps.setup.outputs.series_description }}
+          PROVIDER_TAG: ${{ steps.setup.outputs.provider_tag }}
           POSTER_PATH: ${{ env.poster_path }}
         run: |
           cd downloads
@@ -1674,15 +1732,21 @@ jobs:
           echo "📁 File: ${{ env.merged_file_path }}"
           echo "========================================="
           
-          if [ ! -f "${{ env.merged_file_path }}" ] && [ ! -f "output.mp4" ]; then
-            echo "❌ output.mp4 not found!"
+          # Get the merged filename
+          MERGED_FILENAME="${{ env.merged_filename }}"
+          if [ -z "$MERGED_FILENAME" ]; then
+            MERGED_FILENAME="output.mp4"
+          fi
+          
+          if [ ! -f "${{ env.merged_file_path }}" ] && [ ! -f "$MERGED_FILENAME" ]; then
+            echo "❌ $MERGED_FILENAME not found!"
             exit 1
           fi
           
           if [ -f "${{ env.merged_file_path }}" ]; then
             export MERGED_PATH="${{ env.merged_file_path }}"
           else
-            export MERGED_PATH="$(pwd)/output.mp4"
+            export MERGED_PATH="$(pwd)/$MERGED_FILENAME"
             echo "⚠️ Using fallback path: $MERGED_PATH"
           fi
           
@@ -1948,10 +2012,6 @@ jobs:
                   print(f"📸 Using thumbnail: {thumb}")
               
               # Check if poster should be sent
-              # Only send poster if ALL conditions are met:
-              # 1. Poster file exists
-              # 2. Series provider is not N/A or empty
-              # 3. Series description is not N/A or empty
               should_send_poster = False
               if poster_path and os.path.isfile(poster_path):
                   provider_has_value = series_provider and series_provider != "N/A" and series_provider.strip()
@@ -2133,7 +2193,7 @@ jobs:
           echo "✅ Merged upload started with PID: $MERGED_PID"
 
       - name: Skip Single Episodes Upload (skipsingleupload = yes)
-        if: steps.verify.outputs.verify_success == 'true' && github.event.client_payload.skipsingleupload == 'yes'
+        if: steps.verify.outputs.verify_success == 'true' && steps.setup.outputs.skip_single_upload == 'yes'
         run: |
           cd downloads
           echo "========================================="
@@ -2146,7 +2206,7 @@ jobs:
           echo "⏭️ Skipped by user request"
 
       - name: Upload Single Episodes (Fast Upload)
-        if: steps.verify.outputs.verify_success == 'true' && (github.event.client_payload.skipsingleupload == '' || github.event.client_payload.skipsingleupload == null || github.event.client_payload.skipsingleupload != 'yes')
+        if: steps.verify.outputs.verify_success == 'true' && (steps.setup.outputs.skip_single_upload == '' || steps.setup.outputs.skip_single_upload == 'no' || steps.setup.outputs.skip_single_upload == null)
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -2159,10 +2219,10 @@ jobs:
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
           DISPLAY_TITLE: ${{ steps.fname.outputs.display_title }}
           LABEL: ${{ steps.fname.outputs.clean_label }}
-          TELEGRAM_DATE: ${{ steps.payload.outputs.telegram_date }}
-          SERIES_PROVIDER: ${{ steps.payload.outputs.series_provider }}
-          SERIES_DESCRIPTION: ${{ steps.payload.outputs.series_description }}
-          PROVIDER_TAG: ${{ steps.payload.outputs.provider_tag }}
+          TELEGRAM_DATE: ${{ steps.setup.outputs.telegram_date }}
+          SERIES_PROVIDER: ${{ steps.setup.outputs.series_provider }}
+          SERIES_DESCRIPTION: ${{ steps.setup.outputs.series_description }}
+          PROVIDER_TAG: ${{ steps.setup.outputs.provider_tag }}
           POSTER_PATH: ${{ env.poster_path }}
         run: |
           cd downloads
