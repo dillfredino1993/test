@@ -305,8 +305,7 @@ jobs:
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                --prefer-langs en \
-                -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best" \
+                                -f "bestvideo[ext=mp4]+bestaudio[language^=en]/bestvideo+bestaudio/best[ext=mp4]/best" \
                 --merge-output-format mp4 \
                 --no-progress \
                 --no-warnings \
@@ -500,8 +499,7 @@ jobs:
                 yt-dlp \
                   --extractor-args "generic:impersonate" \
                   --impersonate chrome \
-                --prefer-langs en \
-                  -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best" \
+                                  -f "bestvideo[ext=mp4]+bestaudio[language^=en]/bestvideo+bestaudio/best[ext=mp4]/best" \
                   --merge-output-format mp4 \
                   --no-progress \
                   --no-warnings \
@@ -536,8 +534,7 @@ jobs:
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                --prefer-langs en \
-                -f "bestvideo+bestaudio/best" \
+                                -f "bestvideo[language^=en]+bestaudio[language^=en]/bestvideo+bestaudio/best" \
                 --merge-output-format mp4 \
                 --remux-video mp4 \
                 --external-downloader aria2c \
@@ -1063,8 +1060,7 @@ jobs:
                 
                 # Redownload with yt-dlp specifically to ensure video+audio
                 yt-dlp --extractor-args "generic:impersonate" --impersonate chrome \
-                --prefer-langs en \
-                  -f "bestvideo+bestaudio/best" \
+                                  -f "bestvideo[language^=en]+bestaudio[language^=en]/bestvideo+bestaudio/best" \
                   --merge-output-format mp4 \
                   --no-progress --no-warnings \
                   -o "$FILE" "$URL" < /dev/null 2>&1
