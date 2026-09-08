@@ -217,8 +217,8 @@ jobs:
           TAG_NAME="${DATE_STR}-${CLEAN_LABEL}-${CLEAN_SERIES_TAG}"
           FORMATTED_TITLE="[${DATE_STR}]-[${CLEAN_LABEL}]-${CLEAN_SERIES_TITLE}"
           
-          # For filename: Keep brackets but ensure proper escaping for GitHub/shell
-          SAFE_FILENAME_TITLE="${FORMATTED_TITLE}"
+          # For filename: REMOVE brackets, use hyphens instead (GitHub/shell safe)
+          SAFE_FILENAME_TITLE="${DATE_STR}-${CLEAN_LABEL}-${CLEAN_SERIES_TITLE}"
           
           # Additional safety: Ensure no spaces in filename
           SAFE_FILENAME_TITLE=$(echo "$SAFE_FILENAME_TITLE" | tr ' ' '_')
@@ -997,8 +997,9 @@ jobs:
           echo "📊 Episodes: $(ls -1 EP*.mp4 2>/dev/null | wc -l)"
           echo "========================================="
           
-          # Get the safe filename with brackets
+          # Get the safe filename WITHOUT brackets
           SAFE_TITLE="${{ steps.fname.outputs.safe_filename_title }}"
+          # Get the display title WITH brackets for Telegram
           DISPLAY_TITLE="${{ steps.fname.outputs.formatted_title }}"
           
           # Ensure the safe title is not empty
@@ -1006,13 +1007,10 @@ jobs:
             SAFE_TITLE="merged_video"
           fi
           
-          # Escape brackets for shell safety when using in commands
-          ESCAPED_TITLE=$(echo "$SAFE_TITLE" | sed 's/\[/\\[/g' | sed 's/\]/\\]/g')
           MERGED_OUTPUT="${SAFE_TITLE}.mp4"
           
           echo "📄 Merged file will be: $MERGED_OUTPUT"
           echo "📄 Display title (for Telegram): $DISPLAY_TITLE"
-          echo "📄 Escaped title for shell: $ESCAPED_TITLE"
           
           EP_COUNT=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           if [ "$EP_COUNT" -eq 0 ]; then
@@ -1023,7 +1021,6 @@ jobs:
           if [ "$EP_COUNT" -eq 1 ]; then
             echo "📦 Only 1 episode - copying to merged file"
             SINGLE_FILE=$(ls EP*.mp4 | head -1)
-            # Use escaped title in ffmpeg command
             ffmpeg -i "$SINGLE_FILE" -c copy -movflags +faststart \
               -metadata title="$DISPLAY_TITLE" \
               -metadata series="$SERIES_TITLE" \
@@ -1509,51 +1506,53 @@ jobs:
             exit 1
           fi
           
+          # FIRST: Try to fix the file with ffmpeg BEFORE any validation
+          echo "🔧 Pre-emptively fixing file structure..."
+          
+          # Use ffmpeg with ignore_err and genpts to fix timestamp issues
+          ffmpeg -y -err_detect ignore_err -fflags +genpts -i "$MERGED_FILENAME" \
+            -c copy \
+            -movflags +faststart \
+            -map_metadata 0 \
+            "${MERGED_FILENAME}_fixed.mp4" 2>/dev/null
+          
+          if [ -f "${MERGED_FILENAME}_fixed.mp4" ] && [ -s "${MERGED_FILENAME}_fixed.mp4" ]; then
+            FIXED_SIZE=$(stat -c%s "${MERGED_FILENAME}_fixed.mp4" 2>/dev/null || echo "0")
+            ORIG_SIZE=$(stat -c%s "$MERGED_FILENAME" 2>/dev/null || echo "0")
+            if [ "$FIXED_SIZE" -gt 1000000 ] && [ "$FIXED_SIZE" -gt "$((ORIG_SIZE / 2))" ]; then
+              mv "${MERGED_FILENAME}_fixed.mp4" "$MERGED_FILENAME"
+              echo "✅ Fixed file structure successfully"
+            else
+              echo "⚠️ Fixed file seems too small, keeping original"
+              rm -f "${MERGED_FILENAME}_fixed.mp4"
+            fi
+          else
+            echo "⚠️ Quick fix didn't work, will try re-encoding if needed"
+          fi
+          
           FILE_SIZE_BYTES=$(stat -c%s "$MERGED_FILENAME" 2>/dev/null || stat -f%z "$MERGED_FILENAME" 2>/dev/null || echo "0")
           FILE_SIZE_MB=$((FILE_SIZE_BYTES / 1024 / 1024))
           
           echo "📊 File size: ${FILE_SIZE_MB} MB"
           
-          # First, check if the file is valid using ffprobe (more reliable than mediainfo)
+          # Check if file is valid with ffprobe (more reliable than mediainfo)
           echo "🔍 Checking file validity with ffprobe..."
-          if ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$MERGED_FILENAME" 2>/dev/null; then
-            echo "✅ File is valid (ffprobe check passed)"
+          DURATION_CHECK=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$MERGED_FILENAME" 2>/dev/null)
+          
+          if [ -n "$DURATION_CHECK" ] && [ "$DURATION_CHECK" != "0" ] && [ "$DURATION_CHECK" != "N/A" ]; then
+            echo "✅ File is valid (ffprobe check passed, duration: ${DURATION_CHECK}s)"
             FILE_VALID=true
           else
             echo "⚠️ File appears invalid or corrupted!"
             FILE_VALID=false
           fi
           
-          # If file is invalid, try to repair it first
+          # If file is invalid, try re-encoding
           if [ "$FILE_VALID" = false ]; then
-            echo "🔧 Attempting to repair the file..."
+            echo "🔧 File appears corrupted, attempting re-encode..."
             
-            # Try to remux with ffmpeg
-            ffmpeg -y -err_detect ignore_err -i "$MERGED_FILENAME" \
-              -c copy \
-              -movflags +faststart \
-              -metadata title="$TITLE" \
-              -metadata series="$SERIES_TITLE" \
-              -metadata label="$LABEL" \
-              "${MERGED_FILENAME}_remuxed.mp4" 2>/dev/null
-            
-            if [ -f "${MERGED_FILENAME}_remuxed.mp4" ] && [ -s "${MERGED_FILENAME}_remuxed.mp4" ]; then
-              REMUX_SIZE=$(stat -c%s "${MERGED_FILENAME}_remuxed.mp4" 2>/dev/null || echo "0")
-              if [ "$REMUX_SIZE" -gt 1000000 ]; then
-                mv "${MERGED_FILENAME}_remuxed.mp4" "$MERGED_FILENAME"
-                echo "✅ File remuxed successfully!"
-                FILE_VALID=true
-              else
-                rm -f "${MERGED_FILENAME}_remuxed.mp4"
-              fi
-            fi
-          fi
-          
-          # If still invalid, try re-encoding
-          if [ "$FILE_VALID" = false ]; then
-            echo "🔧 Remux failed, attempting re-encode..."
-            
-            ffmpeg -y -err_detect ignore_err -i "$MERGED_FILENAME" \
+            # Try to re-encode with ignore_err and genpts
+            ffmpeg -y -err_detect ignore_err -fflags +genpts -i "$MERGED_FILENAME" \
               -c:v libx264 -preset veryfast -crf 23 \
               -c:a aac -b:a 128k -ar 44100 \
               -movflags +faststart \
@@ -1572,8 +1571,11 @@ jobs:
                 echo "✅ File re-encoded successfully! New size: ${REENC_SIZE_MB} MB"
                 FILE_VALID=true
               else
+                echo "❌ Re-encode failed or file too large"
                 rm -f "${MERGED_FILENAME}_reencoded.mp4"
               fi
+            else
+              echo "❌ Re-encode failed"
             fi
           fi
           
@@ -1607,7 +1609,7 @@ jobs:
             
             echo "🔧 Compressing with veryfast preset..."
             
-            ffmpeg -y -i "$MERGED_FILENAME" \
+            ffmpeg -y -err_detect ignore_err -fflags +genpts -i "$MERGED_FILENAME" \
               -c:v libx264 -preset veryfast -b:v ${TARGET_BITRATE}k -maxrate ${TARGET_BITRATE}k \
               -c:a aac -b:a 128k -ar 44100 \
               -movflags +faststart \
@@ -1629,7 +1631,7 @@ jobs:
               else
                 echo "⚠️ Compression didn't reduce enough (${NEW_SIZE_MB} MB), trying CRF..."
                 
-                ffmpeg -y -i "$MERGED_FILENAME" \
+                ffmpeg -y -err_detect ignore_err -fflags +genpts -i "$MERGED_FILENAME" \
                   -c:v libx264 -preset veryfast -crf 28 \
                   -c:a aac -b:a 96k -ar 44100 \
                   -movflags +faststart \
@@ -1675,14 +1677,6 @@ jobs:
               -q:v 2 "square_thumb.jpg" 2>/dev/null
           fi
           
-          echo "🔧 Fixing duration metadata..."
-          ffmpeg -i "$MERGED_FILENAME" -c copy -map_metadata 0 -movflags +faststart "${MERGED_FILENAME}_fixed" 2>/dev/null
-          
-          if [ -f "${MERGED_FILENAME}_fixed" ] && [ -s "${MERGED_FILENAME}_fixed" ]; then
-            mv "${MERGED_FILENAME}_fixed" "$MERGED_FILENAME"
-            echo "✅ Duration metadata fixed"
-          fi
-          
           # Use ffprobe for final validation (more reliable than mediainfo)
           DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$MERGED_FILENAME" 2>/dev/null)
           FINAL_SIZE=$(stat -c%s "$MERGED_FILENAME" 2>/dev/null || stat -f%z "$MERGED_FILENAME" 2>/dev/null || echo "0")
@@ -1691,19 +1685,10 @@ jobs:
           echo "📝 Duration: ${DURATION}s"
           echo "💾 Final size: ${FINAL_SIZE_MB} MB"
           
-          # Also try mediainfo but don't fail if it doesn't work
-          echo "🔍 Checking with mediainfo (optional)..."
-          if mediainfo "$MERGED_FILENAME" > /dev/null 2>&1; then
-            echo "✅ MediaInfo can read the file"
-            echo ""
-            mediainfo "$MERGED_FILENAME"
-            echo ""
-          else
-            echo "⚠️ MediaInfo cannot read the file, but ffprobe says it's valid"
-            echo "   This is usually fine - the file should work for upload"
-          fi
+          # SKIP MEDIAINFO COMPLETELY - it causes segfaults
+          echo "✅ File validated using ffprobe (skipping mediainfo to avoid segfaults)"
           
-          if [ -n "$DURATION" ] && [ "$DURATION" != "0" ] && [ "$DURATION" != "N/A" ]; then
+          if [ -n "$DURATION" ] && [ "$DURATION" != "0" ] && [ "$DURATION" != "N/A" ] && [ "$DURATION" != "0.000000" ]; then
             echo "✅ File appears valid (ffprobe check passed)"
             echo "verify_success=true" >> $GITHUB_OUTPUT
             echo "merged_file_path=$(pwd)/$MERGED_FILENAME" >> $GITHUB_ENV
