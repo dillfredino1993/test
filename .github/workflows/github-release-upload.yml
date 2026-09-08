@@ -137,6 +137,9 @@ jobs:
           CLEAN_SERIES_TITLE=$(echo "$SERIES" | sed -e 's/[\/:*?"<>|]/_/g' -e 's/^ *//' -e 's/ *$//')
           CLEAN_SERIES_TAG=$(echo "$CLEAN_SERIES_TITLE" | tr ' ' '_')
           
+          # Store display title with spaces for Telegram messages
+          DISPLAY_SERIES_TITLE=$(echo "$SERIES" | sed -e 's/[\/:*?"<>|]/_/g' -e 's/^ *//' -e 's/ *$//')
+          
           # Use telegram date for the title/date (fallback to today's date if blank)
           TELEGRAM_DATE="${{ github.event.client_payload.telegramdate }}"
           if [ -z "$TELEGRAM_DATE" ] || [ "$TELEGRAM_DATE" = "null" ]; then
@@ -148,10 +151,12 @@ jobs:
           FORMATTED_TITLE="[${DATE_STR}]-[${CLEAN_LABEL}]-${CLEAN_SERIES_TITLE}"
           
           echo "📄 Formatted Title: $FORMATTED_TITLE"
+          echo "📄 Display Title (with spaces): $DISPLAY_SERIES_TITLE"
           echo "🏷️  Tag Name: $TAG_NAME"
           echo "========================================="
           
           echo "formatted_title=${FORMATTED_TITLE}" >> $GITHUB_OUTPUT
+          echo "display_title=${DISPLAY_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
           echo "series_title=${CLEAN_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "clean_label=${CLEAN_LABEL}" >> $GITHUB_OUTPUT
@@ -237,7 +242,7 @@ jobs:
           
           echo "✅ Found $(cat urls.txt | wc -l) URLs"
 
-      - name: Download All Episodes First
+       - name: Download All Episodes First
         timeout-minutes: 120
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
@@ -707,13 +712,14 @@ jobs:
           
           echo "✅ All $TOTAL_EPISODES episodes downloaded and verified successfully!"
           echo "========================================="
-          - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
-             timeout-minutes: 240
-             env:
-             TITLE: ${{ steps.fname.outputs.formatted_title }}
-              SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
-              LABEL: ${{ github.event.client_payload.label || 'NONE' }}
-              run: |
+
+      - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
+        timeout-minutes: 240
+        env:
+          TITLE: ${{ steps.fname.outputs.formatted_title }}
+          SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
+          LABEL: ${{ github.event.client_payload.label || 'NONE' }}
+        run: |
           cd downloads
           
           echo "========================================="
