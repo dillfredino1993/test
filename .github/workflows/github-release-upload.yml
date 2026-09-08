@@ -19,7 +19,7 @@ permissions:
 # Change the default here, or override per run by sending
 # "download_delay": <seconds> in the repository_dispatch payload.
 env:
-  DOWNLOAD_DELAY: 15
+  DOWNLOAD_DELAY: 10
 
 jobs:
   upload:
@@ -137,9 +137,6 @@ jobs:
           CLEAN_SERIES_TITLE=$(echo "$SERIES" | sed -e 's/[\/:*?"<>|]/_/g' -e 's/^ *//' -e 's/ *$//')
           CLEAN_SERIES_TAG=$(echo "$CLEAN_SERIES_TITLE" | tr ' ' '_')
           
-          # Store display title with spaces for Telegram messages
-          DISPLAY_SERIES_TITLE=$(echo "$SERIES" | sed -e 's/[\/:*?"<>|]/_/g' -e 's/^ *//' -e 's/ *$//')
-          
           # Use telegram date for the title/date (fallback to today's date if blank)
           TELEGRAM_DATE="${{ github.event.client_payload.telegramdate }}"
           if [ -z "$TELEGRAM_DATE" ] || [ "$TELEGRAM_DATE" = "null" ]; then
@@ -151,12 +148,10 @@ jobs:
           FORMATTED_TITLE="[${DATE_STR}]-[${CLEAN_LABEL}]-${CLEAN_SERIES_TITLE}"
           
           echo "📄 Formatted Title: $FORMATTED_TITLE"
-          echo "📄 Display Title (with spaces): $DISPLAY_SERIES_TITLE"
           echo "🏷️  Tag Name: $TAG_NAME"
           echo "========================================="
           
           echo "formatted_title=${FORMATTED_TITLE}" >> $GITHUB_OUTPUT
-          echo "display_title=${DISPLAY_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
           echo "series_title=${CLEAN_SERIES_TITLE}" >> $GITHUB_OUTPUT
           echo "clean_label=${CLEAN_LABEL}" >> $GITHUB_OUTPUT
@@ -301,15 +296,17 @@ jobs:
             # CHECK URL TYPE: HLS/m3u8 OR DIRECT VIDEO
             # ------------------------------------------------------------
             if [[ "$URL" == *".m3u8"* ]] || [[ "$URL" == *".m3u"* ]] || [[ "$URL" == *"master.m3u8"* ]]; then
-              echo "📺 HLS STREAM DETECTED - Using yt-dlp with best quality selection"
+              echo "📺 HLS STREAM DETECTED - Using yt-dlp"
               
-              # Use yt-dlp for HLS streams with best quality selection
-              # Format selector: bestvideo+bestaudio -> merge to mp4
-              # This selects the highest quality video and audio available
+              # Use yt-dlp for HLS streams with proper format selection
+              # NOTE: --hls-use-mpegts intentionally removed. The native HLS path
+              # (m3u8_native) writes a proper fragmented MP4. Forcing MPEG-TS into an
+              # .mp4 is what caused "video track not detected".
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                -f "bestvideo+bestaudio/best" \
+                --prefer-langs en \
+                -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best" \
                 --merge-output-format mp4 \
                 --no-progress \
                 --no-warnings \
@@ -346,7 +343,7 @@ jobs:
                 if [ "$NEEDS_FIXUP" = true ]; then
                   echo "🔧 Fixing MPEG-TS to MP4 container..."
                   
-                  # Use ffmpeg to fix the file
+                  # Use ffmpeg to fix the file (similar to smart merge approach)
                   ffmpeg -y -err_detect ignore_err -i "$OUT_FILE" \
                     -c:v libx264 -preset veryfast -crf 23 \
                     -c:a aac -b:a 128k -ar 44100 \
@@ -415,7 +412,7 @@ jobs:
               
             else
               # ------------------------------------------------------------
-              # DIRECT VIDEO URL - Use aria2c for speed with best quality
+              # DIRECT VIDEO URL - Use aria2c for speed
               # ------------------------------------------------------------
               echo "🎬 DIRECT VIDEO DETECTED - Using aria2c for fast download"
               
@@ -495,15 +492,16 @@ jobs:
                 fi
               fi
               
-              # If aria2c failed, try yt-dlp as fallback with best quality
+              # If aria2c failed, try yt-dlp as fallback
               if [ "$DOWNLOAD_SUCCESS" != true ]; then
-                echo "⚠️ aria2c failed. Trying yt-dlp fallback with best quality..."
+                echo "⚠️ aria2c failed. Trying yt-dlp fallback..."
                 rm -f "$OUT_FILE" 2>/dev/null
                 
                 yt-dlp \
                   --extractor-args "generic:impersonate" \
                   --impersonate chrome \
-                  -f "bestvideo+bestaudio/best" \
+                --prefer-langs en \
+                  -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best" \
                   --merge-output-format mp4 \
                   --no-progress \
                   --no-warnings \
@@ -526,18 +524,19 @@ jobs:
             fi
             
             # ------------------------------------------------------------
-            # ULTIMATE FALLBACK: Try yt-dlp with best quality and external downloader
+            # ULTIMATE FALLBACK: Try yt-dlp with external downloader for any URL
             # ------------------------------------------------------------
             if [ "$DOWNLOAD_SUCCESS" != true ]; then
-              echo "⚠️ Primary download methods failed. Trying yt-dlp with best quality + aria2c external..."
+              echo "⚠️ Primary download methods failed. Trying yt-dlp with aria2c external..."
               
               rm -f "$OUT_FILE" 2>/dev/null
               
-              # Use yt-dlp with best quality selection and aria2c as external downloader
-              # This ensures we get the best quality available
+              # Kept: with an external downloader, TS is written. --remux-video mp4
+              # converts TS -> MP4 after download so the output stays a real MP4.
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
+                --prefer-langs en \
                 -f "bestvideo+bestaudio/best" \
                 --merge-output-format mp4 \
                 --remux-video mp4 \
@@ -615,7 +614,9 @@ jobs:
               
               echo "✅ Episode $EP_INDEX ready: $OUT_FILE (${FINAL_SIZE_MB}MB)"
               
-              # Quick verify with ffprobe
+              # Quick verify with mediainfo
+              # Use ffprobe for the definitive check (mediainfo parses MPEG-TS
+              # correctly even when the file is TS-in-MP4, so it can misreport)
               HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$OUT_FILE" 2>/dev/null)
               if [ -n "$HAS_VIDEO" ] && [ "$HAS_VIDEO" = "video" ]; then
                 echo "   📹 Video track confirmed (ffprobe)"
@@ -639,6 +640,10 @@ jobs:
             
             # ────────────────────────────────────────────────
             # ⏳ DELAY BETWEEN EPISODE DOWNLOADS
+            # If more episodes remain, pause before starting the
+            # next one so we don't hammer the server back-to-back.
+            # Configure via env.DOWNLOAD_DELAY or the 'download_delay'
+            # payload value. Set to 0 to disable.
             # ────────────────────────────────────────────────
             if [ "$EP_INDEX" -lt "$TOTAL_EPISODES" ] && [ "$DELAY" -gt 0 ] 2>/dev/null; then
               echo "⏳ Waiting ${DELAY}s before downloading episode $((EP_INDEX + 1))/$TOTAL_EPISODES..."
@@ -1050,14 +1055,15 @@ jobs:
               if [ $URL_INDEX -ge 0 ] && [ $URL_INDEX -lt ${#URL_ARRAY[@]} ]; then
                 URL="${URL_ARRAY[$URL_INDEX]}"
                 echo ""
-                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp (best quality)..."
+                echo "🔄 Redownloading Episode $EP_NUM_FORMATTED with yt-dlp..."
                 echo "📎 URL: $URL"
                 
                 # Remove the bad file
                 rm -f "$FILE"
                 
-                # Redownload with yt-dlp with best quality
+                # Redownload with yt-dlp specifically to ensure video+audio
                 yt-dlp --extractor-args "generic:impersonate" --impersonate chrome \
+                --prefer-langs en \
                   -f "bestvideo+bestaudio/best" \
                   --merge-output-format mp4 \
                   --no-progress --no-warnings \
@@ -1650,7 +1656,6 @@ jobs:
           MERGED_PATH: ${{ env.merged_file_path }}
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
-          DISPLAY_TITLE: ${{ steps.fname.outputs.display_title }}
           LABEL: ${{ steps.fname.outputs.clean_label }}
           TELEGRAM_DATE: ${{ steps.payload.outputs.telegram_date }}
           SERIES_PROVIDER: ${{ steps.payload.outputs.series_provider }}
@@ -1719,7 +1724,6 @@ jobs:
           video_path = os.environ.get("MERGED_PATH")
           title = os.environ.get("TITLE")
           series_title = os.environ.get("SERIES_TITLE", "Series")
-          display_title = os.environ.get("DISPLAY_TITLE", series_title)
           label = os.environ.get("LABEL", "NONE")
           telegram_date = os.environ.get("TELEGRAM_DATE", datetime.date.today().strftime("%Y-%m-%d"))
           series_provider = os.environ.get("SERIES_PROVIDER", "N/A")
@@ -1745,47 +1749,30 @@ jobs:
                   return val
 
           def get_video_metadata(file_path):
-              """Get video duration, width, height using ffprobe and mediainfo"""
-              duration = 0
-              width = 1280
-              height = 720
-              
               try:
-                  # Try ffprobe first for duration
                   cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
                   if result and result.replace('.', '', 1).isdigit():
-                      duration = int(float(result))
+                      duration = float(result)
                   else:
-                      # Fallback to mediainfo
                       cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
                       result = subprocess.check_output(cmd, text=True).strip()
-                      if result and result.replace('.', '', 1).isdigit():
-                          duration = int(float(result))
-              except:
-                  pass
-              
-              try:
-                  # Get resolution using ffprobe
-                  cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
+                      duration = float(result) if result.replace('.', '', 1).isdigit() else 0.0
+                  
+                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
-                  if result:
-                      parts = result.split(',')
-                      if len(parts) >= 2:
-                          width = int(parts[0]) if parts[0].isdigit() else 1280
-                          height = int(parts[1]) if parts[1].isdigit() else 720
+                  parts = result.split('|')
+                  
+                  if len(parts) >= 2:
+                      w = int(parts[0]) if parts[0].isdigit() else 1280
+                      h = int(parts[1]) if parts[1].isdigit() else 720
                   else:
-                      # Fallback to mediainfo
-                      cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
-                      result = subprocess.check_output(cmd, text=True).strip()
-                      parts = result.split('|')
-                      if len(parts) >= 2:
-                          width = int(parts[0]) if parts[0].isdigit() else 1280
-                          height = int(parts[1]) if parts[1].isdigit() else 720
+                      w, h = 1280, 720
+                  
+                  return int(duration), w, h
               except:
                   pass
-              
-              return duration, width, height
+              return 0, 1280, 720
 
           def generate_thumbnail(file_path):
               try:
@@ -1884,18 +1871,8 @@ jobs:
                   print(f"❌ File not found: {file_path}")
                   return False, None
               
-              # Get accurate video metadata using ffprobe
               duration, w, h = get_video_metadata(file_path)
               print(f"📊 Video duration: {duration} seconds, {w}x{h}")
-              
-              # Ensure we have valid values for DocumentAttributeVideo
-              if duration == 0:
-                  print("⚠️ Could not detect duration, using 60 seconds as fallback")
-                  duration = 60
-              if w == 0 or h == 0:
-                  print("⚠️ Could not detect resolution, using 1280x720 as fallback")
-                  w, h = 1280, 720
-              
               thumb = generate_thumbnail(file_path)
               
               print(f"⬆️ Uploading to channel...")
@@ -1918,7 +1895,6 @@ jobs:
                   traceback.print_exc()
                   return False, None
               
-              # Create video attribute with correct duration and resolution
               video_attr = DocumentAttributeVideo(
                   duration=duration,
                   w=w,
@@ -1940,53 +1916,42 @@ jobs:
                   kwargs["thumb"] = thumb
                   print(f"📸 Using thumbnail: {thumb}")
               
-              # Check if poster should be sent
-              # Only send poster if ALL conditions are met:
-              # 1. Poster file exists
-              # 2. Series provider is not N/A or empty
-              # 3. Series description is not N/A or empty
-              should_send_poster = False
+              # Upload poster together with the video as a media group (album)
+              # NOTE: We send the poster as its OWN photo message first, then the video
+              # with proper DocumentAttributeVideo(w,h). Sending [poster, video] via
+              # Telethon's album path DROPS the w/h attributes (Telethon guesses from
+              # the filename), which makes Telegram's player stretch the video on
+              # phones even though the saved file is correct.
+              use_poster = False
               if poster_path and os.path.isfile(poster_path):
-                  provider_has_value = series_provider and series_provider != "N/A" and series_provider.strip()
-                  description_has_value = series_description and series_description != "N/A" and series_description.strip()
-                  
-                  if provider_has_value and description_has_value:
-                      should_send_poster = True
-                      print(f"🖼️ Poster will be sent with series info (Provider: {series_provider}, Description: {series_description[:50]}...)")
-                  else:
-                      print(f"⚠️ Poster skipped: Missing provider or description")
-                      if not provider_has_value:
-                          print(f"   - Provider: '{series_provider}' (missing or N/A)")
-                      if not description_has_value:
-                          print(f"   - Description: '{series_description}' (missing or N/A)")
+                  print(f"🖼️ Poster found, posting as separate photo message: {poster_path}")
+                  use_poster = True
+                  try:
+                      # Only the caption header for the poster photo (no hashtag block)
+                      # Telegram caption limit is 1024 chars — truncate description to fit
+                      poster_cap_header = f"📺 {title}\n👤 {series_provider}\n📝 "
+                      max_pdesc = 1024 - len(poster_cap_header) - 2
+                      pdesc = series_description
+                      if len(pdesc) > max_pdesc:
+                          pdesc = pdesc[:max_pdesc - 1].rstrip() + "…"
+                      cap_header_only = f"{poster_cap_header}{pdesc}"
+                      await client.send_file(
+                          entity=entity,
+                          file=poster_path,
+                          caption=cap_header_only,
+                          force_document=False
+                      )
+                      print("✅ Poster photo posted")
+                      await asyncio.sleep(1)
+                  except Exception as e:
+                      print(f"⚠️ Poster post failed: {e}, continuing with video only")
               
               try:
-                  # First: Post poster with series info if all conditions are met
-                  if should_send_poster:
-                      print(f"🖼️ Posting poster with series info first...")
-                      try:
-                          poster_caption = f"📺 {series_title}\n👤 {series_provider}\n📝 {series_description}"
-                          poster_result = await client.send_file(
-                              entity=entity,
-                              file=poster_path,
-                              caption=poster_caption
-                          )
-                          print("✅ Poster posted with series info!")
-                          await asyncio.sleep(2)  # Small delay before video
-                      except Exception as e:
-                          print(f"⚠️ Poster send failed: {e}, continuing with video")
-                  else:
-                      print("ℹ️ Skipping poster (missing provider, description, or poster file)")
-                  
-                  # Now post the video with title and hashtags only
-                  print("📤 Sending video to channel...")
                   result = await client.send_file(**kwargs)
-                  print("✅ Video sent to Telegram Channel!")
-                  
-                  # Write VIDEO_SENT marker to indicate the video was actually posted
-                  with open("merged_progress.log", "a") as f:
-                      f.write(f"{datetime.datetime.now()}: VIDEO_SENT\n")
-                  
+                  if use_poster:
+                      print("✅ Poster photo + Video sent to Telegram Channel!")
+                  else:
+                      print("✅ File sent to Telegram Channel!")
                   return True, result
               except Exception as e:
                   print(f"❌ Send failed: {e}")
@@ -1994,10 +1959,6 @@ jobs:
                       del kwargs["thumb"]
                       try:
                           result = await client.send_file(**kwargs)
-                          print("✅ Video sent to Telegram Channel!")
-                          # Write VIDEO_SENT marker even if thumb was removed
-                          with open("merged_progress.log", "a") as f:
-                              f.write(f"{datetime.datetime.now()}: VIDEO_SENT\n")
                           return True, result
                       except Exception as e2:
                           print(f"❌ Send failed without thumb: {e2}")
@@ -2054,17 +2015,20 @@ jobs:
               if provider_clean == "NONE" or provider_clean == "":
                   provider_clean = "N/A"
               
-              # Video caption with title (with spaces) and hashtags ONLY
-              video_caption = f"📺 [{telegram_date}]-[{clean_label}]-{display_title}\n\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}\n#{provider_clean}"
+              # Telegram caption limit is 1024 chars — truncate description to fit
+              cap_header = f"📺 {title}\n👤 {series_provider}\n📝 "
+              cap_hashtags = f"\n\n#UNWATCHED\n#{month_year}\n#{month_year}UNWATCHED\n#{month_year}{clean_label}\n#{clean_label}\n#{provider_clean}"
+              max_desc = 1024 - len(cap_header) - len(cap_hashtags) - 1
+              if len(series_description) > max_desc:
+                  series_description = series_description[:max_desc - 1].rstrip() + "…"
+              
+              caption = f"{cap_header}{series_description}{cap_hashtags}"
               
               print(f"📤 Uploading merged video to channel...")
-              print(f"📝 Video Caption: {video_caption[:50]}...")
+              print(f"📝 Caption: {caption[:50]}...")
               
               try:
-                  success, result = await send_file_with_thumb(
-                      client, entity, video_path, video_caption, 
-                      poster_path=poster_path
-                  )
+                  success, result = await send_file_with_thumb(client, entity, video_path, caption, poster_path=poster_path)
                   if success:
                       print("✅ Merged video successfully posted to channel!")
                       return True
@@ -2072,11 +2036,7 @@ jobs:
               except FloodWaitError as e:
                   print(f"⏳ Rate limited: waiting {e.seconds}s")
                   await asyncio.sleep(e.seconds)
-                  success, result = await send_file_with_thumb(
-                      client, entity, video_path, video_caption,
-                      poster_path=poster_path
-                  )
-                  return success
+                  return await send_file_with_thumb(client, entity, video_path, caption, poster_path=poster_path)
               except Exception as e:
                   print(f"❌ Merged upload failed: {e}")
                   traceback.print_exc()
@@ -2125,21 +2085,8 @@ jobs:
           echo "merged_pid=$MERGED_PID" >> $GITHUB_ENV
           echo "✅ Merged upload started with PID: $MERGED_PID"
 
-      - name: Skip Single Episodes Upload (skipsingleupload = yes)
-        if: steps.verify.outputs.verify_success == 'true' && github.event.client_payload.skipsingleupload == 'yes'
-        run: |
-          cd downloads
-          echo "========================================="
-          echo "⏭️ SKIPPING SINGLE EPISODES UPLOAD"
-          echo "========================================="
-          echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
-          echo "ℹ️  skipsingleupload = yes, skipping single episodes upload"
-          echo "========================================="
-          echo "Single episodes upload skipped due to skipsingleupload=yes" > single_episodes_complete.txt
-          echo "⏭️ Skipped by user request"
-
       - name: Upload Single Episodes (Fast Upload)
-        if: steps.verify.outputs.verify_success == 'true' && (github.event.client_payload.skipsingleupload == '' || github.event.client_payload.skipsingleupload == null || github.event.client_payload.skipsingleupload != 'yes')
+        if: steps.verify.outputs.verify_success == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -2150,7 +2097,6 @@ jobs:
           TG_SINGLE_EPISODES_INVITE_LINK: ${{ secrets.TELEGRAM_SINGLE_EPISODES_INVITE_LINK }}
           TITLE: ${{ steps.fname.outputs.formatted_title }}
           SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
-          DISPLAY_TITLE: ${{ steps.fname.outputs.display_title }}
           LABEL: ${{ steps.fname.outputs.clean_label }}
           TELEGRAM_DATE: ${{ steps.payload.outputs.telegram_date }}
           SERIES_PROVIDER: ${{ steps.payload.outputs.series_provider }}
@@ -2208,7 +2154,6 @@ jobs:
           
           title = os.environ.get("TITLE")
           series_title = os.environ.get("SERIES_TITLE", "Series")
-          display_title = os.environ.get("DISPLAY_TITLE", series_title)
           label = os.environ.get("LABEL", "NONE")
           telegram_date = os.environ.get("TELEGRAM_DATE", datetime.date.today().strftime("%Y-%m-%d"))
           series_provider = os.environ.get("SERIES_PROVIDER", "N/A")
@@ -2258,47 +2203,38 @@ jobs:
                   return False
 
           def get_video_metadata(file_path):
-              """Get video duration, width, height using ffprobe and mediainfo"""
-              duration = 0
-              width = 1280
-              height = 720
-              
               try:
-                  # Try ffprobe first for duration
                   cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
                   if result and result.replace('.', '', 1).isdigit():
-                      duration = int(float(result))
+                      duration = float(result)
                   else:
-                      # Fallback to mediainfo
                       cmd = ["mediainfo", "--Inform=Video;%Duration%", file_path]
                       result = subprocess.check_output(cmd, text=True).strip()
-                      if result and result.replace('.', '', 1).isdigit():
-                          duration = int(float(result))
-              except:
-                  pass
-              
-              try:
-                  # Get resolution using ffprobe
-                  cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", file_path]
+                      duration = float(result) if result.replace('.', '', 1).isdigit() else 0.0
+                  
+                  cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
                   result = subprocess.check_output(cmd, text=True).strip()
-                  if result:
-                      parts = result.split(',')
-                      if len(parts) >= 2:
-                          width = int(parts[0]) if parts[0].isdigit() else 1280
-                          height = int(parts[1]) if parts[1].isdigit() else 720
+                  parts = result.split('|')
+                  
+                  if len(parts) >= 2:
+                      w = int(parts[0]) if parts[0].isdigit() else 1280
+                      h = int(parts[1]) if parts[1].isdigit() else 720
                   else:
-                      # Fallback to mediainfo
-                      cmd = ["mediainfo", "--Inform=Video;%Width%|%Height%", file_path]
+                      cmd = ["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of", "default=noprint_wrappers=1", file_path]
                       result = subprocess.check_output(cmd, text=True).strip()
-                      parts = result.split('|')
-                      if len(parts) >= 2:
-                          width = int(parts[0]) if parts[0].isdigit() else 1280
-                          height = int(parts[1]) if parts[1].isdigit() else 720
-              except:
-                  pass
-              
-              return duration, width, height
+                      w = 1280
+                      h = 720
+                      for line in result.split('\n'):
+                          if 'width=' in line:
+                              w = int(line.split('=')[1])
+                          elif 'height=' in line:
+                              h = int(line.split('=')[1])
+                  
+                  return int(duration), w, h
+              except Exception as e:
+                  print(f"⚠️ Error getting metadata: {e}")
+              return 0, 1280, 720
 
           def generate_thumbnail(file_path):
               try:
@@ -2430,13 +2366,14 @@ jobs:
               duration, w, h = get_video_metadata(file_path)
               print(f"📊 Video duration: {duration} seconds, {w}x{h}")
               
-              # Ensure we have valid values
               if duration == 0:
-                  print("⚠️ Could not detect duration, using 60 seconds as fallback")
-                  duration = 60
-              if w == 0 or h == 0:
-                  print("⚠️ Could not detect resolution, using 1280x720 as fallback")
-                  w, h = 1280, 720
+                  try:
+                      cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
+                      result = subprocess.check_output(cmd, text=True).strip()
+                      if result and result.replace('.', '', 1).isdigit():
+                          duration = int(float(result))
+                  except:
+                      pass
               
               thumb = generate_thumbnail(file_path)
               
@@ -2513,7 +2450,13 @@ jobs:
               
               # 📌 Post the poster + series info message in the topic first (if poster available)
               if topic_id and poster_path and os.path.isfile(poster_path):
-                  poster_caption = f"📺 {series_title}\n👤 {series_provider}\n📝 {series_description}"
+                  # Telegram caption limit is 1024 chars — truncate description to fit
+                  poster_header = f"📺 {series_title}\n👤 {series_provider}\n📝 "
+                  max_desc = 1024 - len(poster_header) - 2
+                  desc = series_description
+                  if len(desc) > max_desc:
+                      desc = desc[:max_desc - 1].rstrip() + "…"
+                  poster_caption = f"{poster_header}{desc}"
                   print(f"🖼️ Posting poster with series info into topic...")
                   try:
                       await client.send_file(
@@ -2645,14 +2588,8 @@ jobs:
           # Function to parse progress from log files
           get_merged_progress() {
             if [ -f "merged_progress.log" ]; then
-              # Check if video was sent successfully (KEY CHANGE - check for VIDEO_SENT)
-              if grep -q "VIDEO_SENT" merged_progress.log; then
-                echo "100|complete"
-                return
-              fi
-              
-              # Also check merged_upload.log for success
-              if [ -f "merged_upload.log" ] && grep -q "✅ Video sent to Telegram Channel!" merged_upload.log; then
+              # Check if upload is complete first
+              if grep -q "UPLOAD_COMPLETE" merged_progress.log; then
                 echo "100|complete"
                 return
               fi
@@ -2775,24 +2712,25 @@ jobs:
             # Check if both are complete first
             if [ -f "single_episodes_complete.txt" ]; then
               EPISODES_COMPLETE=true
+            elif [ -f "episode_upload.log" ]; then
+              chk_total=0
+              chk_done="0"
+              if [ "" -gt 0 ] && [ "" -ge "" ]; then
+                EPISODES_COMPLETE=true
+                touch single_episodes_complete.txt
+              fi
             fi
             
-            # Check merged completion - CHECK FOR VIDEO_SENT NOT UPLOAD_COMPLETE
-            if [ -f "merged_progress.log" ] && grep -q "VIDEO_SENT" merged_progress.log; then
+            # Check merged completion - either from log or process ended
+            if [ -f "merged_progress.log" ] && grep -q "UPLOAD_COMPLETE" merged_progress.log; then
               MERGED_COMPLETE=true
-            elif [ -f "merged_upload.log" ] && grep -q "✅ Video sent to Telegram Channel!" merged_upload.log; then
-              MERGED_COMPLETE=true
-              # Write completion marker if missing
-              if ! grep -q "VIDEO_SENT" merged_progress.log 2>/dev/null; then
-                echo "$(date): VIDEO_SENT" >> merged_progress.log
-              fi
             elif ! is_merged_running && [ -f "merged_upload.log" ]; then
               # Process ended, check if it was successful
-              if tail -20 merged_upload.log | grep -q "✅ Video sent to Telegram Channel!"; then
+              if tail -20 merged_upload.log | grep -q "✅ Merged video uploaded!"; then
                 MERGED_COMPLETE=true
                 # Write completion marker if missing
-                if ! grep -q "VIDEO_SENT" merged_progress.log 2>/dev/null; then
-                  echo "$(date): VIDEO_SENT" >> merged_progress.log
+                if ! grep -q "UPLOAD_COMPLETE" merged_progress.log 2>/dev/null; then
+                  echo "$(date): UPLOAD_COMPLETE" >> merged_progress.log
                 fi
               fi
             fi
@@ -2831,30 +2769,6 @@ jobs:
             MERGED_PERCENT=$(echo "$MERGED_PROGRESS" | cut -d'|' -f1)
             MERGED_DATA=$(echo "$MERGED_PROGRESS" | cut -d'|' -f2)
             
-            # Check poster status from log
-            POSTER_STATUS=""
-            if [ -f "merged_upload.log" ]; then
-              if grep -q "✅ Poster posted with series info!" merged_upload.log; then
-                POSTER_STATUS="✅ Poster sent"
-              elif grep -q "🖼️ Posting poster with series info first..." merged_upload.log; then
-                POSTER_STATUS="🖼️ Poster posting..."
-              elif grep -q "ℹ️ Skipping poster" merged_upload.log; then
-                POSTER_STATUS="ℹ️ Poster skipped (missing info)"
-              elif grep -q "Poster skipped:" merged_upload.log; then
-                POSTER_STATUS="ℹ️ Poster skipped"
-              fi
-            fi
-            
-            # Check if video is being sent
-            VIDEO_STATUS=""
-            if [ -f "merged_upload.log" ]; then
-              if grep -q "✅ Video sent to Telegram Channel!" merged_upload.log; then
-                VIDEO_STATUS="✅ Video sent"
-              elif grep -q "📤 Sending video to channel..." merged_upload.log; then
-                VIDEO_STATUS="📤 Sending video..."
-              fi
-            fi
-            
             if [ "$MERGED_COMPLETE" = true ] || [ "$MERGED_DATA" = "complete" ]; then
               MERGED_COMPLETE=true
               echo "║ 📹 Merged Video:                                        ║"
@@ -2864,12 +2778,6 @@ jobs:
               BAR=""
               for ((i=0; i<$BAR_LENGTH; i++)); do BAR="${BAR}█"; done
               echo "║    [${BAR}] ║"
-              if [ -n "$POSTER_STATUS" ]; then
-                echo "║    $POSTER_STATUS                                    ║"
-              fi
-              if [ -n "$VIDEO_STATUS" ]; then
-                echo "║    $VIDEO_STATUS                                     ║"
-              fi
               echo "║                                                              ║"
             elif [ "$MERGED_PERCENT" != "0" ] && [ "$MERGED_PERCENT" != "100" ]; then
               echo "║ 📹 Merged Video:                                        ║"
@@ -2897,23 +2805,10 @@ jobs:
                   echo "║    ETA: $(printf "%-51s" "$ETA")║"
                 fi
               fi
-              
-              if [ -n "$POSTER_STATUS" ]; then
-                echo "║    $POSTER_STATUS                                    ║"
-              fi
-              if [ -n "$VIDEO_STATUS" ]; then
-                echo "║    $VIDEO_STATUS                                     ║"
-              fi
               echo "║                                                              ║"
             elif is_merged_running; then
               echo "║ 📹 Merged Video: Uploading...                           ║"
               echo "║    Status: ⏳ In Progress                                 ║"
-              if [ -n "$POSTER_STATUS" ]; then
-                echo "║    $POSTER_STATUS                                    ║"
-              fi
-              if [ -n "$VIDEO_STATUS" ]; then
-                echo "║    $VIDEO_STATUS                                     ║"
-              fi
               echo "║                                                              ║"
             else
               echo "║ 📹 Merged Video: Starting...                             ║"
@@ -2927,16 +2822,13 @@ jobs:
             EP_PERCENT=$(echo "$EP_PROGRESS" | cut -d'|' -f1)
             EP_DATA=$(echo "$EP_PROGRESS" | cut -d'|' -f2)
             
-            if [ "$EPISODES_COMPLETE" = true ] || [ "$EP_DATA" = "complete" ]; then              EPISODES_COMPLETE=true
+            if [ "$EPISODES_COMPLETE" = true ] || [ "$EP_DATA" = "complete" ]; then
+              EPISODES_COMPLETE=true
               echo "║    Status: ✅ COMPLETE                                     ║"
               BAR_LENGTH=40
               BAR=""
               for ((i=0; i<$BAR_LENGTH; i++)); do BAR="${BAR}█"; done
               echo "║    [${BAR}] ║"
-              # Check if it was skipped
-              if [ -f "single_episodes_complete.txt" ] && grep -q "skipped" single_episodes_complete.txt 2>/dev/null; then
-                echo "║    ⏭️  Skipped by user request                           ║"
-              fi
             else
               TOTAL_EPISODES=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
               COMPLETED=$(echo "$EP_DATA" | cut -d'/' -f1 2>/dev/null || echo "0")
@@ -2991,23 +2883,15 @@ jobs:
             # If merged upload is at 100% but not marked complete for a while, force complete
             if [ "$MERGED_PERCENT" = "100" ] && [ "$MERGED_COMPLETE" = false ]; then
               NO_PROGRESS_COUNT=$((NO_PROGRESS_COUNT + 1))
-              if [ $NO_PROGRESS_COUNT -gt 12 ]; then  # After 60 seconds (12 * 5s)
+              if [ $NO_PROGRESS_COUNT -gt 6 ]; then  # After 30 seconds (6 * 5s)
                 echo ""
                 echo "⚠️  Merged upload at 100% but not marked complete..."
                 echo "   Checking if process is still running..."
                 
                 if ! is_merged_running; then
-                  echo "✅ Process ended, checking if video was sent..."
-                  if [ -f "merged_upload.log" ] && grep -q "✅ Video sent to Telegram Channel!" merged_upload.log; then
-                    echo "✅ Video was sent successfully!"
-                    echo "$(date): VIDEO_SENT" >> merged_progress.log
-                    MERGED_COMPLETE=true
-                  else
-                    echo "⚠️  Process ended but video may not have been sent!"
-                    echo "   Check merged_upload.log for details."
-                    # Don't force complete, let the loop continue
-                    NO_PROGRESS_COUNT=0
-                  fi
+                  echo "✅ Process ended, marking as complete..."
+                  echo "$(date): UPLOAD_COMPLETE" >> merged_progress.log
+                  MERGED_COMPLETE=true
                 else
                   echo "⚠️  Process still running, waiting..."
                   NO_PROGRESS_COUNT=0
@@ -3049,15 +2933,11 @@ jobs:
           
           EP_COUNT=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
           if [ -f "single_episodes_complete.txt" ]; then
-            if grep -q "skipped" single_episodes_complete.txt 2>/dev/null; then
-              echo "📺 Episodes Upload: ⏭️ Skipped (user requested)"
-            else
-              echo "📺 Episodes Uploaded: $EP_COUNT"
-            fi
+            echo "📺 Episodes Uploaded: $EP_COUNT"
           fi
           
           echo "========================================="
-          if [ -f "single_episodes_complete.txt" ] && [ -f "merged_progress.log" ] && grep -q "VIDEO_SENT" merged_progress.log; then
+          if [ -f "single_episodes_complete.txt" ] && [ -f "merged_progress.log" ] && grep -q "UPLOAD_COMPLETE" merged_progress.log; then
             echo "🎉 All uploads completed successfully!"
           fi
           echo "========================================="
