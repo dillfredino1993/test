@@ -708,12 +708,12 @@ jobs:
           echo "✅ All $TOTAL_EPISODES episodes downloaded and verified successfully!"
           echo "========================================="
           - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
-        timeout-minutes: 240
-        env:
-          TITLE: ${{ steps.fname.outputs.formatted_title }}
-          SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
-          LABEL: ${{ github.event.client_payload.label || 'NONE' }}
-        run: |
+             timeout-minutes: 240
+             env:
+             TITLE: ${{ steps.fname.outputs.formatted_title }}
+              SERIES_TITLE: ${{ steps.fname.outputs.series_title }}
+              LABEL: ${{ github.event.client_payload.label || 'NONE' }}
+              run: |
           cd downloads
           
           echo "========================================="
