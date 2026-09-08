@@ -1514,6 +1514,79 @@ jobs:
           
           echo "📊 File size: ${FILE_SIZE_MB} MB"
           
+          # First, check if the file is valid using ffprobe (more reliable than mediainfo)
+          echo "🔍 Checking file validity with ffprobe..."
+          if ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$MERGED_FILENAME" 2>/dev/null; then
+            echo "✅ File is valid (ffprobe check passed)"
+            FILE_VALID=true
+          else
+            echo "⚠️ File appears invalid or corrupted!"
+            FILE_VALID=false
+          fi
+          
+          # If file is invalid, try to repair it first
+          if [ "$FILE_VALID" = false ]; then
+            echo "🔧 Attempting to repair the file..."
+            
+            # Try to remux with ffmpeg
+            ffmpeg -y -err_detect ignore_err -i "$MERGED_FILENAME" \
+              -c copy \
+              -movflags +faststart \
+              -metadata title="$TITLE" \
+              -metadata series="$SERIES_TITLE" \
+              -metadata label="$LABEL" \
+              "${MERGED_FILENAME}_remuxed.mp4" 2>/dev/null
+            
+            if [ -f "${MERGED_FILENAME}_remuxed.mp4" ] && [ -s "${MERGED_FILENAME}_remuxed.mp4" ]; then
+              REMUX_SIZE=$(stat -c%s "${MERGED_FILENAME}_remuxed.mp4" 2>/dev/null || echo "0")
+              if [ "$REMUX_SIZE" -gt 1000000 ]; then
+                mv "${MERGED_FILENAME}_remuxed.mp4" "$MERGED_FILENAME"
+                echo "✅ File remuxed successfully!"
+                FILE_VALID=true
+              else
+                rm -f "${MERGED_FILENAME}_remuxed.mp4"
+              fi
+            fi
+          fi
+          
+          # If still invalid, try re-encoding
+          if [ "$FILE_VALID" = false ]; then
+            echo "🔧 Remux failed, attempting re-encode..."
+            
+            ffmpeg -y -err_detect ignore_err -i "$MERGED_FILENAME" \
+              -c:v libx264 -preset veryfast -crf 23 \
+              -c:a aac -b:a 128k -ar 44100 \
+              -movflags +faststart \
+              -metadata title="$TITLE" \
+              -metadata series="$SERIES_TITLE" \
+              -metadata label="$LABEL" \
+              -metadata year="$(date +%Y)" \
+              -metadata date="$(date +%Y-%m-%d)" \
+              "${MERGED_FILENAME}_reencoded.mp4" 2>/dev/null
+            
+            if [ -f "${MERGED_FILENAME}_reencoded.mp4" ] && [ -s "${MERGED_FILENAME}_reencoded.mp4" ]; then
+              REENC_SIZE=$(stat -c%s "${MERGED_FILENAME}_reencoded.mp4" 2>/dev/null || echo "0")
+              REENC_SIZE_MB=$((REENC_SIZE / 1024 / 1024))
+              if [ "$REENC_SIZE" -gt 1000000 ] && [ $REENC_SIZE_MB -lt 2000 ]; then
+                mv "${MERGED_FILENAME}_reencoded.mp4" "$MERGED_FILENAME"
+                echo "✅ File re-encoded successfully! New size: ${REENC_SIZE_MB} MB"
+                FILE_VALID=true
+              else
+                rm -f "${MERGED_FILENAME}_reencoded.mp4"
+              fi
+            fi
+          fi
+          
+          if [ "$FILE_VALID" = false ]; then
+            echo "❌ Could not repair the file!"
+            exit 1
+          fi
+          
+          # Now check file size again after potential repair
+          FILE_SIZE_BYTES=$(stat -c%s "$MERGED_FILENAME" 2>/dev/null || stat -f%z "$MERGED_FILENAME" 2>/dev/null || echo "0")
+          FILE_SIZE_MB=$((FILE_SIZE_BYTES / 1024 / 1024))
+          echo "📊 File size after repair: ${FILE_SIZE_MB} MB"
+          
           if [ $FILE_SIZE_MB -gt 1800 ]; then
             echo "⚠️ File exceeds 1.8GB (${FILE_SIZE_MB} MB)"
             echo "🔧 Compressing file with veryfast preset..."
@@ -1610,19 +1683,28 @@ jobs:
             echo "✅ Duration metadata fixed"
           fi
           
+          # Use ffprobe for final validation (more reliable than mediainfo)
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$MERGED_FILENAME" 2>/dev/null)
+          FINAL_SIZE=$(stat -c%s "$MERGED_FILENAME" 2>/dev/null || stat -f%z "$MERGED_FILENAME" 2>/dev/null || echo "0")
+          FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
+          
+          echo "📝 Duration: ${DURATION}s"
+          echo "💾 Final size: ${FINAL_SIZE_MB} MB"
+          
+          # Also try mediainfo but don't fail if it doesn't work
+          echo "🔍 Checking with mediainfo (optional)..."
           if mediainfo "$MERGED_FILENAME" > /dev/null 2>&1; then
             echo "✅ MediaInfo can read the file"
             echo ""
             mediainfo "$MERGED_FILENAME"
             echo ""
-            
-            DURATION=$(mediainfo --Inform="General;%Duration/String3%" "$MERGED_FILENAME" 2>/dev/null)
-            FINAL_SIZE=$(stat -c%s "$MERGED_FILENAME" 2>/dev/null || stat -f%z "$MERGED_FILENAME" 2>/dev/null || echo "0")
-            FINAL_SIZE_MB=$((FINAL_SIZE / 1024 / 1024))
-            
-            echo "📝 Duration: $DURATION"
-            echo "💾 Final size: ${FINAL_SIZE_MB} MB"
-            echo "✅ File is valid"
+          else
+            echo "⚠️ MediaInfo cannot read the file, but ffprobe says it's valid"
+            echo "   This is usually fine - the file should work for upload"
+          fi
+          
+          if [ -n "$DURATION" ] && [ "$DURATION" != "0" ] && [ "$DURATION" != "N/A" ]; then
+            echo "✅ File appears valid (ffprobe check passed)"
             echo "verify_success=true" >> $GITHUB_OUTPUT
             echo "merged_file_path=$(pwd)/$MERGED_FILENAME" >> $GITHUB_ENV
             
@@ -1634,37 +1716,9 @@ jobs:
               echo "✅ File size: ${FINAL_SIZE_MB} MB (under 2GB limit)"
             fi
           else
-            echo "❌ MediaInfo cannot read the file!"
-            echo "🔧 Attempting to repair..."
-            
-            ffmpeg -y -err_detect ignore_err -i "$MERGED_FILENAME" \
-              -c:v libx264 -preset veryfast -crf 23 \
-              -c:a aac -b:a 128k -ar 44100 \
-              -movflags +faststart \
-              -metadata title="$TITLE" \
-              -metadata series="$SERIES_TITLE" \
-              -metadata label="$LABEL" \
-              -metadata year="$(date +%Y)" \
-              -metadata date="$(date +%Y-%m-%d)" \
-              "${MERGED_FILENAME}_repaired" 2>/dev/null
-            
-            if [ -f "${MERGED_FILENAME}_repaired" ]; then
-              REPAIR_SIZE=$(stat -c%s "${MERGED_FILENAME}_repaired" 2>/dev/null || echo "0")
-              REPAIR_SIZE_MB=$((REPAIR_SIZE / 1024 / 1024))
-              if [ "$REPAIR_SIZE" -gt 1000000 ] && [ $REPAIR_SIZE_MB -lt 2000 ]; then
-                mv "${MERGED_FILENAME}_repaired" "$MERGED_FILENAME"
-                echo "✅ File repaired!"
-                echo "verify_success=true" >> $GITHUB_OUTPUT
-                echo "merged_file_path=$(pwd)/$MERGED_FILENAME" >> $GITHUB_ENV
-              else
-                echo "❌ Repair failed or file still too large"
-                rm -f "${MERGED_FILENAME}_repaired"
-                exit 1
-              fi
-            else
-              echo "❌ Repair failed"
-              exit 1
-            fi
+            echo "❌ File validation failed!"
+            echo "   ffprobe could not read the file properly."
+            exit 1
           fi
 
       - name: 📥 Download Poster (for Telegram Uploads)
