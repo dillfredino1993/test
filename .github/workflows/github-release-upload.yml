@@ -707,7 +707,7 @@ jobs:
           
           echo "✅ All $TOTAL_EPISODES episodes downloaded and verified successfully!"
           echo "========================================="
-  - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
+          - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
         timeout-minutes: 240
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
