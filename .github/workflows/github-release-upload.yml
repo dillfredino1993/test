@@ -752,6 +752,8 @@ jobs:
           import shutil
           import json
           import time
+          import asyncio
+          import traceback
           
           def get_video_info(file_path):
               """Get video duration, width, height using ffprobe"""
@@ -1798,6 +1800,7 @@ jobs:
           import asyncio
           import datetime
           import traceback
+          import time
           import json
           import math
 
@@ -1817,6 +1820,17 @@ jobs:
           except ImportError as e:
               print(f"❌ Import error: {e}")
               sys.exit(1)
+
+          def make_client():
+              return TelegramClient(
+                  StringSession(session_string),
+                  int(api_id),
+                  api_hash,
+                  connection_retries=5,
+                  request_retries=5,
+                  retry_delay=5,
+                  flood_sleep_threshold=60
+              )
 
           api_id = os.environ.get("TG_API_ID")
           api_hash = os.environ.get("TG_API_HASH")
@@ -1967,27 +1981,87 @@ jobs:
               return None
 
           async def fast_upload_file(client, file_path, progress_callback=None):
+              # Stall watchdog: monitors upload speed; if it drops below
+              # MIN_MBPS for STALL_LIMIT seconds, aborts, reconnects and retries.
+              # The `client` argument is ignored — each attempt builds a fresh
+              # connection via make_client() so a dead socket gets replaced.
               if not os.path.exists(file_path):
                   print(f"❌ File not found: {file_path}")
                   return None
-              
+
               file_size = os.path.getsize(file_path)
               CHUNK_SIZE = 512 * 1024
               NUM_CHUNKS = math.ceil(file_size / CHUNK_SIZE)
-              
               print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
               print(f"📊 Chunks: {NUM_CHUNKS} (512KB each)")
-              
-              try:
-                  return await client.upload_file(
-                      file_path,
-                      part_size_kb=512,
-                      file_name=os.path.basename(file_path),
-                      progress_callback=progress_callback
-                  )
-              except Exception as e:
-                  print(f"❌ Upload failed: {e}")
-                  raise
+              CHECK_INTERVAL = 15   # seconds between speed checks
+              MIN_MBPS = 0.5        # stalled below this rate (MB/s)
+              STALL_LIMIT = 60      # tolerate stalls this long before restart
+              MAX_ATTEMPTS = 4
+
+              for attempt in range(1, MAX_ATTEMPTS + 1):
+                  if attempt > 1:
+                      print(f"🔄 Upload attempt {attempt}/{MAX_ATTEMPTS} — fresh connection...")
+
+                  upload_client = make_client()
+                  await upload_client.connect()
+                  if not await upload_client.is_user_authorized():
+                      print("❌ Session invalid on reconnect")
+                      return None
+
+                  state = {"prev": 0, "prev_t": time.monotonic(), "stall_since": None}
+
+                  async def watchdog(upload_task):
+                      while True:
+                          await asyncio.sleep(CHECK_INTERVAL)
+                          now = time.monotonic()
+                          rate = (state["prev"] - state["prev_t"]) / max(now - state["prev_t"], 1)
+                          state["prev_t"] = now
+                          mbps = rate / (1024 * 1024)
+                          print(f"  📈 {mbps:.2f} MB/s")
+                          if mbps < MIN_MBPS:
+                              if state["stall_since"] is None:
+                                  state["stall_since"] = now
+                              elif now - state["stall_since"] >= STALL_LIMIT:
+                                  print("🐌 Upload stalled — restarting with fresh connection")
+                                  upload_task.cancel()
+                                  return
+                          else:
+                              state["stall_since"] = None
+
+                  def cb(current, total):
+                      state["prev"] = current
+                      if progress_callback:
+                          progress_callback(current, total)
+
+                  upload_task = None
+                  watcher = None
+                  try:
+                      upload_task = asyncio.ensure_future(upload_client.upload_file(
+                          file_path,
+                          part_size_kb=512,
+                          file_name=os.path.basename(file_path),
+                          progress_callback=cb,
+                      ))
+                      watcher = asyncio.ensure_future(watchdog(upload_task))
+                      result = await upload_task
+                      print("✅ Upload complete!")
+                      return result
+                  except asyncio.CancelledError:
+                      print(f"⚠️ Attempt {attempt} aborted (stall watchdog)")
+                  except Exception as e:
+                      print(f"❌ Upload attempt {attempt} failed: {e}")
+                      traceback.print_exc()
+                  finally:
+                      if watcher:
+                          watcher.cancel()
+                      try:
+                          await upload_client.disconnect()
+                      except Exception:
+                          pass
+
+              print("❌ Upload failed after all retry attempts")
+              return None
 
           async def send_file_with_thumb(client, entity, file_path, caption, poster_path=None):
               if not os.path.exists(file_path):
@@ -2191,13 +2265,7 @@ jobs:
           async def main():
               try:
                   print("🔌 Connecting to Telegram...")
-                  client = TelegramClient(
-                      StringSession(session_string), 
-                      int(api_id), 
-                      api_hash,
-                      connection_retries=5,
-                      flood_sleep_threshold=180
-                  )
+                  client = make_client()
                   await client.connect()
                   
                   if not await client.is_user_authorized():
@@ -2302,6 +2370,17 @@ jobs:
           except ImportError as e:
               print(f"❌ Import error: {e}")
               sys.exit(1)
+
+          def make_client():
+              return TelegramClient(
+                  StringSession(session_string),
+                  int(api_id),
+                  api_hash,
+                  connection_retries=5,
+                  request_retries=5,
+                  retry_delay=5,
+                  flood_sleep_threshold=60
+              )
 
           api_id = os.environ.get("TG_API_ID")
           api_hash = os.environ.get("TG_API_HASH")
@@ -2510,23 +2589,84 @@ jobs:
               return None
 
           async def fast_upload_file(client, file_path, progress_callback=None):
+              # Stall watchdog: monitors upload speed; if it drops below
+              # MIN_MBPS for STALL_LIMIT seconds, aborts, reconnects and retries.
+              # The `client` argument is ignored — each attempt builds a fresh
+              # connection via make_client() so a dead socket gets replaced.
               if not os.path.exists(file_path):
                   print(f"❌ File not found: {file_path}")
                   return None
-              
+
               file_size = os.path.getsize(file_path)
               print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
-              
-              try:
-                  return await client.upload_file(
-                      file_path,
-                      part_size_kb=512,
-                      file_name=os.path.basename(file_path),
-                      progress_callback=progress_callback
-                  )
-              except Exception as e:
-                  print(f"❌ Upload failed: {e}")
-                  raise
+              CHECK_INTERVAL = 15   # seconds between speed checks
+              MIN_MBPS = 0.5        # stalled below this rate (MB/s)
+              STALL_LIMIT = 60      # tolerate stalls this long before restart
+              MAX_ATTEMPTS = 4
+
+              for attempt in range(1, MAX_ATTEMPTS + 1):
+                  if attempt > 1:
+                      print(f"🔄 Upload attempt {attempt}/{MAX_ATTEMPTS} — fresh connection...")
+
+                  upload_client = make_client()
+                  await upload_client.connect()
+                  if not await upload_client.is_user_authorized():
+                      print("❌ Session invalid on reconnect")
+                      return None
+
+                  state = {"prev": 0, "prev_t": time.monotonic(), "stall_since": None}
+
+                  async def watchdog(upload_task):
+                      while True:
+                          await asyncio.sleep(CHECK_INTERVAL)
+                          now = time.monotonic()
+                          rate = (state["prev"] - state["prev_t"]) / max(now - state["prev_t"], 1)
+                          state["prev_t"] = now
+                          mbps = rate / (1024 * 1024)
+                          print(f"  📈 {mbps:.2f} MB/s")
+                          if mbps < MIN_MBPS:
+                              if state["stall_since"] is None:
+                                  state["stall_since"] = now
+                              elif now - state["stall_since"] >= STALL_LIMIT:
+                                  print("🐌 Upload stalled — restarting with fresh connection")
+                                  upload_task.cancel()
+                                  return
+                          else:
+                              state["stall_since"] = None
+
+                  def cb(current, total):
+                      state["prev"] = current
+                      if progress_callback:
+                          progress_callback(current, total)
+
+                  upload_task = None
+                  watcher = None
+                  try:
+                      upload_task = asyncio.ensure_future(upload_client.upload_file(
+                          file_path,
+                          part_size_kb=512,
+                          file_name=os.path.basename(file_path),
+                          progress_callback=cb,
+                      ))
+                      watcher = asyncio.ensure_future(watchdog(upload_task))
+                      result = await upload_task
+                      print("✅ Upload complete!")
+                      return result
+                  except asyncio.CancelledError:
+                      print(f"⚠️ Attempt {attempt} aborted (stall watchdog)")
+                  except Exception as e:
+                      print(f"❌ Upload attempt {attempt} failed: {e}")
+                      traceback.print_exc()
+                  finally:
+                      if watcher:
+                          watcher.cancel()
+                      try:
+                          await upload_client.disconnect()
+                      except Exception:
+                          pass
+
+              print("❌ Upload failed after all retry attempts")
+              return None
 
           async def send_file_with_thumb(client, entity, file_path, caption, reply_to=None):
               if not os.path.exists(file_path):
@@ -2681,13 +2821,7 @@ jobs:
           async def main():
               try:
                   print("🔌 Connecting to Telegram...")
-                  client = TelegramClient(
-                      StringSession(session_string), 
-                      int(api_id), 
-                      api_hash,
-                      connection_retries=5,
-                      flood_sleep_threshold=180
-                  )
+                  client = make_client()
                   await client.connect()
                   
                   if not await client.is_user_authorized():
