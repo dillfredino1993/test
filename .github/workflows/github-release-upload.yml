@@ -2145,7 +2145,7 @@ jobs:
                   if should_send_poster:
                       print(f"🖼️ Posting poster with series info first...")
                       try:
-                          poster_caption = f"📺 {series_title}\n👤 {series_provider}\n📝 {series_description}"
+                          poster_caption = f"📺 {display_title}\n👤 {series_provider}\n📝 {series_description}"
                           poster_result = await client.send_file(
                               entity=entity,
                               file=poster_path,
@@ -2761,7 +2761,7 @@ jobs:
               
               # 📌 Post the poster + series info message in the topic first (if poster available)
               if topic_id and poster_path and os.path.isfile(poster_path):
-                  poster_caption = f"📺 {series_title}\n👤 {series_provider}\n📝 {series_description}"
+                  poster_caption = f"📺 {display_title}\n👤 {series_provider}\n📝 {series_description}"
                   print(f"🖼️ Posting poster with series info into topic...")
                   try:
                       await client.send_file(
@@ -2840,7 +2840,7 @@ jobs:
                   
                   print(f"\n📤 Target Group: {entity.title if hasattr(entity, 'title') else entity.id}")
                   
-                  topic_name = f"[{label}]-{series_title}"
+                  topic_name = f"[{label}]-{display_title}"
                   topic_id = await get_or_create_topic(client, entity, topic_name, topic_id_raw)
                   
                   await upload_episodes(client, entity, topic_id)
