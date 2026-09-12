@@ -204,7 +204,9 @@ jobs:
           CLEAN_SERIES_TAG=$(echo "$CLEAN_SERIES_TITLE" | tr ' ' '_')
           
           # Store display title with spaces for Telegram messages
-          DISPLAY_SERIES_TITLE=$(echo "$SERIES" | sed -e 's/[\/:*?"<>|]/_/g' -e 's/^ *//' -e 's/ *$//')
+          # Keep characters like ':' intact here — used for captions/topic titles,
+          # NOT filenames. Only trim whitespace.
+          DISPLAY_SERIES_TITLE=$(echo "$SERIES" | sed -e 's/^ *//' -e 's/ *$//')
           
           # Use telegram date from setup step
           TELEGRAM_DATE="${{ steps.setup.outputs.telegram_date }}"
