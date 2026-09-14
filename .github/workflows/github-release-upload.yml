@@ -1994,10 +1994,10 @@ jobs:
               NUM_CHUNKS = math.ceil(file_size / CHUNK_SIZE)
               print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
               print(f"📊 Chunks: {NUM_CHUNKS} (512KB each)")
-              CHECK_INTERVAL = 15   # seconds between speed checks
-              MIN_MBPS = 0.5        # stalled below this rate (MB/s)
+              CHECK_INTERVAL = 30   # seconds between speed checks
+              MIN_MBPS = 0.45        # stalled below this rate (MB/s)
               STALL_LIMIT = 60      # tolerate stalls this long before restart
-              MAX_ATTEMPTS = 4
+              MAX_ATTEMPTS = 10
 
               for attempt in range(1, MAX_ATTEMPTS + 1):
                   if attempt > 1:
@@ -2601,10 +2601,10 @@ jobs:
 
               file_size = os.path.getsize(file_path)
               print(f"📊 File size: {file_size / (1024*1024):.1f} MB")
-              CHECK_INTERVAL = 15   # seconds between speed checks
-              MIN_MBPS = 0.5        # stalled below this rate (MB/s)
+              CHECK_INTERVAL = 30   # seconds between speed checks
+              MIN_MBPS = 0.45        # stalled below this rate (MB/s)
               STALL_LIMIT = 60      # tolerate stalls this long before restart
-              MAX_ATTEMPTS = 4
+              MAX_ATTEMPTS = 10
 
               for attempt in range(1, MAX_ATTEMPTS + 1):
                   if attempt > 1:
