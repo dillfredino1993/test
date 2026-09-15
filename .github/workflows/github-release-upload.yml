@@ -1323,8 +1323,10 @@ jobs:
                 NORMALIZED_FILES="$NORMALIZED_FILES $f"
               fi
             elif [ "$CURRENT_RES" == "$TARGET_RES" ] && \
-                 [ "$CURRENT_SAMPLE_RATE" == "$TARGET_SAMPLE_RATE" ]; then
-              echo "✅ Keeping: $f (matches all targets)"
+                 [ "$CURRENT_SAMPLE_RATE" == "$TARGET_SAMPLE_RATE" ] && \
+                 [ "$CURRENT_VIDEO_CODEC" == "$TARGET_VIDEO_CODEC" ] && \
+                 [ "$CURRENT_AUDIO_CODEC" == "$TARGET_AUDIO_CODEC" ]; then
+              echo "✅ Keeping: $f (matches all targets including codecs)"
               NORMALIZED_FILES="$NORMALIZED_FILES $f"
             else
               echo "⚠️ Normalizing: $f"
@@ -1403,7 +1405,7 @@ jobs:
           
           echo ""
           echo "✅ All files validated!"
-          echo "📊 MERGING: Using FFmpeg concat demuxer"
+          echo "📊 MERGING: Using FFmpeg concat demuxer with timestamp-safe re-encode"
           
           TOTAL_DURATION=0
           for f in "${MERGE_FILES_ARRAY[@]}"; do
@@ -1434,16 +1436,26 @@ jobs:
             fi
           done
           
-          echo "🔄 Concatenating files..."
-          ffmpeg -f concat -safe 0 -i $CONCAT_LIST \
-            -c copy \
+          echo "🔄 Concatenating files with timestamp-safe re-encode..."
+          # NOTE: We intentionally do NOT use `-c copy` here.
+          # Mixed-resolution / mixed-timebase segments produce broken PTS
+          # when stream-copied, which inflates the container duration
+          # (e.g. ~52 min of content reported as ~5 hours).
+          # A full re-encode with -vsync cfr and -avoid_negative_ts
+          # guarantees a correct, monotonic timeline.
+          ffmpeg -y -f concat -safe 0 -i $CONCAT_LIST \
+            -c:v libx264 -preset veryfast -crf 23 \
+            -c:a aac -b:a 128k -ar 44100 \
+            -vsync cfr \
+            -avoid_negative_ts make_zero \
+            -fflags +genpts \
             -movflags +faststart \
             -metadata title="$DISPLAY_TITLE" \
             -metadata series="$SERIES_TITLE" \
             -metadata label="$LABEL" \
             -metadata year="$(date +%Y)" \
             -metadata date="$(date +%Y-%m-%d)" \
-            "$MERGED_OUTPUT" 2>/dev/null
+            "$MERGED_OUTPUT" 2>&1 | tail -20
           
           if [ -f "$MERGED_OUTPUT" ] && [ -s "$MERGED_OUTPUT" ]; then
             echo "✅ Merge successful!"
@@ -1452,6 +1464,47 @@ jobs:
             MERGED_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$MERGED_OUTPUT" 2>/dev/null || echo "0")
             MERGED_DURATION_INT=${MERGED_DURATION%.*}
             echo "📊 Merged file duration: ${MERGED_DURATION_INT} seconds"
+            
+            # --- SANITY CHECK: merged duration must be close to sum of parts ---
+            # Allow 10% slack for container overhead / rounding.
+            MAX_ALLOWED=$(( TOTAL_DURATION + TOTAL_DURATION / 10 ))
+            MIN_ALLOWED=$(( TOTAL_DURATION - TOTAL_DURATION / 10 ))
+            
+            if [ "$MERGED_DURATION_INT" -gt "$MAX_ALLOWED" ] || \
+               [ "$MERGED_DURATION_INT" -lt "$MIN_ALLOWED" ]; then
+              echo "⚠️ Duration mismatch detected!"
+              echo "   Expected ~${TOTAL_DURATION}s (allowed ${MIN_ALLOWED}-${MAX_ALLOWED}s)"
+              echo "   Got      ${MERGED_DURATION_INT}s"
+              echo "🔧 Container timestamps are likely corrupted. Re-encoding with PTS reset..."
+              
+              ffmpeg -y -err_detect ignore_err -fflags +genpts -i "$MERGED_OUTPUT" \
+                -c:v libx264 -preset veryfast -crf 23 \
+                -c:a aac -b:a 128k -ar 44100 \
+                -vsync cfr -avoid_negative_ts make_zero \
+                -movflags +faststart \
+                -metadata title="$DISPLAY_TITLE" \
+                -metadata series="$SERIES_TITLE" \
+                -metadata label="$LABEL" \
+                -metadata year="$(date +%Y)" \
+                -metadata date="$(date +%Y-%m-%d)" \
+                "${MERGED_OUTPUT}.fix.mp4" 2>&1 | tail -10
+              
+              if [ -f "${MERGED_OUTPUT}.fix.mp4" ] && [ -s "${MERGED_OUTPUT}.fix.mp4" ]; then
+                FIX_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${MERGED_OUTPUT}.fix.mp4" 2>/dev/null || echo "0")
+                FIX_DUR_INT=${FIX_DUR%.*}
+                if [ "$FIX_DUR_INT" -le "$MAX_ALLOWED" ] && [ "$FIX_DUR_INT" -ge "$MIN_ALLOWED" ]; then
+                  mv "${MERGED_OUTPUT}.fix.mp4" "$MERGED_OUTPUT"
+                  echo "✅ Re-encode fixed duration: ${FIX_DUR_INT}s"
+                else
+                  echo "⚠️ Re-encode still off (${FIX_DUR_INT}s). Keeping original."
+                  rm -f "${MERGED_OUTPUT}.fix.mp4"
+                fi
+              else
+                echo "⚠️ Re-encode failed, keeping original."
+              fi
+            else
+              echo "✅ Duration sanity check passed."
+            fi
             
             # Generate thumbnails
             echo "🖼️ Generating thumbnails..."
@@ -1511,9 +1564,14 @@ jobs:
           # FIRST: Try to fix the file with ffmpeg BEFORE any validation
           echo "🔧 Pre-emptively fixing file structure..."
           
-          # Use ffmpeg with ignore_err and genpts to fix timestamp issues
+          # NOTE: `-c copy` cannot fix broken timestamps — it just remuxes
+          # the bad PTS values into a new container. We must re-encode the
+          # timeline to guarantee correct duration. Since the merge step
+          # already re-encodes, this is mostly a safety net.
           ffmpeg -y -err_detect ignore_err -fflags +genpts -i "$MERGED_FILENAME" \
-            -c copy \
+            -c:v libx264 -preset ultrafast -crf 24 \
+            -c:a aac -b:a 128k -ar 44100 \
+            -vsync cfr -avoid_negative_ts make_zero \
             -movflags +faststart \
             -map_metadata 0 \
             "${MERGED_FILENAME}_fixed.mp4" 2>/dev/null
