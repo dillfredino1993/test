@@ -4,18 +4,15 @@ on:
   repository_dispatch:
     types: [github_release_upload]
 
-# ONLY ONE WORKFLOW RUN AT A TIME
 concurrency:
   group: media-pipeline-processor
   cancel-in-progress: false
   queue: max
 
-# Add permissions for deleting workflow runs
 permissions:
   actions: write
   contents: read
 
-# ⏳ Seconds to wait between each episode download.
 env:
   DOWNLOAD_DELAY: 15
 
@@ -338,7 +335,9 @@ jobs:
             URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [ -z "$URL" ]; then continue; fi
             
-            EP_NUM=$(printf "%02d" $EP_INDEX)
+            # ─── 3-DIGIT ZERO PADDING ───
+            # Supports up to 999 episodes with correct lexicographic sort order
+            EP_NUM=$(printf "%03d" $EP_INDEX)
             OUT_FILE="EP${EP_NUM}.mp4"
             TEMP_FILE="EP${EP_NUM}_temp.mp4"
             FIXED_FILE="EP${EP_NUM}_fixed.mp4"
@@ -859,7 +858,8 @@ jobs:
               sys.exit(0 if compress_with_veryfast(file_path, target_size) else 1)
           EOFCOMPRESS
           
-          EPISODE_FILES=$(ls -1 EP*.mp4 2>/dev/null)
+          # Use sort -V so the compression order matches numeric order
+          EPISODE_FILES=$(ls -1 EP*.mp4 2>/dev/null | sort -V)
           TOTAL_EPISODES=$(echo "$EPISODE_FILES" | wc -l)
           COMPRESSED_COUNT=0
           FAILED_COMPRESSIONS=""
@@ -994,11 +994,15 @@ jobs:
           echo "🎯 Target: ${TARGET_RES} @ ${TARGET_SAMPLE_RATE}Hz"
           
           echo ""
-          echo "🔍 Stage 3: Building concat list..."
+          echo "🔍 Stage 3: Building concat list (numeric order)..."
           CONCAT_LIST="concat_list.txt"
           > $CONCAT_LIST
           TOTAL_DURATION=0
-          for f in $(ls EP*.mp4 | sort); do
+          
+          # ─── NUMERIC (VERSION) SORT ───
+          # sort -V correctly orders EP001 < EP002 < ... < EP099 < EP100 < EP120
+          # Even if padding were inconsistent, this would still order correctly.
+          for f in $(ls EP*.mp4 | sort -V); do
             if [ ! -f "$f" ]; then continue; fi
             if ffprobe -v error "$f" >/dev/null 2>&1; then
               echo "file '$f'" >> $CONCAT_LIST
@@ -1041,18 +1045,12 @@ jobs:
           echo "🔗 Stage 5: Merging with unified scale/pad + timestamp reset..."
           echo "   Target resolution: ${TARGET_W}x${TARGET_H}"
           echo "   Expected duration: ${TOTAL_DURATION}s (~$((TOTAL_DURATION/60))min)"
-          echo "   Expected output size: roughly 40-60% of source total (encoder-dependent)"
           echo ""
           
-          # ============================================================
-          # Live progress reporter: ffmpeg writes progress to merge_progress.txt,
-          # a background watcher tails it and prints a heartbeat every 30s.
-          # ============================================================
           PROGRESS_FILE="merge_progress.txt"
           rm -f "$PROGRESS_FILE"
           START_TS=$(date +%s)
           
-          # Launch ffmpeg in the background, writing progress to the file
           ffmpeg -y \
             -f concat -safe 0 -i "$CONCAT_LIST" \
             -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1" \
@@ -1074,7 +1072,6 @@ jobs:
           echo "⏱️  Heartbeat every 30 seconds. Please wait..."
           echo ""
           
-          # Background heartbeat: prints progress every 30 seconds
           (
             HEARTBEAT_COUNT=0
             while kill -0 $FFMPEG_PID 2>/dev/null; do
@@ -1085,7 +1082,6 @@ jobs:
               ELAPSED_MIN=$((ELAPSED / 60))
               ELAPSED_SEC=$((ELAPSED % 60))
               
-              # Read latest progress values from ffmpeg's progress file
               OUT_TIME_MS=""
               SPEED=""
               FPS=""
@@ -1095,7 +1091,6 @@ jobs:
                 FPS=$(grep '^fps=' "$PROGRESS_FILE" 2>/dev/null | tail -1 | cut -d= -f2)
               fi
               
-              # Compute percent complete
               PERCENT="--"
               ETA_STR="--"
               if [ -n "$OUT_TIME_MS" ] && [ "$OUT_TIME_MS" -gt 0 ] 2>/dev/null && [ "$TOTAL_DURATION" -gt 0 ]; then
@@ -1103,7 +1098,6 @@ jobs:
                 PERCENT=$((OUT_SEC * 100 / TOTAL_DURATION))
                 if [ "$PERCENT" -gt 100 ]; then PERCENT=100; fi
                 
-                # ETA: remaining_seconds / speed_multiplier
                 REMAIN_SEC=$((TOTAL_DURATION - OUT_SEC))
                 if [ -n "$SPEED" ] && [ "$SPEED" != "N/A" ]; then
                   SPEED_NUM=$(echo "$SPEED" | tr -d 'x')
@@ -1119,11 +1113,9 @@ jobs:
           ) &
           HEARTBEAT_PID=$!
           
-          # Wait for ffmpeg to complete
           wait $FFMPEG_PID
           FFMPEG_EXIT=$?
           
-          # Stop heartbeat
           kill $HEARTBEAT_PID 2>/dev/null || true
           wait $HEARTBEAT_PID 2>/dev/null || true
           
@@ -1132,7 +1124,6 @@ jobs:
           echo "⏱️  Merge encode took $((END_TS - START_TS))s"
           echo "📊 ffmpeg exit code: $FFMPEG_EXIT"
           
-          # Show the tail of ffmpeg's log for diagnostics
           if [ -f "merge_ffmpeg.log" ]; then
             echo "📋 Last lines from ffmpeg:"
             tail -15 merge_ffmpeg.log || true
@@ -2238,6 +2229,7 @@ jobs:
                       except: pass
 
           async def upload_episodes(client, entity, topic_id=None):
+              # Numeric sort via Python int extraction — works for any padding
               ep_files = sorted(glob.glob("EP*.mp4"), 
                   key=lambda f: int(re.search(r'EP(\d+)\.mp4', f).group(1)) if re.search(r'EP(\d+)\.mp4', f) else 0)
               
