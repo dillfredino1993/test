@@ -1141,16 +1141,6 @@ jobs:
           if [ -z "$MERGED_DUR" ]; then MERGED_DUR=0; fi
           echo "📊 Merged duration: ${MERGED_DUR}s (expected ~${TOTAL_DURATION}s)"
           
-          # ─── WIDENED TOLERANCE (±30%) ───
-          # Mixed-framerate inputs cause ffmpeg to stretch PTS values during
-          # CFR normalization, inflating the container duration by up to ~30%
-          # even though the wall-clock playback timing of each segment is
-          # preserved in the encoded frames.
-          #
-          # This tolerance still catches genuine failures:
-          #   - ffmpeg crash mid-encode   → duration ~50% of expected
-          #   - empty/corrupt output       → duration 0 or near-zero
-          #   - truncated concat           → duration way below 70%
           MAX_ALLOWED=$(( TOTAL_DURATION * 130 / 100 ))
           MIN_ALLOWED=$(( TOTAL_DURATION * 70 / 100 ))
           
@@ -1175,9 +1165,6 @@ jobs:
           
           COMPRESSED_FLAG=false
           
-          # ─── COMPRESSION THRESHOLD: 1900 MB ───
-          # Files at or below 1900 MB are uploaded as-is. Files above are
-          # compressed to target ~1500 MB (or CRF 28 fallback) before upload.
           if [ "$FILE_SIZE_MB" -gt 1900 ]; then
             echo "⚠️ File exceeds 1900 MB — compressing..."
             
@@ -1192,6 +1179,11 @@ jobs:
               TARGET_BITRATE=1500
             fi
             
+            # ── Live progress for compression ──
+            COMPRESS_PROGRESS="compress_progress.txt"
+            rm -f "$COMPRESS_PROGRESS"
+            COMPRESS_START_TS=$(date +%s)
+            
             ffmpeg -y -err_detect ignore_err -fflags +genpts -i "$MERGED_OUTPUT" \
               -c:v libx264 -preset veryfast \
               -b:v ${TARGET_BITRATE}k -maxrate ${TARGET_BITRATE}k -bufsize $((TARGET_BITRATE * 2))k \
@@ -1201,7 +1193,76 @@ jobs:
               -metadata title="$DISPLAY_TITLE" \
               -metadata series="$SERIES_TITLE" \
               -metadata label="$LABEL" \
-              "${MERGED_OUTPUT}.compressed.mp4" 2>&1 | tail -5
+              -progress "$COMPRESS_PROGRESS" \
+              -nostats \
+              "${MERGED_OUTPUT}.compressed.mp4" > compress_ffmpeg.log 2>&1 &
+            COMPRESS_PID=$!
+            
+            echo "🎬 Compression started (PID: $COMPRESS_PID)"
+            echo "   Target: ${TARGET_SIZE_MB} MB at ${TARGET_BITRATE}k"
+            echo "⏱️  Heartbeat every 30 seconds. Please wait..."
+            echo ""
+            
+            (
+              HB_COUNT=0
+              while kill -0 $COMPRESS_PID 2>/dev/null; do
+                sleep 30
+                HB_COUNT=$((HB_COUNT + 1))
+                NOW_TS=$(date +%s)
+                ELAPSED=$((NOW_TS - COMPRESS_START_TS))
+                ELAPSED_MIN=$((ELAPSED / 60))
+                ELAPSED_SEC=$((ELAPSED % 60))
+                
+                OUT_TIME_MS=""
+                SPEED=""
+                if [ -f "$COMPRESS_PROGRESS" ]; then
+                  OUT_TIME_MS=$(grep '^out_time_ms=' "$COMPRESS_PROGRESS" 2>/dev/null | tail -1 | cut -d= -f2)
+                  SPEED=$(grep '^speed=' "$COMPRESS_PROGRESS" 2>/dev/null | tail -1 | cut -d= -f2)
+                fi
+                
+                PERCENT="--"
+                ETA_STR="--"
+                if [ -n "$OUT_TIME_MS" ] && [ "$OUT_TIME_MS" -gt 0 ] 2>/dev/null && [ "$DUR_INT" -gt 0 ]; then
+                  OUT_SEC=$((OUT_TIME_MS / 1000000))
+                  PERCENT=$((OUT_SEC * 100 / DUR_INT))
+                  if [ "$PERCENT" -gt 100 ]; then PERCENT=100; fi
+                  
+                  REMAIN_SEC=$((DUR_INT - OUT_SEC))
+                  if [ -n "$SPEED" ] && [ "$SPEED" != "N/A" ]; then
+                    SPEED_NUM=$(echo "$SPEED" | tr -d 'x')
+                    ETA_SEC=$(awk -v r="$REMAIN_SEC" -v s="$SPEED_NUM" 'BEGIN { if (s > 0) printf "%d", r/s; else print 0 }')
+                    ETA_MIN=$((ETA_SEC / 60))
+                    ETA_S=$((ETA_SEC % 60))
+                    ETA_STR="${ETA_MIN}m${ETA_S}s"
+                  fi
+                fi
+                
+                echo "⏳ [Compress HB ${HB_COUNT}] Elapsed: ${ELAPSED_MIN}m${ELAPSED_SEC}s | Progress: ${PERCENT}% | Speed: ${SPEED:-N/A} | ETA: ${ETA_STR}"
+              done
+            ) &
+            COMPRESS_HB_PID=$!
+            
+            wait $COMPRESS_PID
+            COMPRESS_EXIT=$?
+            
+            kill $COMPRESS_HB_PID 2>/dev/null || true
+            wait $COMPRESS_HB_PID 2>/dev/null || true
+            
+            COMPRESS_END_TS=$(date +%s)
+            echo ""
+            echo "⏱️  Compression took $((COMPRESS_END_TS - COMPRESS_START_TS))s"
+            echo "📊 ffmpeg exit code: $COMPRESS_EXIT"
+            
+            if [ -f "compress_ffmpeg.log" ]; then
+              echo "📋 Last lines from compression:"
+              tail -10 compress_ffmpeg.log || true
+            fi
+            
+            rm -f "$COMPRESS_PROGRESS" compress_ffmpeg.log
+            
+            if [ "$COMPRESS_EXIT" -ne 0 ]; then
+              echo "❌ Compression failed (ffmpeg exit ${COMPRESS_EXIT})"
+            fi
             
             NEW_SIZE_MB=0
             if [ -f "${MERGED_OUTPUT}.compressed.mp4" ] && [ -s "${MERGED_OUTPUT}.compressed.mp4" ]; then
@@ -1219,6 +1280,11 @@ jobs:
               echo "⚠️ First-pass didn't hit target, trying CRF 28..."
               rm -f "${MERGED_OUTPUT}.compressed.mp4"
               
+              # ── Live progress for CRF28 fallback ──
+              COMPRESS_PROGRESS="compress_progress2.txt"
+              rm -f "$COMPRESS_PROGRESS"
+              COMPRESS_START_TS=$(date +%s)
+              
               ffmpeg -y -err_detect ignore_err -fflags +genpts -i "$MERGED_OUTPUT" \
                 -c:v libx264 -preset veryfast -crf 28 \
                 -c:a aac -b:a 96k -ar 44100 \
@@ -1227,7 +1293,75 @@ jobs:
                 -metadata title="$DISPLAY_TITLE" \
                 -metadata series="$SERIES_TITLE" \
                 -metadata label="$LABEL" \
-                "${MERGED_OUTPUT}.compressed.mp4" 2>&1 | tail -5
+                -progress "$COMPRESS_PROGRESS" \
+                -nostats \
+                "${MERGED_OUTPUT}.compressed.mp4" > compress_ffmpeg2.log 2>&1 &
+              COMPRESS_PID=$!
+              
+              echo "🎬 CRF28 compression started (PID: $COMPRESS_PID)"
+              echo "⏱️  Heartbeat every 30 seconds. Please wait..."
+              echo ""
+              
+              (
+                HB_COUNT=0
+                while kill -0 $COMPRESS_PID 2>/dev/null; do
+                  sleep 30
+                  HB_COUNT=$((HB_COUNT + 1))
+                  NOW_TS=$(date +%s)
+                  ELAPSED=$((NOW_TS - COMPRESS_START_TS))
+                  ELAPSED_MIN=$((ELAPSED / 60))
+                  ELAPSED_SEC=$((ELAPSED % 60))
+                  
+                  OUT_TIME_MS=""
+                  SPEED=""
+                  if [ -f "$COMPRESS_PROGRESS" ]; then
+                    OUT_TIME_MS=$(grep '^out_time_ms=' "$COMPRESS_PROGRESS" 2>/dev/null | tail -1 | cut -d= -f2)
+                    SPEED=$(grep '^speed=' "$COMPRESS_PROGRESS" 2>/dev/null | tail -1 | cut -d= -f2)
+                  fi
+                  
+                  PERCENT="--"
+                  ETA_STR="--"
+                  if [ -n "$OUT_TIME_MS" ] && [ "$OUT_TIME_MS" -gt 0 ] 2>/dev/null && [ "$DUR_INT" -gt 0 ]; then
+                    OUT_SEC=$((OUT_TIME_MS / 1000000))
+                    PERCENT=$((OUT_SEC * 100 / DUR_INT))
+                    if [ "$PERCENT" -gt 100 ]; then PERCENT=100; fi
+                    
+                    REMAIN_SEC=$((DUR_INT - OUT_SEC))
+                    if [ -n "$SPEED" ] && [ "$SPEED" != "N/A" ]; then
+                      SPEED_NUM=$(echo "$SPEED" | tr -d 'x')
+                      ETA_SEC=$(awk -v r="$REMAIN_SEC" -v s="$SPEED_NUM" 'BEGIN { if (s > 0) printf "%d", r/s; else print 0 }')
+                      ETA_MIN=$((ETA_SEC / 60))
+                      ETA_S=$((ETA_SEC % 60))
+                      ETA_STR="${ETA_MIN}m${ETA_S}s"
+                    fi
+                  fi
+                  
+                  echo "⏳ [CRF28 HB ${HB_COUNT}] Elapsed: ${ELAPSED_MIN}m${ELAPSED_SEC}s | Progress: ${PERCENT}% | Speed: ${SPEED:-N/A} | ETA: ${ETA_STR}"
+                done
+              ) &
+              COMPRESS_HB_PID=$!
+              
+              wait $COMPRESS_PID
+              COMPRESS_EXIT=$?
+              
+              kill $COMPRESS_HB_PID 2>/dev/null || true
+              wait $COMPRESS_HB_PID 2>/dev/null || true
+              
+              COMPRESS_END_TS=$(date +%s)
+              echo ""
+              echo "⏱️  CRF28 compression took $((COMPRESS_END_TS - COMPRESS_START_TS))s"
+              echo "📊 ffmpeg exit code: $COMPRESS_EXIT"
+              
+              if [ -f "compress_ffmpeg2.log" ]; then
+                echo "📋 Last lines from CRF28 compression:"
+                tail -10 compress_ffmpeg2.log || true
+              fi
+              
+              rm -f "$COMPRESS_PROGRESS" compress_ffmpeg2.log
+              
+              if [ "$COMPRESS_EXIT" -ne 0 ]; then
+                echo "❌ CRF28 compression failed (ffmpeg exit ${COMPRESS_EXIT})"
+              fi
               
               if [ -f "${MERGED_OUTPUT}.compressed.mp4" ] && [ -s "${MERGED_OUTPUT}.compressed.mp4" ]; then
                 NEW_SIZE=$(stat -c%s "${MERGED_OUTPUT}.compressed.mp4" 2>/dev/null || echo "0")
