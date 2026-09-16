@@ -335,7 +335,6 @@ jobs:
             URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [ -z "$URL" ]; then continue; fi
             
-            # ─── 3-DIGIT ZERO PADDING ───
             EP_NUM=$(printf "%03d" $EP_INDEX)
             OUT_FILE="EP${EP_NUM}.mp4"
             TEMP_FILE="EP${EP_NUM}_temp.mp4"
@@ -997,7 +996,6 @@ jobs:
           > $CONCAT_LIST
           TOTAL_DURATION=0
           
-          # sort -V correctly orders EP001 < EP002 < ... < EP099 < EP100 < EP120
           for f in $(ls EP*.mp4 | sort -V); do
             if [ ! -f "$f" ]; then continue; fi
             if ffprobe -v error "$f" >/dev/null 2>&1; then
@@ -1143,17 +1141,16 @@ jobs:
           if [ -z "$MERGED_DUR" ]; then MERGED_DUR=0; fi
           echo "📊 Merged duration: ${MERGED_DUR}s (expected ~${TOTAL_DURATION}s)"
           
-          # ─── WIDENED TOLERANCE (was ±10%, now ±30%) ───
+          # ─── WIDENED TOLERANCE (±30%) ───
           # Mixed-framerate inputs cause ffmpeg to stretch PTS values during
           # CFR normalization, inflating the container duration by up to ~30%
           # even though the wall-clock playback timing of each segment is
-          # preserved in the encoded frames. The merged file is still valid;
-          # only its reported duration differs from the naive sum.
+          # preserved in the encoded frames.
           #
           # This tolerance still catches genuine failures:
-          #   - ffmpeg crash mid-encode      → duration ~50% of expected
-          #   - empty/corrupt output          → duration 0 or near-zero
-          #   - truncated concat              → duration way below 70%
+          #   - ffmpeg crash mid-encode   → duration ~50% of expected
+          #   - empty/corrupt output       → duration 0 or near-zero
+          #   - truncated concat           → duration way below 70%
           MAX_ALLOWED=$(( TOTAL_DURATION * 130 / 100 ))
           MIN_ALLOWED=$(( TOTAL_DURATION * 70 / 100 ))
           
@@ -1178,8 +1175,11 @@ jobs:
           
           COMPRESSED_FLAG=false
           
-          if [ "$FILE_SIZE_MB" -gt 1800 ]; then
-            echo "⚠️ File exceeds 1.8 GB — compressing..."
+          # ─── COMPRESSION THRESHOLD: 1900 MB ───
+          # Files at or below 1900 MB are uploaded as-is. Files above are
+          # compressed to target ~1500 MB (or CRF 28 fallback) before upload.
+          if [ "$FILE_SIZE_MB" -gt 1900 ]; then
+            echo "⚠️ File exceeds 1900 MB — compressing..."
             
             DUR_INT=$MERGED_DUR
             if [ "$DUR_INT" -gt 0 ]; then
@@ -1210,7 +1210,7 @@ jobs:
               echo "📊 First-pass compressed size: ${NEW_SIZE_MB} MB"
             fi
             
-            if [ "$NEW_SIZE_MB" -gt 0 ] && [ "$NEW_SIZE_MB" -lt 1900 ]; then
+            if [ "$NEW_SIZE_MB" -gt 0 ] && [ "$NEW_SIZE_MB" -lt 1950 ]; then
               rm -f "$MERGED_OUTPUT"
               mv "${MERGED_OUTPUT}.compressed.mp4" "$MERGED_OUTPUT"
               echo "✅ Compressed: ${FILE_SIZE_MB} MB → ${NEW_SIZE_MB} MB"
@@ -1233,13 +1233,13 @@ jobs:
                 NEW_SIZE=$(stat -c%s "${MERGED_OUTPUT}.compressed.mp4" 2>/dev/null || echo "0")
                 NEW_SIZE_MB=$((NEW_SIZE / 1024 / 1024))
                 echo "📊 CRF28 size: ${NEW_SIZE_MB} MB"
-                if [ "$NEW_SIZE_MB" -lt 1900 ]; then
+                if [ "$NEW_SIZE_MB" -lt 1950 ]; then
                   rm -f "$MERGED_OUTPUT"
                   mv "${MERGED_OUTPUT}.compressed.mp4" "$MERGED_OUTPUT"
                   echo "✅ Compressed with CRF28: ${NEW_SIZE_MB} MB"
                   COMPRESSED_FLAG=true
                 else
-                  echo "❌ Could not compress under 1.9 GB (got ${NEW_SIZE_MB} MB)"
+                  echo "❌ Could not compress under 1950 MB (got ${NEW_SIZE_MB} MB)"
                   rm -f "${MERGED_OUTPUT}.compressed.mp4"
                 fi
               else
@@ -1248,7 +1248,7 @@ jobs:
               fi
             fi
           else
-            echo "✅ Under 1.8 GB, no compression needed"
+            echo "✅ Under 1900 MB, no compression needed"
           fi
           
           echo "compressed=${COMPRESSED_FLAG}" >> $GITHUB_OUTPUT
