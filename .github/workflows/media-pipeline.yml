@@ -1,5 +1,7 @@
 name: GitHub Telegram & Media Pipeline divided
 
+run-name: "Slot ${{ github.event.client_payload.session_slot || '1' }} — ${{ github.event.client_payload.series || github.event.client_payload.series_name || 'Unknown Series' }}"
+
 on:
   repository_dispatch:
     types: [telegram_media_pipeline]
@@ -18,13 +20,20 @@ env:
 
 jobs:
   upload:
+    name: "Upload (slot ${{ github.event.client_payload.session_slot || '1' }})"
     runs-on: ubuntu-latest
 
     steps:
-      # ─────────────────────────────────────────────────────────────
-      # 🎯 NEW STEP: Map payload.session_slot → your custom secret names
-      #             👉 EDIT THE 5 SESSION_N LINES IF SECRET NAMES DIFFER
-      # ─────────────────────────────────────────────────────────────
+      - name: 🎯 Announce Slot
+        run: |
+          SLOT="${{ github.event.client_payload.session_slot || '1' }}"
+          SERIES="${{ github.event.client_payload.series || github.event.client_payload.series_name || 'Unknown Series' }}"
+          echo "::notice title=Workflow Slot::Running slot ${SLOT} for series: ${SERIES}"
+          echo "========================================="
+          echo "🎯 THIS RUN IS USING SLOT: $SLOT"
+          echo "📺 Series: $SERIES"
+          echo "========================================="
+
       - name: 🎯 Pick Telegram Session
         id: pick
         env:
@@ -358,7 +367,6 @@ jobs:
           echo "📊 Total Episodes: $(wc -l < urls.txt)"
           echo "========================================="
 
-          # ── Optional cookies file ──
           COOKIE_ARGS=()
           if [ -n "${CF_COOKIES:-}" ]; then
             printf '%s\n' "$CF_COOKIES" > /tmp/cf_cookies.txt
@@ -379,7 +387,6 @@ jobs:
           fi
           echo "⏳ Inter-episode delay: ${DELAY}s"
 
-          # ── Helpers ──
           is_hls_url() {
             local url="$1"
             local ct body
@@ -432,7 +439,6 @@ jobs:
             head -c 8 "$1" 2>/dev/null | grep -q "#EXTM3U"
           }
 
-          # ── Main loop ──
           while IFS= read -u 3 -r URL || [ -n "$URL" ]; do
             URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [ -z "$URL" ]; then continue; fi
@@ -451,7 +457,6 @@ jobs:
 
             DOWNLOAD_SUCCESS=false
 
-            # ── Pre-flight classification with retry for CF 5xx ──
             for attempt in 1 2 3 4; do
               classify_http_error "$URL"
               rc=$?
@@ -473,7 +478,6 @@ jobs:
               esac
             done
 
-            # ── Detect HLS by content ──
             if is_hls_url "$URL"; then
               echo "📺 HLS STREAM DETECTED (by content) — using yt-dlp"
               USE_HLS=true
@@ -482,7 +486,6 @@ jobs:
               USE_HLS=false
             fi
 
-            # ── Attempt download ──
             if [ "$USE_HLS" = true ]; then
               yt-dlp \
                 --extractor-args "generic:impersonate" \
@@ -540,7 +543,6 @@ jobs:
               fi
             fi
 
-            # ── yt-dlp fallback if still no valid video ──
             if [ ! -f "$OUT_FILE" ] || [ ! -s "$OUT_FILE" ] || file_is_playlist "$OUT_FILE"; then
               rm -f "$OUT_FILE" 2>/dev/null
               echo "⚠️  Primary method failed — trying yt-dlp fallback..."
@@ -557,7 +559,6 @@ jobs:
                 "$URL" 2>/dev/null || true
             fi
 
-            # ── Audio-only fallback: build silent video ──
             if [ "$DOWNLOAD_SUCCESS" != true ] && [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ] && ! file_is_playlist "$OUT_FILE"; then
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0")
               if [ "$FILE_SIZE" -gt 100000 ]; then
@@ -581,7 +582,6 @@ jobs:
               fi
             fi
 
-            # ── Validate result + container fixup ──
             if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ] && ! file_is_playlist "$OUT_FILE"; then
               FILE_SIZE=$(stat -c%s "$OUT_FILE" 2>/dev/null || echo "0")
               if [ "$FILE_SIZE" -gt 100000 ]; then
