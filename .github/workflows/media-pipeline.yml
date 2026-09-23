@@ -358,6 +358,8 @@ jobs:
           LABEL: ${{ github.event.client_payload.label || 'NONE' }}
           CF_COOKIES: ${{ secrets.CF_COOKIES }}
         run: |
+          set +u
+          set +e
           cd downloads
 
           echo "========================================="
@@ -367,11 +369,16 @@ jobs:
           echo "📊 Total Episodes: $(wc -l < urls.txt)"
           echo "========================================="
 
+          # ── Optional cookies file ──
           COOKIE_ARGS=()
           if [ -n "${CF_COOKIES:-}" ]; then
-            printf '%s\n' "$CF_COOKIES" > /tmp/cf_cookies.txt
-            COOKIE_ARGS=(--cookies /tmp/cf_cookies.txt)
-            echo "🍪 Using CF_COOKIES for authenticated requests"
+            printf '%s\n' "$CF_COOKIES" | tr -d '\r' > /tmp/cf_cookies.txt || true
+            if [ -s /tmp/cf_cookies.txt ]; then
+              COOKIE_ARGS=("--cookies" "/tmp/cf_cookies.txt")
+              echo "🍪 Using CF_COOKIES (size=$(wc -c < /tmp/cf_cookies.txt) bytes)"
+            else
+              echo "⚠️ CF_COOKIES was empty after write — continuing without cookies"
+            fi
           else
             echo "ℹ️  No CF_COOKIES set — public requests only"
           fi
@@ -387,16 +394,19 @@ jobs:
           fi
           echo "⏳ Inter-episode delay: ${DELAY}s"
 
+          # ── Helpers ──
           is_hls_url() {
             local url="$1"
-            local ct body
+            local ct="" body=""
             ct=$(curl -sSL -o /dev/null -w '%{content_type}' \
                   --connect-timeout 15 --max-time 25 \
                   -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
-                  "${COOKIE_ARGS[@]}" "$url" 2>/dev/null || echo "")
+                  ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} \
+                  "$url" 2>/dev/null) || ct=""
             body=$(curl -sSL --connect-timeout 15 --max-time 25 \
                   -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
-                  "${COOKIE_ARGS[@]}" -r 0-2047 "$url" 2>/dev/null | head -c 2048 || echo "")
+                  ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} \
+                  -r 0-2047 "$url" 2>/dev/null | head -c 2048) || body=""
 
             if [[ "$ct" == *"mpegurl"* ]] || [[ "$ct" == *"mpegURL"* ]] || \
                [[ "$body" == *"#EXTM3U"* ]] || \
@@ -408,22 +418,25 @@ jobs:
 
           classify_http_error() {
             local url="$1"
-            local code ct body
+            local code="000" ct="" body=""
             code=$(curl -sSL -o /dev/null -w '%{http_code}' \
                     --connect-timeout 15 --max-time 25 \
                     -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
-                    "${COOKIE_ARGS[@]}" "$url" 2>/dev/null || echo "000")
+                    ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} \
+                    "$url" 2>/dev/null) || code="000"
             ct=$(curl -sSL -o /dev/null -w '%{content_type}' \
                   --connect-timeout 15 --max-time 25 \
                   -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
-                  "${COOKIE_ARGS[@]}" "$url" 2>/dev/null || echo "")
+                  ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} \
+                  "$url" 2>/dev/null) || ct=""
 
             case "$code" in
               200|206) return 0 ;;
               403)
                 body=$(curl -sSL --connect-timeout 15 --max-time 25 \
                         -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
-                        "${COOKIE_ARGS[@]}" -r 0-4095 "$url" 2>/dev/null | head -c 4096 || echo "")
+                        ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} \
+                        -r 0-4095 "$url" 2>/dev/null | head -c 4096) || body=""
                 if [[ "$body" == *"Just a moment"* ]] || [[ "$body" == *"cf-chl"* ]] || [[ "$ct" == *"text/html"* ]]; then
                   return 2
                 fi
@@ -439,6 +452,7 @@ jobs:
             head -c 8 "$1" 2>/dev/null | grep -q "#EXTM3U"
           }
 
+          # ── Main loop ──
           while IFS= read -u 3 -r URL || [ -n "$URL" ]; do
             URL=$(echo "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [ -z "$URL" ]; then continue; fi
@@ -457,27 +471,31 @@ jobs:
 
             DOWNLOAD_SUCCESS=false
 
+            echo "🔎 Pre-flight probe..."
             for attempt in 1 2 3 4; do
-              classify_http_error "$URL"
+              classify_http_error "$URL" || true
               rc=$?
               case $rc in
-                0) break ;;
+                0) echo "   → probe OK (200/206)"; break ;;
                 1)
                   WAIT=$((30 * attempt))
-                  echo "🌩️  Cloudflare origin error (5xx/429) — retry $attempt/4 in ${WAIT}s..."
+                  echo "   → 🌩️  Cloudflare 5xx/429 — retry $attempt/4 in ${WAIT}s..."
                   sleep "$WAIT"
                   ;;
                 2)
-                  echo "🛡️  Cloudflare CHALLENGE detected (403 + JS challenge)."
+                  echo "   → 🛡️  Cloudflare CHALLENGE (403 + JS)."
                   if [ ${#COOKIE_ARGS[@]} -eq 0 ]; then
-                    echo "     💡 Set the CF_COOKIES secret with a Netscape cookie file."
+                    echo "        💡 Set CF_COOKIES with a fresh Netscape cookie file."
                   fi
                   break
                   ;;
-                3) break ;;
+                *)
+                  echo "   → probe returned code $rc — proceeding anyway"
+                  break ;;
               esac
             done
 
+            echo "🔎 Detecting stream type..."
             if is_hls_url "$URL"; then
               echo "📺 HLS STREAM DETECTED (by content) — using yt-dlp"
               USE_HLS=true
@@ -487,18 +505,19 @@ jobs:
             fi
 
             if [ "$USE_HLS" = true ]; then
+              echo "⬇️ yt-dlp starting..."
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
                 -f "bestvideo[ext=mp4]+bestaudio[language^=en]/bestvideo+bestaudio/best[ext=mp4]/best" \
                 --merge-output-format mp4 \
-                --no-progress --no-warnings --quiet \
+                --no-progress --no-warnings \
                 --geo-bypass --no-check-certificates \
                 --socket-timeout 300 \
                 --retries 10 --fragment-retries 10 \
-                "${COOKIE_ARGS[@]}" \
+                ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} \
                 -o "$OUT_FILE" \
-                "$URL" 2>/dev/null || true
+                "$URL" 2>&1 | tail -30 || true
 
               if file_is_playlist "$OUT_FILE"; then
                 echo "🔄 yt-dlp wrote an m3u8 playlist — retrying with --hls-prefer-native..."
@@ -509,14 +528,15 @@ jobs:
                   --hls-prefer-native \
                   -f "best" \
                   --merge-output-format mp4 \
-                  --no-progress --no-warnings --quiet \
+                  --no-progress --no-warnings \
                   --geo-bypass --no-check-certificates \
                   --retries 10 --fragment-retries 10 \
-                  "${COOKIE_ARGS[@]}" \
+                  ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} \
                   -o "$OUT_FILE" \
-                  "$URL" 2>/dev/null || true
+                  "$URL" 2>&1 | tail -30 || true
               fi
             else
+              echo "⬇️ aria2c starting..."
               aria2c -x 16 -s 16 -k 1M --continue=true \
                 --console-log-level=error \
                 --max-connection-per-server=16 \
@@ -524,7 +544,7 @@ jobs:
                 --max-tries=3 --retry-wait=10 \
                 --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
                 --header="Accept: */*" \
-                -o "$OUT_FILE" "$URL" < /dev/null 2>/dev/null || true
+                -o "$OUT_FILE" "$URL" < /dev/null 2>&1 | tail -20 || true
 
               if file_is_playlist "$OUT_FILE"; then
                 echo "🔄 aria2c wrote an m3u8 playlist — redirecting to yt-dlp"
@@ -534,12 +554,12 @@ jobs:
                   --impersonate chrome \
                   -f "bestvideo[ext=mp4]+bestaudio[language^=en]/bestvideo+bestaudio/best[ext=mp4]/best" \
                   --merge-output-format mp4 \
-                  --no-progress --no-warnings --quiet \
+                  --no-progress --no-warnings \
                   --geo-bypass --no-check-certificates \
                   --retries 10 --fragment-retries 10 \
-                  "${COOKIE_ARGS[@]}" \
+                  ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} \
                   -o "$OUT_FILE" \
-                  "$URL" 2>/dev/null || true
+                  "$URL" 2>&1 | tail -30 || true
               fi
             fi
 
@@ -552,11 +572,11 @@ jobs:
                 -f "best" \
                 --merge-output-format mp4 \
                 --remux-video mp4 \
-                --no-progress --no-warnings --quiet \
+                --no-progress --no-warnings \
                 --geo-bypass --no-check-certificates \
-                "${COOKIE_ARGS[@]}" \
+                ${COOKIE_ARGS[@]+"${COOKIE_ARGS[@]}"} \
                 -o "$OUT_FILE" \
-                "$URL" 2>/dev/null || true
+                "$URL" 2>&1 | tail -30 || true
             fi
 
             if [ "$DOWNLOAD_SUCCESS" != true ] && [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ] && ! file_is_playlist "$OUT_FILE"; then
@@ -573,7 +593,7 @@ jobs:
                     -c:v libx264 -preset veryfast -crf 23 \
                     -c:a aac -b:a 128k -ar 44100 \
                     -shortest -movflags +faststart \
-                    "$TEMP_VIDEO" 2>/dev/null
+                    "$TEMP_VIDEO" 2>/dev/null || true
                   if [ -f "$TEMP_VIDEO" ] && [ -s "$TEMP_VIDEO" ]; then
                     rm -f "$OUT_FILE"
                     mv "$TEMP_VIDEO" "$OUT_FILE"
@@ -605,7 +625,7 @@ jobs:
                     -metadata episode_id="$EP_NUM" \
                     -metadata series="$SERIES_TITLE" \
                     -metadata label="$LABEL" \
-                    "$FIXED_FILE" 2>/dev/null
+                    "$FIXED_FILE" 2>/dev/null || true
                   if [ -f "$FIXED_FILE" ] && [ -s "$FIXED_FILE" ]; then
                     HAS_VIDEO_FIXED=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$FIXED_FILE" 2>/dev/null)
                     if [ "$HAS_VIDEO_FIXED" = "video" ]; then
