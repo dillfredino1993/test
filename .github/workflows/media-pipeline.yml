@@ -677,7 +677,7 @@ jobs:
           fi
           echo "✅ All episodes downloaded and verified."
 
-      - name: Compress Episodes Larger Than 80MB (Very Fast Preset)
+      - name: Compress Episodes Larger Than 80MB (Very Fast Preset, Original Resolution)
         timeout-minutes: 240
         env:
           TITLE: ${{ steps.fname.outputs.formatted_title }}
@@ -687,7 +687,7 @@ jobs:
           cd downloads
 
           echo "========================================="
-          echo "🔧 COMPRESSING EPISODES > 80MB"
+          echo "🔧 COMPRESSING EPISODES > 80MB (KEEPING ORIGINAL RESOLUTION)"
           echo "========================================="
           echo "📺 Series: $SERIES_TITLE"
           echo "========================================="
@@ -697,6 +697,7 @@ jobs:
           import sys
           import subprocess
           import time
+          import json
 
           def get_video_info(file_path):
               try:
@@ -708,7 +709,6 @@ jobs:
                       file_path
                   ]
                   result = subprocess.check_output(cmd, text=True)
-                  import json
                   data = json.loads(result)
                   duration = float(data.get('format', {}).get('duration', 0))
                   width, height = 1280, 720
@@ -718,11 +718,11 @@ jobs:
                           height = int(stream.get('height', 720))
                           break
                   return duration, width, height
-              except:
+              except Exception:
                   return 0, 1280, 720
 
           def compress_with_veryfast(file_path, target_size_mb=80):
-              print(f"  ⚡ Compressing with VERY FAST preset...")
+              print(f"  ⚡ Compressing with VERY FAST preset (keeping original resolution)...")
               file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
               print(f"  📊 Original size: {file_size_mb:.1f}MB")
 
@@ -731,7 +731,7 @@ jobs:
                   return True
 
               duration, width, height = get_video_info(file_path)
-              print(f"  📊 Duration: {duration:.1f}s, Resolution: {width}x{height}")
+              print(f"  📊 Duration: {duration:.1f}s, Resolution: {width}x{height} (KEEPING)")
 
               if duration > 0:
                   target_bitrate = (target_size_mb * 8 * 1024) / duration
@@ -752,6 +752,7 @@ jobs:
                   "-b:v", f"{int(target_bitrate)}k",
                   "-maxrate", f"{int(target_bitrate * 1.5)}k",
                   "-bufsize", f"{int(target_bitrate * 2)}k",
+                  "-vf", f"scale={width}:{height}",
                   "-c:a", "aac",
                   "-b:a", "128k",
                   "-ar", "44100",
@@ -761,7 +762,7 @@ jobs:
               ]
 
               try:
-                  print(f"  🔄 Encoding...")
+                  print(f"  🔄 Encoding (resolution locked to {width}x{height})...")
                   start_time = time.time()
                   result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
                   elapsed = time.time() - start_time
@@ -770,15 +771,38 @@ jobs:
                   if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
                       new_size_mb = os.path.getsize(temp_file) / (1024 * 1024)
                       print(f"  ✅ Compressed: {new_size_mb:.1f}MB ({file_size_mb:.1f}MB -> {new_size_mb:.1f}MB)")
+
+                      new_dur, new_w, new_h = get_video_info(temp_file)
+                      if new_w != width or new_h != height:
+                          print(f"  ⚠️ Resolution changed to {new_w}x{new_h} — re-encoding with CRF (strict scale)")
+                          os.remove(temp_file)
+                          cmd_strict = [
+                              "ffmpeg", "-y", "-i", file_path,
+                              "-c:v", "libx264", "-preset", "veryfast",
+                              "-crf", "26",
+                              "-vf", f"scale={width}:{height}",
+                              "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                              "-movflags", "+faststart",
+                              "-threads", str(os.cpu_count() or 2),
+                              temp_file
+                          ]
+                          result2 = subprocess.run(cmd_strict, capture_output=True, text=True, timeout=300)
+                          if result2.returncode == 0 and os.path.exists(temp_file):
+                              new_size_mb = os.path.getsize(temp_file) / (1024 * 1024)
+                              print(f"  ✅ CRF retry: {new_size_mb:.1f}MB")
+                          else:
+                              return False
+
                       if new_size_mb <= target_size_mb * 1.1:
                           os.replace(temp_file, file_path)
                           return True
                       else:
-                          print(f"  ⚠️ Still too large: {new_size_mb:.1f}MB")
+                          print(f"  ⚠️ Still too large: {new_size_mb:.1f}MB — trying ultrafast CRF 28 (resolution locked)")
                           temp_file2 = f"{base_name}_ultrafast.mp4"
                           cmd2 = [
                               "ffmpeg", "-y", "-i", file_path,
                               "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                              "-vf", f"scale={width}:{height}",
                               "-c:a", "aac", "-b:a", "96k", "-ar", "44100",
                               "-movflags", "+faststart",
                               "-threads", str(os.cpu_count() or 2),
@@ -793,7 +817,8 @@ jobs:
                                   return True
                               else:
                                   os.remove(temp_file2)
-                          os.remove(temp_file)
+                          if os.path.exists(temp_file):
+                              os.remove(temp_file)
                           return False
                   else:
                       print(f"  ❌ Compression failed: {result.stderr[:200]}")
@@ -807,8 +832,10 @@ jobs:
               finally:
                   for f in [temp_file, f"{base_name}_ultrafast.mp4"]:
                       if os.path.exists(f):
-                          try: os.remove(f)
-                          except: pass
+                          try:
+                              os.remove(f)
+                          except Exception:
+                              pass
               return False
 
           if __name__ == "__main__":
@@ -817,7 +844,6 @@ jobs:
                   sys.exit(1)
               file_path = sys.argv[1]
               target_size = int(sys.argv[2]) if len(sys.argv) > 2 else 80
-              import sys as _sys
               sys.exit(0 if compress_with_veryfast(file_path, target_size) else 1)
           EOFCOMPRESS
 
@@ -835,7 +861,7 @@ jobs:
             echo "📹 $f: ${FILE_SIZE_MB}MB"
 
             if [ $FILE_SIZE_MB -gt 80 ]; then
-              echo "⚠️  $f exceeds 80MB, compressing..."
+              echo "⚠️  $f exceeds 80MB, compressing (original resolution kept)..."
               if python3 fast_compress.py "$f" 80 < /dev/null; then
                 COMPRESSED_COUNT=$((COMPRESSED_COUNT + 1))
                 NEW_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "0")
@@ -866,14 +892,14 @@ jobs:
           echo "✅ All episodes processed successfully!"
           echo "========================================="
 
-      - name: Smart Merge, Verify, and Compress (Combined)
+      - name: Smart Merge, Verify, and Compress (Combined, Original Resolution)
         id: merge
         timeout-minutes: 220
         run: |
           cd downloads
 
           echo "========================================="
-          echo "🔗 MERGE + VERIFY + COMPRESS (combined)"
+          echo "🔗 MERGE + VERIFY + COMPRESS (combined, original resolution)"
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "📊 Episodes: $(ls -1 EP*.mp4 2>/dev/null | wc -l)"
@@ -953,7 +979,7 @@ jobs:
           TARGET_W=$(echo "$TARGET_RES" | cut -d'x' -f1)
           TARGET_H=$(echo "$TARGET_RES" | cut -d'x' -f2)
 
-          echo "🎯 Target: ${TARGET_RES} @ ${TARGET_SAMPLE_RATE}Hz"
+          echo "🎯 Target: ${TARGET_RES} @ ${TARGET_SAMPLE_RATE}Hz (original resolution preserved)"
 
           echo ""
           echo "🔍 Stage 3: Building concat list (numeric order)..."
@@ -1131,7 +1157,7 @@ jobs:
           COMPRESSED_FLAG=false
 
           if [ "$FILE_SIZE_MB" -gt 1900 ]; then
-            echo "⚠️ File exceeds 1900 MB — compressing..."
+            echo "⚠️ File exceeds 1900 MB — compressing (original resolution preserved)..."
 
             DUR_INT=$MERGED_DUR
             if [ "$DUR_INT" -gt 0 ]; then
@@ -1144,6 +1170,15 @@ jobs:
               TARGET_BITRATE=1500
             fi
 
+            # Detect merged video resolution to preserve it
+            MERGED_W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$MERGED_OUTPUT" 2>/dev/null | head -1)
+            MERGED_H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$MERGED_OUTPUT" 2>/dev/null | head -1)
+            if [ -z "$MERGED_W" ] || [ -z "$MERGED_H" ]; then
+              MERGED_W=1280
+              MERGED_H=720
+            fi
+            echo "🎯 Preserving merged resolution: ${MERGED_W}x${MERGED_H}"
+
             COMPRESS_PROGRESS="compress_progress.txt"
             rm -f "$COMPRESS_PROGRESS"
             COMPRESS_START_TS=$(date +%s)
@@ -1151,6 +1186,7 @@ jobs:
             ffmpeg -y -err_detect ignore_err -fflags +genpts -i "$MERGED_OUTPUT" \
               -c:v libx264 -preset veryfast \
               -b:v ${TARGET_BITRATE}k -maxrate ${TARGET_BITRATE}k -bufsize $((TARGET_BITRATE * 2))k \
+              -vf "scale=${MERGED_W}:${MERGED_H}" \
               -c:a aac -b:a 128k -ar 44100 \
               -vsync cfr -avoid_negative_ts make_zero \
               -movflags +faststart \
@@ -1241,7 +1277,7 @@ jobs:
               echo "✅ Compressed: ${FILE_SIZE_MB} MB → ${NEW_SIZE_MB} MB"
               COMPRESSED_FLAG=true
             else
-              echo "⚠️ First-pass didn't hit target, trying CRF 28..."
+              echo "⚠️ First-pass didn't hit target, trying CRF 28 (resolution preserved)..."
               rm -f "${MERGED_OUTPUT}.compressed.mp4"
 
               COMPRESS_PROGRESS="compress_progress2.txt"
@@ -1250,6 +1286,7 @@ jobs:
 
               ffmpeg -y -err_detect ignore_err -fflags +genpts -i "$MERGED_OUTPUT" \
                 -c:v libx264 -preset veryfast -crf 28 \
+                -vf "scale=${MERGED_W}:${MERGED_H}" \
                 -c:a aac -b:a 96k -ar 44100 \
                 -vsync cfr -avoid_negative_ts make_zero \
                 -movflags +faststart \
