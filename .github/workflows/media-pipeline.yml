@@ -505,11 +505,11 @@ jobs:
             fi
 
             if [ "$USE_HLS" = true ]; then
-              echo "⬇️ yt-dlp starting..."
+              echo "⬇️ yt-dlp starting (max resolution 1440p)..."
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                -f "bestvideo[ext=mp4]+bestaudio[language^=en]/bestvideo+bestaudio/best[ext=mp4]/best" \
+                -f "bestvideo[height<=1440][ext=mp4]+bestaudio[language^=en]/bestvideo[height<=1440]+bestaudio/best[height<=1440][ext=mp4]/best[height<=1440]/best" \
                 --merge-output-format mp4 \
                 --no-progress --no-warnings \
                 --geo-bypass --no-check-certificates \
@@ -526,7 +526,7 @@ jobs:
                   --extractor-args "generic:impersonate" \
                   --impersonate chrome \
                   --hls-prefer-native \
-                  -f "best" \
+                  -f "best[height<=1440]/best" \
                   --merge-output-format mp4 \
                   --no-progress --no-warnings \
                   --geo-bypass --no-check-certificates \
@@ -547,12 +547,12 @@ jobs:
                 -o "$OUT_FILE" "$URL" < /dev/null 2>&1 | tail -20 || true
 
               if file_is_playlist "$OUT_FILE"; then
-                echo "🔄 aria2c wrote an m3u8 playlist — redirecting to yt-dlp"
+                echo "🔄 aria2c wrote an m3u8 playlist — redirecting to yt-dlp (max 1440p)"
                 rm -f "$OUT_FILE"
                 yt-dlp \
                   --extractor-args "generic:impersonate" \
                   --impersonate chrome \
-                  -f "bestvideo[ext=mp4]+bestaudio[language^=en]/bestvideo+bestaudio/best[ext=mp4]/best" \
+                  -f "bestvideo[height<=1440][ext=mp4]+bestaudio[language^=en]/bestvideo[height<=1440]+bestaudio/best[height<=1440][ext=mp4]/best[height<=1440]/best" \
                   --merge-output-format mp4 \
                   --no-progress --no-warnings \
                   --geo-bypass --no-check-certificates \
@@ -565,11 +565,11 @@ jobs:
 
             if [ ! -f "$OUT_FILE" ] || [ ! -s "$OUT_FILE" ] || file_is_playlist "$OUT_FILE"; then
               rm -f "$OUT_FILE" 2>/dev/null
-              echo "⚠️  Primary method failed — trying yt-dlp fallback..."
+              echo "⚠️  Primary method failed — trying yt-dlp fallback (max 1440p)..."
               yt-dlp \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                -f "best" \
+                -f "best[height<=1440]/best" \
                 --merge-output-format mp4 \
                 --remux-video mp4 \
                 --no-progress --no-warnings \
