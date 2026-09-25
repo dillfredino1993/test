@@ -771,7 +771,7 @@ jobs:
 
 
           def compress_without_downscale(file_path, target_size_mb=80,
-                                         crf_ladder=(20, 22, 24, 26, 28, 30),
+                                         crf_ladder=(22, 24, 24, 26, 28, 30),
                                          preset="medium"):
               """
               Compress file_path to fit under target_size_mb without changing resolution.
