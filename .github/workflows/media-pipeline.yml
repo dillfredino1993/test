@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 env:
-  DOWNLOAD_DELAY: 15
+  DOWNLOAD_DELAY: 20
 
 jobs:
   upload:
