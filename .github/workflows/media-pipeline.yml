@@ -151,6 +151,40 @@ jobs:
 
           echo "STARTED" > workflow_status.txt
 
+      - name: 🧭 Decide Pipeline Paths
+        id: decide
+        run: |
+          SKIP_MERGED="${{ steps.setup.outputs.skip_merged_upload }}"
+          SKIP_SINGLE="${{ steps.setup.outputs.skip_single_upload }}"
+
+          if [ "$SKIP_MERGED" = "yes" ]; then
+            DO_MERGE="false"
+          else
+            DO_MERGE="true"
+          fi
+
+          if [ "$SKIP_SINGLE" = "yes" ]; then
+            DO_SINGLE="false"
+          else
+            DO_SINGLE="true"
+          fi
+
+          echo "========================================="
+          echo "🧭 PIPELINE PATH DECISIONS"
+          echo "========================================="
+          echo "Do Merge:         $DO_MERGE"
+          echo "Do Single Upload: $DO_SINGLE"
+          echo "========================================="
+
+          echo "do_merge=${DO_MERGE}" >> $GITHUB_OUTPUT
+          echo "do_single=${DO_SINGLE}" >> $GITHUB_OUTPUT
+
+          if [ "$DO_MERGE" = "false" ] && [ "$DO_SINGLE" = "false" ]; then
+            echo "monitor_uploads=false" >> $GITHUB_OUTPUT
+          else
+            echo "monitor_uploads=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Checkout Code
         uses: actions/checkout@v4
 
@@ -889,6 +923,7 @@ jobs:
 
       - name: Smart Merge, Verify, and Compress (Combined, Original Resolution)
         id: merge
+        if: steps.decide.outputs.do_merge == 'true'
         timeout-minutes: 220
         run: |
           cd downloads
@@ -1426,7 +1461,7 @@ jobs:
           echo "🎉 Combined merge+verify+compress complete!"
 
       - name: 📥 Download Poster (for Telegram Uploads)
-        if: steps.merge.outputs.verify_success == 'true' && steps.setup.outputs.poster_url != ''
+        if: steps.setup.outputs.poster_url != ''
         env:
           POSTER_URL: ${{ steps.setup.outputs.poster_url }}
         run: |
@@ -1446,7 +1481,7 @@ jobs:
           fi
 
       - name: Skip Merged Upload (skipmergedupload = yes)
-        if: steps.merge.outputs.verify_success == 'true' && steps.setup.outputs.skip_merged_upload == 'yes'
+        if: steps.decide.outputs.do_merge == 'false'
         run: |
           cd downloads
           echo "========================================="
@@ -1458,7 +1493,7 @@ jobs:
           echo "$(date): VIDEO_SENT" >> merged_progress.log
 
       - name: Start Merged Upload (Background with Fast Upload)
-        if: steps.merge.outputs.verify_success == 'true' && (steps.setup.outputs.skip_merged_upload == '' || steps.setup.outputs.skip_merged_upload == 'no' || steps.setup.outputs.skip_merged_upload == null)
+        if: steps.decide.outputs.do_merge == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -1967,7 +2002,7 @@ jobs:
           echo "✅ Merged upload started with PID: $MERGED_PID"
 
       - name: Skip Single Episodes Upload (skipsingleupload = yes)
-        if: steps.merge.outputs.verify_success == 'true' && steps.setup.outputs.skip_single_upload == 'yes'
+        if: steps.decide.outputs.do_single == 'false'
         run: |
           cd downloads
           echo "========================================="
@@ -1977,7 +2012,7 @@ jobs:
           echo "⏭️ Skipped by user request"
 
       - name: Upload Single Episodes (Fast Upload)
-        if: steps.merge.outputs.verify_success == 'true' && (steps.setup.outputs.skip_single_upload == '' || steps.setup.outputs.skip_single_upload == 'no' || steps.setup.outputs.skip_single_upload == null)
+        if: steps.decide.outputs.do_single == 'true'
         env:
           TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -2481,8 +2516,11 @@ jobs:
           touch single_episodes_complete.txt
 
       - name: Wait for All Uploads with Enhanced Progress Monitoring
-        if: steps.merge.outputs.verify_success == 'true'
+        if: steps.decide.outputs.monitor_uploads == 'true'
         timeout-minutes: 240
+        env:
+          DO_MERGE: ${{ steps.decide.outputs.do_merge }}
+          DO_SINGLE: ${{ steps.decide.outputs.do_single }}
         run: |
           cd downloads
 
@@ -2490,9 +2528,14 @@ jobs:
           echo "⏳ MONITORING UPLOAD PROGRESS"
           echo "========================================="
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
+          echo "🧭 Do Merge:  ${DO_MERGE}"
+          echo "🧭 Do Single: ${DO_SINGLE}"
           echo "========================================="
 
           is_merged_running() {
+            if [ "${DO_MERGE}" != "true" ]; then
+              return 1
+            fi
             if [ -n "${{ env.merged_pid }}" ]; then
               if kill -0 ${{ env.merged_pid }} 2>/dev/null; then
                 return 0
@@ -2502,6 +2545,10 @@ jobs:
           }
 
           get_merged_progress() {
+            if [ "${DO_MERGE}" != "true" ]; then
+              echo "100|complete"
+              return
+            fi
             if [ -f "merged_progress.log" ]; then
               if grep -q "VIDEO_SENT" merged_progress.log; then
                 echo "100|complete"
@@ -2525,6 +2572,10 @@ jobs:
           }
 
           get_episode_progress() {
+            if [ "${DO_SINGLE}" != "true" ]; then
+              echo "100|complete"
+              return
+            fi
             if [ -f "single_episodes_complete.txt" ]; then
               echo "100|complete"
               return
@@ -2548,28 +2599,37 @@ jobs:
           EPISODES_COMPLETE=false
           NO_PROGRESS_COUNT=0
 
+          if [ "${DO_MERGE}" != "true" ]; then
+            MERGED_COMPLETE=true
+          fi
+          if [ "${DO_SINGLE}" != "true" ]; then
+            EPISODES_COMPLETE=true
+          fi
+
           echo ""
           echo "🔄 Monitoring upload progress..."
           echo "   (Updates every 5 seconds)"
           echo ""
 
           while true; do
-            if [ -f "single_episodes_complete.txt" ]; then
+            if [ "${DO_SINGLE}" = "true" ] && [ -f "single_episodes_complete.txt" ]; then
               EPISODES_COMPLETE=true
             fi
 
-            if [ -f "merged_progress.log" ] && grep -q "VIDEO_SENT" merged_progress.log; then
-              MERGED_COMPLETE=true
-            elif [ -f "merged_upload.log" ] && grep -q "✅ Video sent to Telegram Channel!" merged_upload.log; then
-              MERGED_COMPLETE=true
-              if ! grep -q "VIDEO_SENT" merged_progress.log 2>/dev/null; then
-                echo "$(date): VIDEO_SENT" >> merged_progress.log
-              fi
-            elif ! is_merged_running && [ -f "merged_upload.log" ]; then
-              if tail -20 merged_upload.log | grep -q "✅ Video sent to Telegram Channel!"; then
+            if [ "${DO_MERGE}" = "true" ]; then
+              if [ -f "merged_progress.log" ] && grep -q "VIDEO_SENT" merged_progress.log; then
+                MERGED_COMPLETE=true
+              elif [ -f "merged_upload.log" ] && grep -q "✅ Video sent to Telegram Channel!" merged_upload.log; then
                 MERGED_COMPLETE=true
                 if ! grep -q "VIDEO_SENT" merged_progress.log 2>/dev/null; then
                   echo "$(date): VIDEO_SENT" >> merged_progress.log
+                fi
+              elif ! is_merged_running && [ -f "merged_upload.log" ]; then
+                if tail -20 merged_upload.log | grep -q "✅ Video sent to Telegram Channel!"; then
+                  MERGED_COMPLETE=true
+                  if ! grep -q "VIDEO_SENT" merged_progress.log 2>/dev/null; then
+                    echo "$(date): VIDEO_SENT" >> merged_progress.log
+                  fi
                 fi
               fi
             fi
@@ -2606,7 +2666,7 @@ jobs:
             MERGED_DATA=$(echo "$MERGED_PROGRESS" | cut -d'|' -f2)
 
             POSTER_STATUS=""
-            if [ -f "merged_upload.log" ]; then
+            if [ "${DO_MERGE}" = "true" ] && [ -f "merged_upload.log" ]; then
               if grep -q "✅ Poster posted with series info!" merged_upload.log; then
                 POSTER_STATUS="✅ Poster sent"
               elif grep -q "ℹ️ Skipping poster" merged_upload.log; then
@@ -2614,7 +2674,10 @@ jobs:
               fi
             fi
 
-            if [ "$MERGED_COMPLETE" = true ] || [ "$MERGED_DATA" = "complete" ]; then
+            if [ "${DO_MERGE}" != "true" ]; then
+              echo "║ 📹 Merged Video: ⏭️  SKIPPED (skipmergedupload)            ║"
+              echo "║                                                              ║"
+            elif [ "$MERGED_COMPLETE" = true ] || [ "$MERGED_DATA" = "complete" ]; then
               MERGED_COMPLETE=true
               echo "║ 📹 Merged Video:                                        ║"
               echo "║    Status: ✅ COMPLETE                                   ║"
@@ -2655,7 +2718,9 @@ jobs:
             EP_PERCENT=$(echo "$EP_PROGRESS" | cut -d'|' -f1)
             EP_DATA=$(echo "$EP_PROGRESS" | cut -d'|' -f2)
 
-            if [ "$EPISODES_COMPLETE" = true ] || [ "$EP_DATA" = "complete" ]; then
+            if [ "${DO_SINGLE}" != "true" ]; then
+              echo "║    Status: ⏭️  SKIPPED (skipsingleupload)                  ║"
+            elif [ "$EPISODES_COMPLETE" = true ] || [ "$EP_DATA" = "complete" ]; then
               EPISODES_COMPLETE=true
               echo "║    Status: ✅ COMPLETE                                     ║"
               BAR_LENGTH=40
@@ -2680,7 +2745,7 @@ jobs:
             echo "║                                                              ║"
             echo "╚══════════════════════════════════════════════════════════════╝"
 
-            if [ "$MERGED_PERCENT" = "100" ] && [ "$MERGED_COMPLETE" = false ]; then
+            if [ "${DO_MERGE}" = "true" ] && [ "$MERGED_PERCENT" = "100" ] && [ "$MERGED_COMPLETE" = false ]; then
               NO_PROGRESS_COUNT=$((NO_PROGRESS_COUNT + 1))
               if [ $NO_PROGRESS_COUNT -gt 12 ]; then
                 if ! is_merged_running; then
@@ -2705,7 +2770,7 @@ jobs:
           echo "✅ ALL UPLOADS COMPLETED SUCCESSFULLY!"
           echo "========================================="
 
-          if [ -f "merged_upload.log" ]; then
+          if [ "${DO_MERGE}" = "true" ] && [ -f "merged_upload.log" ]; then
             echo ""
             echo "📋 Final merged upload log:"
             echo "========================================="
@@ -2719,7 +2784,7 @@ jobs:
           echo "📺 Series: ${{ steps.fname.outputs.series_title }}"
           echo "⏱️  Total Time: $ELAPSED_STR"
 
-          if [ -f "merged_progress.log" ]; then
+          if [ "${DO_MERGE}" = "true" ] && [ -f "merged_progress.log" ]; then
             FINAL_SIZE=$(grep -E "[0-9]+\.[0-9]+/[0-9]+\.[0-9]+ MB" merged_progress.log | tail -1 | grep -oE "[0-9.]+\/[0-9.]+ MB" | tail -1)
             if [ -n "$FINAL_SIZE" ]; then
               echo "📹 Merged Video Size: $FINAL_SIZE"
@@ -2727,7 +2792,9 @@ jobs:
           fi
 
           EP_COUNT=$(ls -1 EP*.mp4 2>/dev/null | wc -l)
-          if [ -f "single_episodes_complete.txt" ]; then
+          if [ "${DO_SINGLE}" != "true" ]; then
+            echo "📺 Episodes Upload: ⏭️ Skipped (user requested)"
+          elif [ -f "single_episodes_complete.txt" ]; then
             if grep -q "skipped" single_episodes_complete.txt 2>/dev/null; then
               echo "📺 Episodes Upload: ⏭️ Skipped (user requested)"
             else
@@ -2736,8 +2803,8 @@ jobs:
           fi
 
           echo "========================================="
-          if [ -f "single_episodes_complete.txt" ] && [ -f "merged_progress.log" ] && grep -q "VIDEO_SENT" merged_progress.log; then
-            echo "🎉 All uploads completed successfully!"
+          if [ "$MERGED_COMPLETE" = true ] && [ "$EPISODES_COMPLETE" = true ]; then
+            echo "🎉 All requested uploads completed successfully!"
           fi
           echo "========================================="
 
