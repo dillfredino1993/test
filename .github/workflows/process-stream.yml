@@ -3,7 +3,8 @@ name: Process Stream
 on:
   workflow_dispatch:
     inputs:
-      manifest_url:
+      command:
+        description: 'Full N_m3u8DL-RE command'
         required: true
       callback_url:
         required: true
@@ -13,7 +14,7 @@ on:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -22,17 +23,31 @@ jobs:
           ASSET_URL=$(curl -s https://api.github.com/repos/nilaoda/N_m3u8DL-RE/releases/latest \
             | grep "browser_download_url.*linux-x64.*tar.gz" \
             | cut -d '"' -f 4)
-
           if [ -z "$ASSET_URL" ]; then
-            echo "Could not find linux-x64 asset in latest release"
+            echo "Could not find linux-x64 asset"
             exit 1
           fi
-
           echo "Downloading: $ASSET_URL"
           curl -L -o n-m3u8dl-re.tar.gz "$ASSET_URL"
           tar -xzf n-m3u8dl-re.tar.gz
           chmod +x N_m3u8DL-RE
           ./N_m3u8DL-RE --version
+
+      - name: Install shaka-packager
+        run: |
+          curl -L -o shaka.tar.gz \
+            https://github.com/shaka-project/shaka-packager/releases/latest/download/packager-linux-x64
+          # The latest asset is the binary itself, not a tarball — handle both cases
+          file shaka.tar.gz
+          if file shaka.tar.gz | grep -q gzip; then
+            tar -xzf shaka.tar.gz
+            chmod +x packager
+            sudo mv packager /usr/local/bin/shaka-packager
+          else
+            chmod +x shaka.tar.gz
+            sudo mv shaka.tar.gz /usr/local/bin/shaka-packager
+          fi
+          shaka-packager --version || echo "shaka-packager not directly executable"
 
       - uses: actions/setup-node@v4
         with:
@@ -42,7 +57,7 @@ jobs:
 
       - name: Run relay
         env:
-          MANIFEST_URL: ${{ inputs.manifest_url }}
+          COMMAND: ${{ inputs.command }}
           CALLBACK_URL: ${{ inputs.callback_url }}
           STREAM_ID: ${{ inputs.stream_id }}
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
@@ -54,54 +69,66 @@ jobs:
           const { execSync } = require('child_process');
 
           async function main() {
-            const manifestUrl = process.env.MANIFEST_URL;
+            const command     = process.env.COMMAND;
             const callbackUrl = process.env.CALLBACK_URL;
             const streamId    = process.env.STREAM_ID;
             const secret      = process.env.CALLBACK_SECRET;
             const proxyUrl    = process.env.PROXY_URL || '';
 
-            console.log('Probing manifest with N_m3u8DL-RE');
-            console.log('Source: ' + manifestUrl.slice(0, 80) + '...');
-            console.log('Proxy:  ' + (proxyUrl ? proxyUrl.replace(/:[^:@]+@/, ':****@') : 'none'));
+            console.log('Running N_m3u8DL-RE command');
+            console.log(command.replace(/--key\s+\S+/, '--key ****'));
 
             let result;
             try {
-              const proxyFlag = proxyUrl ? `--custom-proxy "${proxyUrl}"` : '';
+              // Set proxy via environment variables (works for .NET on Linux)
+              const env = { ...process.env };
+              if (proxyUrl) {
+                env.HTTP_PROXY = proxyUrl;
+                env.HTTPS_PROXY = proxyUrl;
+                env.ALL_PROXY = proxyUrl;
+                console.log('Proxy configured');
+              }
 
-              const cmd = `./N_m3u8DL-RE "${manifestUrl}" --skip-download --morehelp ` +
-                          `${proxyFlag} --http-request-timeout 60 --download-retry-count 1`;
+              // Replace "N_m3u8DL-RE" with "./N_m3u8DL-RE" and add --skip-download --morehelp
+              let execCmd = command.replace(/^N_m3u8DL-RE\s+/, './N_m3u8DL-RE ');
+              if (!execCmd.includes('--skip-download')) {
+                execCmd += ' --skip-download';
+              }
+              if (!execCmd.includes('--morehelp')) {
+                execCmd += ' --morehelp';
+              }
 
-              console.log('Running: ' + cmd.replace(/:[^:@]+@/, ':****@'));
+              console.log('Executing: ' + execCmd.replace(/--key\s+\S+/, '--key ****'));
 
-              const output = execSync(cmd, {
+              const output = execSync(execCmd, {
                 encoding: 'utf-8',
-                timeout: 120000,
-                maxBuffer: 20 * 1024 * 1024,
+                timeout: 300000,
+                maxBuffer: 30 * 1024 * 1024,
+                env,
+                shell: '/bin/bash',
               });
 
-              console.log('N_m3u8DL-RE output captured (' + output.length + ' bytes)');
-              console.log('--- OUTPUT PREVIEW ---');
-              console.log(output.slice(0, 3000));
+              console.log('Output captured (' + output.length + ' bytes)');
+              console.log(output.slice(0, 4000));
 
               result = {
                 streamId,
                 success: true,
                 n3u8Output: output,
                 fetchedAt: new Date().toISOString(),
-                sourceUrl: manifestUrl,
               };
             } catch (err) {
               const stderr = err.stderr ? err.stderr.toString() : '';
               const stdout = err.stdout ? err.stdout.toString() : '';
-              console.error('N_m3u8DL-RE failed: ' + err.message);
-              console.error('STDOUT:', stdout.slice(0, 3000));
-              console.error('STDERR:', stderr.slice(0, 3000));
+              console.error('Failed: ' + err.message);
+              console.error('STDOUT:', stdout.slice(0, 4000));
+              console.error('STDERR:', stderr.slice(0, 4000));
               result = {
                 streamId,
                 success: false,
                 error: err.message,
-                stdout: stdout.slice(0, 8000),
-                stderr: stderr.slice(0, 8000),
+                stdout: stdout.slice(0, 10000),
+                stderr: stderr.slice(0, 10000),
                 fetchedAt: new Date().toISOString(),
               };
             }
@@ -112,7 +139,7 @@ jobs:
               .update(payload)
               .digest('hex');
 
-            console.log('Posting callback: ' + callbackUrl);
+            console.log('Posting callback...');
             try {
               await axios.post(callbackUrl, result, {
                 headers: {
@@ -120,14 +147,13 @@ jobs:
                   'X-Signature': signature,
                 },
                 timeout: 20000,
-                maxBodyLength: 20 * 1024 * 1024,
+                maxBodyLength: 30 * 1024 * 1024,
               });
               console.log('Callback delivered');
-            } catch (cbErr) {
-              console.error('Callback failed: ' + cbErr.message);
+            } catch (e) {
+              console.error('Callback failed: ' + e.message);
               process.exit(1);
             }
-
             if (!result.success) process.exit(1);
           }
 
