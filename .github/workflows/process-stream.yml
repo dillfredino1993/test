@@ -1,4 +1,60 @@
-      - name: Install proxy-agent
+name: Process Stream
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        required: true
+      callback_url:
+        required: true
+      stream_id:
+        required: true
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg (static)
+        run: |
+          curl -L -o /tmp/ffmpeg.tar.xz \
+            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+          mkdir -p /tmp/ffmpeg
+          tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1
+          sudo mv /tmp/ffmpeg/ffmpeg /usr/local/bin/ffmpeg
+          sudo mv /tmp/ffmpeg/ffprobe /usr/local/bin/ffprobe
+          sudo chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+          ffmpeg -version | head -1
+
+      - name: Download N_m3u8DL-RE
+        run: |
+          ASSET_URL=$(curl -s https://api.github.com/repos/nilaoda/N_m3u8DL-RE/releases/latest \
+            | grep "browser_download_url.*linux-x64.*tar.gz" \
+            | cut -d '"' -f 4)
+          if [ -z "$ASSET_URL" ]; then
+            echo "Could not find linux-x64 asset"
+            exit 1
+          fi
+          curl -L -o n-m3u8dl-re.tar.gz "$ASSET_URL"
+          tar -xzf n-m3u8dl-re.tar.gz
+          chmod +x N_m3u8DL-RE
+          ./N_m3u8DL-RE --version
+
+      - name: Install shaka-packager
+        run: |
+          curl -L -o /tmp/shaka-packager \
+            https://github.com/shaka-project/shaka-packager/releases/latest/download/packager-linux-x64
+          chmod +x /tmp/shaka-packager
+          sudo mv /tmp/shaka-packager /usr/local/bin/shaka-packager
+          shaka-packager --version 2>&1 | head -1 || true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Node dependencies
         run: npm install axios proxy-agent
 
       - name: Run relay
@@ -77,7 +133,6 @@
 
               console.log('N_m3u8DL-RE output: ' + output.length + ' bytes');
 
-              // Try meta.json first
               const candidates = [
                 'meta.json',
                 path.join(process.env.GITHUB_WORKSPACE || '.', 'meta.json'),
@@ -91,7 +146,6 @@
                 }
               }
 
-              // Fallback: fetch MPD directly THROUGH THE PROXY
               let rawManifest = '';
               if (!metaJsonContent && originalUrl) {
                 console.log('Fetching MPD directly through proxy...');
@@ -107,7 +161,7 @@
                     responseType: 'text',
                     httpsAgent: agent,
                     httpAgent: agent,
-                    proxy: false,  // disable axios's own proxy handling; use the agent
+                    proxy: false,
                   });
                   rawManifest = mpdRes.data;
                   console.log('MPD fetched through proxy: ' + rawManifest.length + ' bytes');
