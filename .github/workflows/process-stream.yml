@@ -19,8 +19,18 @@ jobs:
 
       - name: Download N_m3u8DL-RE
         run: |
-          curl -L -o n-m3u8dl-re.tar.gz \
-            https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.6.0-beta/N_m3u8DL-RE_v0.6.0-beta_linux-x64_20260627.tar.gz
+          # Fetch the latest release asset dynamically to avoid 404s
+          ASSET_URL=$(curl -s https://api.github.com/repos/nilaoda/N_m3u8DL-RE/releases/latest \
+            | grep "browser_download_url.*linux-x64.*tar.gz" \
+            | cut -d '"' -f 4)
+          
+          if [ -z "$ASSET_URL" ]; then
+            echo "Could not find linux-x64 asset in latest release"
+            exit 1
+          fi
+          
+          echo "Downloading: $ASSET_URL"
+          curl -L -o n-m3u8dl-re.tar.gz "$ASSET_URL"
           tar -xzf n-m3u8dl-re.tar.gz
           chmod +x N_m3u8DL-RE
           ./N_m3u8DL-RE --version
@@ -54,7 +64,6 @@ jobs:
             let result;
             try {
               // Run N_m3u8DL-RE in skip-download mode to parse the stream
-              // --morehelp prints full stream info
               const output = execSync(
                 `./N_m3u8DL-RE "${manifestUrl}" --skip-download --morehelp`,
                 { encoding: 'utf-8', timeout: 45000, maxBuffer: 10 * 1024 * 1024 }
@@ -62,8 +71,6 @@ jobs:
 
               console.log('N_m3u8DL-RE output captured (' + output.length + ' bytes)');
 
-              // The output contains the parsed stream info
-              // We forward this to the Worker, which extracts segment URLs
               result = {
                 streamId,
                 success: true,
