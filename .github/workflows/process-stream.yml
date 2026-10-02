@@ -19,16 +19,15 @@ jobs:
 
       - name: Download N_m3u8DL-RE
         run: |
-          # Fetch the latest release asset dynamically to avoid 404s
           ASSET_URL=$(curl -s https://api.github.com/repos/nilaoda/N_m3u8DL-RE/releases/latest \
             | grep "browser_download_url.*linux-x64.*tar.gz" \
             | cut -d '"' -f 4)
-          
+
           if [ -z "$ASSET_URL" ]; then
             echo "Could not find linux-x64 asset in latest release"
             exit 1
           fi
-          
+
           echo "Downloading: $ASSET_URL"
           curl -L -o n-m3u8dl-re.tar.gz "$ASSET_URL"
           tar -xzf n-m3u8dl-re.tar.gz
@@ -47,6 +46,7 @@ jobs:
           CALLBACK_URL: ${{ inputs.callback_url }}
           STREAM_ID: ${{ inputs.stream_id }}
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: |
           cat > process.js << 'JSEOF'
           const axios = require('axios');
@@ -58,18 +58,30 @@ jobs:
             const callbackUrl = process.env.CALLBACK_URL;
             const streamId    = process.env.STREAM_ID;
             const secret      = process.env.CALLBACK_SECRET;
+            const proxyUrl    = process.env.PROXY_URL || '';
 
-            console.log('Probing manifest with N_m3u8DL-RE: ' + manifestUrl);
+            console.log('Probing manifest with N_m3u8DL-RE');
+            console.log('Source: ' + manifestUrl.slice(0, 80) + '...');
+            console.log('Proxy:  ' + (proxyUrl ? proxyUrl.replace(/:[^:@]+@/, ':****@') : 'none'));
 
             let result;
             try {
-              // Run N_m3u8DL-RE in skip-download mode to parse the stream
-              const output = execSync(
-                `./N_m3u8DL-RE "${manifestUrl}" --skip-download --morehelp`,
-                { encoding: 'utf-8', timeout: 45000, maxBuffer: 10 * 1024 * 1024 }
-              );
+              const proxyFlag = proxyUrl ? `--custom-proxy "${proxyUrl}"` : '';
+
+              const cmd = `./N_m3u8DL-RE "${manifestUrl}" --skip-download --morehelp ` +
+                          `${proxyFlag} --http-request-timeout 60 --download-retry-count 1`;
+
+              console.log('Running: ' + cmd.replace(/:[^:@]+@/, ':****@'));
+
+              const output = execSync(cmd, {
+                encoding: 'utf-8',
+                timeout: 120000,
+                maxBuffer: 20 * 1024 * 1024,
+              });
 
               console.log('N_m3u8DL-RE output captured (' + output.length + ' bytes)');
+              console.log('--- OUTPUT PREVIEW ---');
+              console.log(output.slice(0, 3000));
 
               result = {
                 streamId,
@@ -82,14 +94,14 @@ jobs:
               const stderr = err.stderr ? err.stderr.toString() : '';
               const stdout = err.stdout ? err.stdout.toString() : '';
               console.error('N_m3u8DL-RE failed: ' + err.message);
-              console.error('STDOUT:', stdout.slice(0, 2000));
-              console.error('STDERR:', stderr.slice(0, 2000));
+              console.error('STDOUT:', stdout.slice(0, 3000));
+              console.error('STDERR:', stderr.slice(0, 3000));
               result = {
                 streamId,
                 success: false,
                 error: err.message,
-                stdout: stdout.slice(0, 5000),
-                stderr: stderr.slice(0, 5000),
+                stdout: stdout.slice(0, 8000),
+                stderr: stderr.slice(0, 8000),
                 fetchedAt: new Date().toISOString(),
               };
             }
@@ -101,15 +113,21 @@ jobs:
               .digest('hex');
 
             console.log('Posting callback: ' + callbackUrl);
-            await axios.post(callbackUrl, result, {
-              headers: {
-                'Content-Type': 'application/json',
-                'X-Signature': signature,
-              },
-              timeout: 20000,
-            });
+            try {
+              await axios.post(callbackUrl, result, {
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Signature': signature,
+                },
+                timeout: 20000,
+                maxBodyLength: 20 * 1024 * 1024,
+              });
+              console.log('Callback delivered');
+            } catch (cbErr) {
+              console.error('Callback failed: ' + cbErr.message);
+              process.exit(1);
+            }
 
-            console.log('Callback delivered');
             if (!result.success) process.exit(1);
           }
 
