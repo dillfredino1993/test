@@ -37,7 +37,6 @@ jobs:
             echo "Could not find linux-x64 asset"
             exit 1
           fi
-          echo "Downloading: $ASSET_URL"
           curl -L -o n-m3u8dl-re.tar.gz "$ASSET_URL"
           tar -xzf n-m3u8dl-re.tar.gz
           chmod +x N_m3u8DL-RE
@@ -79,28 +78,40 @@ jobs:
             const secret      = process.env.CALLBACK_SECRET;
             const proxyUrl    = process.env.PROXY_URL || '';
 
-            console.log('Running N_m3u8DL-RE command (parse only)');
+            console.log('Running N_m3u8DL-RE (parse-only, debug log)');
 
             let result;
             let metaJsonContent = '';
 
             try {
-              let execCmd = command.replace(/^N_m3u8DL-RE\s+/, './N_m3u8DL-RE ');
+              // Parse the user's command to extract the URL and headers
+              const urlMatch = command.match(/N_m3u8DL-RE\s+"([^"]+)"/);
+              const originalUrl = urlMatch ? urlMatch[1] : '';
 
-              // Pass the proxy via --custom-proxy (env vars are ignored by N_m3u8DL-RE on Linux)
-              if (proxyUrl && !execCmd.includes('--custom-proxy')) {
-                execCmd += ` --custom-proxy "${proxyUrl}"`;
-                console.log('Proxy added via --custom-proxy');
+              const headerMatches = [...command.matchAll(/-H\s+"([^:]+):\s*([^"]+)"/g)];
+              const headers = {};
+              for (const m of headerMatches) {
+                headers[m[1].trim()] = m[2].trim();
               }
 
-              // Add flags needed for non-interactive parse-only mode
+              console.log('Source URL: ' + originalUrl.slice(0, 80) + '...');
+              console.log('Headers parsed: ' + Object.keys(headers).join(', '));
+
+              // Build N_m3u8DL-RE command with debug logging
+              let execCmd = command.replace(/^N_m3u8DL-RE\s+/, './N_m3u8DL-RE ');
+
+              if (proxyUrl && !execCmd.includes('--custom-proxy')) {
+                execCmd += ` --custom-proxy "${proxyUrl}"`;
+              }
+
               const flagsToAdd = [
                 '--skip-download',
                 '--write-meta-json',
                 '--auto-select',
+                '--log-level DEBUG',
               ];
               for (const flag of flagsToAdd) {
-                if (!execCmd.includes(flag)) {
+                if (!execCmd.includes(flag.split(' ')[0])) {
                   execCmd += ` ${flag}`;
                 }
               }
@@ -109,9 +120,7 @@ jobs:
                 .replace(/--morehelp/g, '')
                 .replace(/--skip-merge/g, '');
 
-              console.log('Executing: ' + execCmd
-                .replace(/--key\s+\S+/, '--key ****')
-                .replace(/(https?:\/\/[^:]+:)[^@]+(@)/, '$1****$2'));
+              console.log('Executing N_m3u8DL-RE...');
 
               const output = execSync(execCmd, {
                 encoding: 'utf-8',
@@ -122,25 +131,43 @@ jobs:
                 cwd: process.env.GITHUB_WORKSPACE || '.',
               });
 
-              console.log('N_m3u8DL-RE output captured (' + output.length + ' bytes)');
+              console.log('N_m3u8DL-RE output: ' + output.length + ' bytes');
 
+              // Try meta.json first
               const candidates = [
                 'meta.json',
                 path.join(process.env.GITHUB_WORKSPACE || '.', 'meta.json'),
                 path.join(process.cwd(), 'meta.json'),
               ];
-
               for (const candidate of candidates) {
                 if (fs.existsSync(candidate)) {
                   metaJsonContent = fs.readFileSync(candidate, 'utf-8');
-                  console.log('meta.json read from: ' + candidate +
-                              ' (' + metaJsonContent.length + ' bytes)');
+                  console.log('meta.json read from: ' + candidate);
                   break;
                 }
               }
 
-              if (!metaJsonContent) {
-                console.log('Warning: meta.json not found in any location');
+              // As fallback, fetch the MPD ourselves using the parsed headers
+              let rawManifest = '';
+              if (!metaJsonContent && originalUrl) {
+                console.log('Fetching MPD directly with parsed headers...');
+                try {
+                  const mpdRes = await axios.get(originalUrl, {
+                    headers: {
+                      ...headers,
+                      'Accept': '*/*',
+                    },
+                    timeout: 30000,
+                    responseType: 'text',
+                    httpsAgent: proxyUrl ? new (require('https').Agent)({
+                      // Not using HTTP proxy here — N_m3u8DL-RE already validated access
+                    }) : undefined,
+                  });
+                  rawManifest = mpdRes.data;
+                  console.log('MPD fetched directly: ' + rawManifest.length + ' bytes');
+                } catch (e) {
+                  console.error('Direct MPD fetch failed: ' + e.message);
+                }
               }
 
               result = {
@@ -148,23 +175,15 @@ jobs:
                 success: true,
                 n3u8Output: output,
                 metaJson: metaJsonContent,
+                rawManifest: rawManifest,
+                sourceUrl: originalUrl,
+                headers: headers,
                 fetchedAt: new Date().toISOString(),
               };
             } catch (err) {
               const stderr = err.stderr ? err.stderr.toString() : '';
               const stdout = err.stdout ? err.stdout.toString() : '';
-              console.error('Failed: ' + err.message);
-              console.error('STDOUT:', stdout.slice(0, 4000));
-              console.error('STDERR:', stderr.slice(0, 4000));
-
-              try {
-                const metaPath = path.join(process.env.GITHUB_WORKSPACE || '.', 'meta.json');
-                if (fs.existsSync(metaPath)) {
-                  metaJsonContent = fs.readFileSync(metaPath, 'utf-8');
-                  console.log('meta.json read on failure (' + metaJsonContent.length + ' bytes)');
-                }
-              } catch {}
-
+              console.error('N_m3u8DL-RE failed: ' + err.message);
               result = {
                 streamId,
                 success: false,
@@ -190,7 +209,7 @@ jobs:
                   'X-Signature': signature,
                 },
                 timeout: 20000,
-                maxBodyLength: 30 * 1024 * 1024,
+                maxBodyLength: 50 * 1024 * 1024,
               });
               console.log('Callback delivered');
             } catch (e) {
