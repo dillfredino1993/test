@@ -1,0 +1,115 @@
+name: Process Stream
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_url:
+        description: 'Live manifest URL'
+        required: true
+      callback_url:
+        description: 'Worker callback endpoint'
+        required: true
+      stream_id:
+        description: 'Stream ID'
+        required: true
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install axios
+
+      - name: Run relay
+        env:
+          MANIFEST_URL: ${{ inputs.manifest_url }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          STREAM_ID: ${{ inputs.stream_id }}
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          cat > process.js << 'JSEOF'
+          const axios = require('axios');
+          const crypto = require('crypto');
+
+          async function main() {
+            const manifestUrl = process.env.MANIFEST_URL;
+            const callbackUrl = process.env.CALLBACK_URL;
+            const streamId    = process.env.STREAM_ID;
+            const secret      = process.env.CALLBACK_SECRET;
+
+            console.log('Fetching: ' + manifestUrl);
+
+            let result;
+            try {
+              const origin = new URL(manifestUrl).origin;
+
+              const res = await axios.get(manifestUrl, {
+                headers: {
+                  'User-Agent':
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+                  Referer: origin + '/',
+                  Origin: origin,
+                  Accept: '*/*',
+                },
+                timeout: 20000,
+                responseType: 'text',
+              });
+
+              const manifest = res.data;
+              console.log('Fetched ' + manifest.length + ' bytes');
+
+              result = {
+                streamId,
+                success: true,
+                manifest,
+                isMaster: manifest.includes('#EXT-X-STREAM-INF'),
+                variantCount: (manifest.match(/#EXT-X-STREAM-INF/g) || []).length,
+                segmentCount: (manifest.match(/#EXTINF/g) || []).length,
+                fetchedAt: new Date().toISOString(),
+                sourceUrl: manifestUrl,
+              };
+            } catch (err) {
+              console.error('Fetch failed: ' + err.message);
+              result = {
+                streamId,
+                success: false,
+                error: err.message,
+                fetchedAt: new Date().toISOString(),
+              };
+            }
+
+            const payload = JSON.stringify(result);
+            const signature = crypto
+              .createHmac('sha256', secret)
+              .update(payload)
+              .digest('hex');
+
+            console.log('Posting callback: ' + callbackUrl);
+
+            try {
+              await axios.post(callbackUrl, result, {
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Signature': signature,
+                },
+                timeout: 20000,
+              });
+              console.log('Callback delivered');
+            } catch (err) {
+              console.error('Callback failed: ' + err.message);
+              process.exit(1);
+            }
+
+            if (!result.success) process.exit(1);
+          }
+
+          main();
+          JSEOF
+          node process.js
