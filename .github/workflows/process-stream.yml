@@ -4,28 +4,32 @@ on:
   workflow_dispatch:
     inputs:
       manifest_url:
-        description: 'Live manifest URL'
         required: true
       callback_url:
-        description: 'Worker callback endpoint'
         required: true
       stream_id:
-        description: 'Stream ID'
         required: true
 
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download N_m3u8DL-RE
+        run: |
+          curl -L -o n-m3u8dl-re.tar.gz \
+            https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.6.0-beta/N_m3u8DL-RE_v0.6.0-beta_linux-x64_20260627.tar.gz
+          tar -xzf n-m3u8dl-re.tar.gz
+          chmod +x N_m3u8DL-RE
+          ./N_m3u8DL-RE --version
 
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install dependencies
-        run: npm install axios
+      - run: npm install axios
 
       - name: Run relay
         env:
@@ -37,6 +41,7 @@ jobs:
           cat > process.js << 'JSEOF'
           const axios = require('axios');
           const crypto = require('crypto');
+          const { execSync } = require('child_process');
 
           async function main() {
             const manifestUrl = process.env.MANIFEST_URL;
@@ -44,43 +49,40 @@ jobs:
             const streamId    = process.env.STREAM_ID;
             const secret      = process.env.CALLBACK_SECRET;
 
-            console.log('Fetching: ' + manifestUrl);
+            console.log('Probing manifest with N_m3u8DL-RE: ' + manifestUrl);
 
             let result;
             try {
-              const origin = new URL(manifestUrl).origin;
+              // Run N_m3u8DL-RE in skip-download mode to parse the stream
+              // --morehelp prints full stream info
+              const output = execSync(
+                `./N_m3u8DL-RE "${manifestUrl}" --skip-download --morehelp`,
+                { encoding: 'utf-8', timeout: 45000, maxBuffer: 10 * 1024 * 1024 }
+              );
 
-              const res = await axios.get(manifestUrl, {
-                headers: {
-                  'User-Agent':
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-                  Referer: origin + '/',
-                  Origin: origin,
-                  Accept: '*/*',
-                },
-                timeout: 20000,
-                responseType: 'text',
-              });
+              console.log('N_m3u8DL-RE output captured (' + output.length + ' bytes)');
 
-              const manifest = res.data;
-              console.log('Fetched ' + manifest.length + ' bytes');
-
+              // The output contains the parsed stream info
+              // We forward this to the Worker, which extracts segment URLs
               result = {
                 streamId,
                 success: true,
-                manifest,
-                isMaster: manifest.includes('#EXT-X-STREAM-INF'),
-                variantCount: (manifest.match(/#EXT-X-STREAM-INF/g) || []).length,
-                segmentCount: (manifest.match(/#EXTINF/g) || []).length,
+                n3u8Output: output,
                 fetchedAt: new Date().toISOString(),
                 sourceUrl: manifestUrl,
               };
             } catch (err) {
-              console.error('Fetch failed: ' + err.message);
+              const stderr = err.stderr ? err.stderr.toString() : '';
+              const stdout = err.stdout ? err.stdout.toString() : '';
+              console.error('N_m3u8DL-RE failed: ' + err.message);
+              console.error('STDOUT:', stdout.slice(0, 2000));
+              console.error('STDERR:', stderr.slice(0, 2000));
               result = {
                 streamId,
                 success: false,
                 error: err.message,
+                stdout: stdout.slice(0, 5000),
+                stderr: stderr.slice(0, 5000),
                 fetchedAt: new Date().toISOString(),
               };
             }
@@ -92,21 +94,15 @@ jobs:
               .digest('hex');
 
             console.log('Posting callback: ' + callbackUrl);
+            await axios.post(callbackUrl, result, {
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Signature': signature,
+              },
+              timeout: 20000,
+            });
 
-            try {
-              await axios.post(callbackUrl, result, {
-                headers: {
-                  'Content-Type': 'application/json',
-                  'X-Signature': signature,
-                },
-                timeout: 20000,
-              });
-              console.log('Callback delivered');
-            } catch (err) {
-              console.error('Callback failed: ' + err.message);
-              process.exit(1);
-            }
-
+            console.log('Callback delivered');
             if (!result.success) process.exit(1);
           }
 
