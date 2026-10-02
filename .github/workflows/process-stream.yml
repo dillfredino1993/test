@@ -1,60 +1,5 @@
-name: Process Stream
-
-on:
-  workflow_dispatch:
-    inputs:
-      command:
-        required: true
-      callback_url:
-        required: true
-      stream_id:
-        required: true
-
-jobs:
-  process:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install ffmpeg (static)
-        run: |
-          curl -L -o /tmp/ffmpeg.tar.xz \
-            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
-          mkdir -p /tmp/ffmpeg
-          tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1
-          sudo mv /tmp/ffmpeg/ffmpeg /usr/local/bin/ffmpeg
-          sudo mv /tmp/ffmpeg/ffprobe /usr/local/bin/ffprobe
-          sudo chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
-          ffmpeg -version | head -1
-
-      - name: Download N_m3u8DL-RE
-        run: |
-          ASSET_URL=$(curl -s https://api.github.com/repos/nilaoda/N_m3u8DL-RE/releases/latest \
-            | grep "browser_download_url.*linux-x64.*tar.gz" \
-            | cut -d '"' -f 4)
-          if [ -z "$ASSET_URL" ]; then
-            echo "Could not find linux-x64 asset"
-            exit 1
-          fi
-          curl -L -o n-m3u8dl-re.tar.gz "$ASSET_URL"
-          tar -xzf n-m3u8dl-re.tar.gz
-          chmod +x N_m3u8DL-RE
-          ./N_m3u8DL-RE --version
-
-      - name: Install shaka-packager
-        run: |
-          curl -L -o /tmp/shaka-packager \
-            https://github.com/shaka-project/shaka-packager/releases/latest/download/packager-linux-x64
-          chmod +x /tmp/shaka-packager
-          sudo mv /tmp/shaka-packager /usr/local/bin/shaka-packager
-          shaka-packager --version 2>&1 | head -1 || true
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - run: npm install axios
+      - name: Install proxy-agent
+        run: npm install axios proxy-agent
 
       - name: Run relay
         env:
@@ -70,6 +15,7 @@ jobs:
           const { execSync } = require('child_process');
           const fs = require('fs');
           const path = require('path');
+          const { ProxyAgent } = require('proxy-agent');
 
           async function main() {
             const command     = process.env.COMMAND;
@@ -84,7 +30,6 @@ jobs:
             let metaJsonContent = '';
 
             try {
-              // Parse the user's command to extract the URL and headers
               const urlMatch = command.match(/N_m3u8DL-RE\s+"([^"]+)"/);
               const originalUrl = urlMatch ? urlMatch[1] : '';
 
@@ -97,7 +42,6 @@ jobs:
               console.log('Source URL: ' + originalUrl.slice(0, 80) + '...');
               console.log('Headers parsed: ' + Object.keys(headers).join(', '));
 
-              // Build N_m3u8DL-RE command with debug logging
               let execCmd = command.replace(/^N_m3u8DL-RE\s+/, './N_m3u8DL-RE ');
 
               if (proxyUrl && !execCmd.includes('--custom-proxy')) {
@@ -147,11 +91,13 @@ jobs:
                 }
               }
 
-              // As fallback, fetch the MPD ourselves using the parsed headers
+              // Fallback: fetch MPD directly THROUGH THE PROXY
               let rawManifest = '';
               if (!metaJsonContent && originalUrl) {
-                console.log('Fetching MPD directly with parsed headers...');
+                console.log('Fetching MPD directly through proxy...');
                 try {
+                  const agent = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
+
                   const mpdRes = await axios.get(originalUrl, {
                     headers: {
                       ...headers,
@@ -159,14 +105,18 @@ jobs:
                     },
                     timeout: 30000,
                     responseType: 'text',
-                    httpsAgent: proxyUrl ? new (require('https').Agent)({
-                      // Not using HTTP proxy here — N_m3u8DL-RE already validated access
-                    }) : undefined,
+                    httpsAgent: agent,
+                    httpAgent: agent,
+                    proxy: false,  // disable axios's own proxy handling; use the agent
                   });
                   rawManifest = mpdRes.data;
-                  console.log('MPD fetched directly: ' + rawManifest.length + ' bytes');
+                  console.log('MPD fetched through proxy: ' + rawManifest.length + ' bytes');
                 } catch (e) {
-                  console.error('Direct MPD fetch failed: ' + e.message);
+                  console.error('Proxied MPD fetch failed: ' + e.message);
+                  if (e.response) {
+                    console.error('Status: ' + e.response.status);
+                    console.error('Body preview: ' + String(e.response.data).slice(0, 500));
+                  }
                 }
               }
 
