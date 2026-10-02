@@ -57,6 +57,21 @@ jobs:
       - name: Install Node dependencies
         run: npm install axios proxy-agent
 
+      - name: Test proxy
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          echo "=== Proxy reachability test ==="
+          echo "Proxied IP:"
+          curl -x "$PROXY_URL" -s --max-time 20 https://api.ipify.org || echo "PROXY CURL FAILED"
+          echo ""
+          echo "Direct (runner) IP:"
+          curl -s --max-time 10 https://api.ipify.org || echo "DIRECT CURL FAILED"
+          echo ""
+          echo "=== Header test through proxy ==="
+          curl -x "$PROXY_URL" -s -o /dev/null -w "HTTP %{http_code}\n" \
+            --max-time 20 https://i-live-cache.akamaized.net/ || echo "proxy request failed"
+
       - name: Run relay
         env:
           COMMAND: ${{ inputs.command }}
@@ -81,6 +96,7 @@ jobs:
             const proxyUrl    = process.env.PROXY_URL || '';
 
             console.log('Running N_m3u8DL-RE (parse-only, debug log)');
+            console.log('Proxy URL length: ' + proxyUrl.length);
 
             let result;
             let metaJsonContent = '';
@@ -98,6 +114,20 @@ jobs:
               console.log('Source URL: ' + originalUrl.slice(0, 80) + '...');
               console.log('Headers parsed: ' + Object.keys(headers).join(', '));
 
+              // Set proxy in env — lowercase first for .NET on Linux
+              const childEnv = { ...process.env };
+              if (proxyUrl) {
+                childEnv.http_proxy  = proxyUrl;
+                childEnv.https_proxy = proxyUrl;
+                childEnv.all_proxy   = proxyUrl;
+                childEnv.HTTP_PROXY  = proxyUrl;
+                childEnv.HTTPS_PROXY = proxyUrl;
+                childEnv.ALL_PROXY   = proxyUrl;
+                childEnv.NO_PROXY    = '';
+                childEnv.no_proxy    = '';
+                console.log('Proxy env vars set (lowercase + uppercase)');
+              }
+
               let execCmd = command.replace(/^N_m3u8DL-RE\s+/, './N_m3u8DL-RE ');
 
               if (proxyUrl && !execCmd.includes('--custom-proxy')) {
@@ -109,6 +139,7 @@ jobs:
                 '--write-meta-json',
                 '--auto-select',
                 '--log-level DEBUG',
+                '--no-ansi-color',
               ];
               for (const flag of flagsToAdd) {
                 if (!execCmd.includes(flag.split(' ')[0])) {
@@ -122,17 +153,26 @@ jobs:
 
               console.log('Executing N_m3u8DL-RE...');
 
-              const output = execSync(execCmd, {
-                encoding: 'utf-8',
-                timeout: 300000,
-                maxBuffer: 30 * 1024 * 1024,
-                env: process.env,
-                shell: '/bin/bash',
-                cwd: process.env.GITHUB_WORKSPACE || '.',
-              });
+              let output = '';
+              try {
+                output = execSync(execCmd, {
+                  encoding: 'utf-8',
+                  timeout: 300000,
+                  maxBuffer: 30 * 1024 * 1024,
+                  env: childEnv,
+                  shell: '/bin/bash',
+                  cwd: process.env.GITHUB_WORKSPACE || '.',
+                });
+              } catch (execErr) {
+                // Capture stdout/stderr from a failed run
+                output = (execErr.stdout ? execErr.stdout.toString() : '') +
+                         '\n' + (execErr.stderr ? execErr.stderr.toString() : '');
+                throw new Error('N_m3u8DL-RE failed: ' + execErr.message);
+              }
 
               console.log('N_m3u8DL-RE output: ' + output.length + ' bytes');
 
+              // Try meta.json
               const candidates = [
                 'meta.json',
                 path.join(process.env.GITHUB_WORKSPACE || '.', 'meta.json'),
@@ -146,6 +186,7 @@ jobs:
                 }
               }
 
+              // Fallback: fetch MPD through the proxy with axios
               let rawManifest = '';
               if (!metaJsonContent && originalUrl) {
                 console.log('Fetching MPD directly through proxy...');
