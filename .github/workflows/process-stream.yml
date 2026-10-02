@@ -13,12 +13,20 @@ on:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install ffmpeg (static)
+        run: |
+          curl -L -o /tmp/ffmpeg.tar.xz \
+            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+          mkdir -p /tmp/ffmpeg
+          tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1
+          sudo mv /tmp/ffmpeg/ffmpeg /usr/local/bin/ffmpeg
+          sudo mv /tmp/ffmpeg/ffprobe /usr/local/bin/ffprobe
+          sudo chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+          ffmpeg -version | head -1
 
       - name: Download N_m3u8DL-RE
         run: |
@@ -37,10 +45,10 @@ jobs:
 
       - name: Install shaka-packager
         run: |
-          curl -L -o shaka-packager \
+          curl -L -o /tmp/shaka-packager \
             https://github.com/shaka-project/shaka-packager/releases/latest/download/packager-linux-x64
-          chmod +x shaka-packager
-          sudo mv shaka-packager /usr/local/bin/shaka-packager
+          chmod +x /tmp/shaka-packager
+          sudo mv /tmp/shaka-packager /usr/local/bin/shaka-packager
           shaka-packager --version 2>&1 | head -1 || true
 
       - uses: actions/setup-node@v4
@@ -115,7 +123,7 @@ jobs:
 
               console.log('N_m3u8DL-RE output captured (' + output.length + ' bytes)');
 
-              // N_m3u8DL-RE writes meta.json next to the binary or in cwd
+              // Look for meta.json in several likely locations
               const candidates = [
                 'meta.json',
                 path.join(process.env.GITHUB_WORKSPACE || '.', 'meta.json'),
@@ -149,7 +157,6 @@ jobs:
               console.error('STDOUT:', stdout.slice(0, 4000));
               console.error('STDERR:', stderr.slice(0, 4000));
 
-              // Try to read meta.json even on failure
               try {
                 const metaPath = path.join(process.env.GITHUB_WORKSPACE || '.', 'meta.json');
                 if (fs.existsSync(metaPath)) {
