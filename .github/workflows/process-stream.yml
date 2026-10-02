@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
     inputs:
       command:
-        description: 'Full N_m3u8DL-RE command'
         required: true
       callback_url:
         required: true
@@ -37,7 +36,6 @@ jobs:
         run: |
           curl -L -o shaka.tar.gz \
             https://github.com/shaka-project/shaka-packager/releases/latest/download/packager-linux-x64
-          # The latest asset is the binary itself, not a tarball — handle both cases
           file shaka.tar.gz
           if file shaka.tar.gz | grep -q gzip; then
             tar -xzf shaka.tar.gz
@@ -67,6 +65,7 @@ jobs:
           const axios = require('axios');
           const crypto = require('crypto');
           const { execSync } = require('child_process');
+          const fs = require('fs');
 
           async function main() {
             const command     = process.env.COMMAND;
@@ -75,12 +74,12 @@ jobs:
             const secret      = process.env.CALLBACK_SECRET;
             const proxyUrl    = process.env.PROXY_URL || '';
 
-            console.log('Running N_m3u8DL-RE command');
-            console.log(command.replace(/--key\s+\S+/, '--key ****'));
+            console.log('Running N_m3u8DL-RE command (parse only)');
 
             let result;
+            let metaJsonContent = '';
+
             try {
-              // Set proxy via environment variables (works for .NET on Linux)
               const env = { ...process.env };
               if (proxyUrl) {
                 env.HTTP_PROXY = proxyUrl;
@@ -89,14 +88,24 @@ jobs:
                 console.log('Proxy configured');
               }
 
-              // Replace "N_m3u8DL-RE" with "./N_m3u8DL-RE" and add --skip-download --morehelp
+              // Build the command for parsing only
               let execCmd = command.replace(/^N_m3u8DL-RE\s+/, './N_m3u8DL-RE ');
-              if (!execCmd.includes('--skip-download')) {
-                execCmd += ' --skip-download';
+
+              // Add required flags for non-interactive parsing
+              const flagsToAdd = [
+                '--skip-download',
+                '--write-meta-json',
+                '--auto-select',
+              ];
+
+              for (const flag of flagsToAdd) {
+                if (!execCmd.includes(flag)) {
+                  execCmd += ` ${flag}`;
+                }
               }
-              if (!execCmd.includes('--morehelp')) {
-                execCmd += ' --morehelp';
-              }
+
+              // Clean up any conflicting flags from the original command
+              execCmd = execCmd.replace(/--morehelp/g, '').replace(/--skip-merge/g, '');
 
               console.log('Executing: ' + execCmd.replace(/--key\s+\S+/, '--key ****'));
 
@@ -106,15 +115,25 @@ jobs:
                 maxBuffer: 30 * 1024 * 1024,
                 env,
                 shell: '/bin/bash',
+                cwd: process.env.GITHUB_WORKSPACE || '.',
               });
 
-              console.log('Output captured (' + output.length + ' bytes)');
-              console.log(output.slice(0, 4000));
+              console.log('N_m3u8DL-RE output captured (' + output.length + ' bytes)');
+
+              // Read the generated meta.json file
+              const metaFile = 'meta.json';
+              if (fs.existsSync(metaFile)) {
+                metaJsonContent = fs.readFileSync(metaFile, 'utf-8');
+                console.log('meta.json read (' + metaJsonContent.length + ' bytes)');
+              } else {
+                console.log('Warning: meta.json not found');
+              }
 
               result = {
                 streamId,
                 success: true,
                 n3u8Output: output,
+                metaJson: metaJsonContent,
                 fetchedAt: new Date().toISOString(),
               };
             } catch (err) {
