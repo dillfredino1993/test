@@ -539,11 +539,14 @@ jobs:
             fi
 
             if [ "$USE_HLS" = true ]; then
-              echo "⬇️ yt-dlp starting (max resolution 1440p)..."
+              echo "⬇️ yt-dlp starting (max 1440p, prefer landscape/width)..."
+
+              # ── PRIMARY HLS PATH ──
               yt-dlp \
+                -S "width,height" \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                -f "bestvideo[height<=1440][ext=mp4]+bestaudio[language^=en]/bestvideo[height<=1440]+bestaudio/best[height<=1440][ext=mp4]/best[height<=1440]/best" \
+                -f "bestvideo[height<=1440][width<=2560][ext=mp4]+bestaudio[language^=en]/bestvideo[height<=1440][width<=2560]+bestaudio/best[height<=1440][width<=2560][ext=mp4]/best[height<=1440][width<=2560]/best[height<=1440]" \
                 --merge-output-format mp4 \
                 --no-progress --no-warnings \
                 --geo-bypass --no-check-certificates \
@@ -557,10 +560,11 @@ jobs:
                 echo "🔄 yt-dlp wrote an m3u8 playlist — retrying with --hls-prefer-native..."
                 rm -f "$OUT_FILE"
                 yt-dlp \
+                  -S "width,height" \
                   --extractor-args "generic:impersonate" \
                   --impersonate chrome \
                   --hls-prefer-native \
-                  -f "best[height<=1440]/best" \
+                  -f "best[height<=1440][width<=2560]/best[height<=1440]" \
                   --merge-output-format mp4 \
                   --no-progress --no-warnings \
                   --geo-bypass --no-check-certificates \
@@ -581,12 +585,15 @@ jobs:
                 -o "$OUT_FILE" "$URL" < /dev/null 2>&1 | tail -20 || true
 
               if file_is_playlist "$OUT_FILE"; then
-                echo "🔄 aria2c wrote an m3u8 playlist — redirecting to yt-dlp (max 1440p)"
+                echo "🔄 aria2c wrote an m3u8 playlist — redirecting to yt-dlp (max 1440p, prefer width)"
                 rm -f "$OUT_FILE"
+
+                # ── ARIA2C → YT-DLP FALLBACK ──
                 yt-dlp \
+                  -S "width,height" \
                   --extractor-args "generic:impersonate" \
                   --impersonate chrome \
-                  -f "bestvideo[height<=1440][ext=mp4]+bestaudio[language^=en]/bestvideo[height<=1440]+bestaudio/best[height<=1440][ext=mp4]/best[height<=1440]/best" \
+                  -f "bestvideo[height<=1440][width<=2560][ext=mp4]+bestaudio[language^=en]/bestvideo[height<=1440][width<=2560]+bestaudio/best[height<=1440][width<=2560][ext=mp4]/best[height<=1440][width<=2560]/best[height<=1440]" \
                   --merge-output-format mp4 \
                   --no-progress --no-warnings \
                   --geo-bypass --no-check-certificates \
@@ -599,11 +606,14 @@ jobs:
 
             if [ ! -f "$OUT_FILE" ] || [ ! -s "$OUT_FILE" ] || file_is_playlist "$OUT_FILE"; then
               rm -f "$OUT_FILE" 2>/dev/null
-              echo "⚠️  Primary method failed — trying yt-dlp fallback (max 1440p)..."
+              echo "⚠️  Primary method failed — trying yt-dlp fallback (max 1440p, prefer width)..."
+
+              # ── FINAL YT-DLP FALLBACK ──
               yt-dlp \
+                -S "width,height" \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                -f "best[height<=1440]/best" \
+                -f "best[height<=1440][width<=2560]/best[height<=1440]" \
                 --merge-output-format mp4 \
                 --remux-video mp4 \
                 --no-progress --no-warnings \
