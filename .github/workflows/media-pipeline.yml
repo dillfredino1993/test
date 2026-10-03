@@ -539,14 +539,14 @@ jobs:
             fi
 
             if [ "$USE_HLS" = true ]; then
-              echo "⬇️ yt-dlp starting (max 1440p, prefer landscape/width)..."
+              echo "⬇️ yt-dlp starting (max 1440p via res, prefer English audio)..."
 
               # ── PRIMARY HLS PATH ──
               yt-dlp \
-                -S "width,height" \
+                -S "res:1440" \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                -f "bestvideo[height<=1440][width<=2560][ext=mp4]+bestaudio[language^=en]/bestvideo[height<=1440][width<=2560]+bestaudio/best[height<=1440][width<=2560][ext=mp4]/best[height<=1440][width<=2560]/best[height<=1440]" \
+                -f "bv*[res<=1440]+ba[language^=en]/b[res<=1440]/b" \
                 --merge-output-format mp4 \
                 --no-progress --no-warnings \
                 --geo-bypass --no-check-certificates \
@@ -560,11 +560,11 @@ jobs:
                 echo "🔄 yt-dlp wrote an m3u8 playlist — retrying with --hls-prefer-native..."
                 rm -f "$OUT_FILE"
                 yt-dlp \
-                  -S "width,height" \
+                  -S "res:1440" \
                   --extractor-args "generic:impersonate" \
                   --impersonate chrome \
                   --hls-prefer-native \
-                  -f "best[height<=1440][width<=2560]/best[height<=1440]" \
+                  -f "b[res<=1440]/b" \
                   --merge-output-format mp4 \
                   --no-progress --no-warnings \
                   --geo-bypass --no-check-certificates \
@@ -590,10 +590,10 @@ jobs:
 
                 # ── ARIA2C → YT-DLP FALLBACK ──
                 yt-dlp \
-                  -S "width,height" \
+                  -S "res:1440" \
                   --extractor-args "generic:impersonate" \
                   --impersonate chrome \
-                  -f "bestvideo[height<=1440][width<=2560][ext=mp4]+bestaudio[language^=en]/bestvideo[height<=1440][width<=2560]+bestaudio/best[height<=1440][width<=2560][ext=mp4]/best[height<=1440][width<=2560]/best[height<=1440]" \
+                  -f "bv*[res<=1440]+ba[language^=en]/b[res<=1440]/b" \
                   --merge-output-format mp4 \
                   --no-progress --no-warnings \
                   --geo-bypass --no-check-certificates \
@@ -610,10 +610,10 @@ jobs:
 
               # ── FINAL YT-DLP FALLBACK ──
               yt-dlp \
-                -S "width,height" \
+                -S "res:1440" \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                -f "best[height<=1440][width<=2560]/best[height<=1440]" \
+                -f "b[res<=1440]/b" \
                 --merge-output-format mp4 \
                 --remux-video mp4 \
                 --no-progress --no-warnings \
