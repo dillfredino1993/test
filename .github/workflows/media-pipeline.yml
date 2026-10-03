@@ -539,14 +539,13 @@ jobs:
             fi
 
             if [ "$USE_HLS" = true ]; then
-              echo "⬇️ yt-dlp starting (max 1440p via res, prefer English audio)..."
+              echo "⬇️ yt-dlp starting (max 1440p via res, prefer English audio, fallback for single-variant m3u8)..."
 
               # ── PRIMARY HLS PATH ──
               yt-dlp \
-                -S "res:1440" \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                -f "bv*[res<=1440]+ba[language^=en]/b[res<=1440]/b" \
+                -f "bv*[res<=1440]+ba[language^=en]/b[res<=1440]/bv*+ba/b/best" \
                 --merge-output-format mp4 \
                 --no-progress --no-warnings \
                 --geo-bypass --no-check-certificates \
@@ -560,11 +559,10 @@ jobs:
                 echo "🔄 yt-dlp wrote an m3u8 playlist — retrying with --hls-prefer-native..."
                 rm -f "$OUT_FILE"
                 yt-dlp \
-                  -S "res:1440" \
                   --extractor-args "generic:impersonate" \
                   --impersonate chrome \
                   --hls-prefer-native \
-                  -f "b[res<=1440]/b" \
+                  -f "b/best" \
                   --merge-output-format mp4 \
                   --no-progress --no-warnings \
                   --geo-bypass --no-check-certificates \
@@ -585,15 +583,14 @@ jobs:
                 -o "$OUT_FILE" "$URL" < /dev/null 2>&1 | tail -20 || true
 
               if file_is_playlist "$OUT_FILE"; then
-                echo "🔄 aria2c wrote an m3u8 playlist — redirecting to yt-dlp (max 1440p, prefer width)"
+                echo "🔄 aria2c wrote an m3u8 playlist — redirecting to yt-dlp"
                 rm -f "$OUT_FILE"
 
                 # ── ARIA2C → YT-DLP FALLBACK ──
                 yt-dlp \
-                  -S "res:1440" \
                   --extractor-args "generic:impersonate" \
                   --impersonate chrome \
-                  -f "bv*[res<=1440]+ba[language^=en]/b[res<=1440]/b" \
+                  -f "bv*[res<=1440]+ba[language^=en]/b[res<=1440]/bv*+ba/b/best" \
                   --merge-output-format mp4 \
                   --no-progress --no-warnings \
                   --geo-bypass --no-check-certificates \
@@ -606,14 +603,13 @@ jobs:
 
             if [ ! -f "$OUT_FILE" ] || [ ! -s "$OUT_FILE" ] || file_is_playlist "$OUT_FILE"; then
               rm -f "$OUT_FILE" 2>/dev/null
-              echo "⚠️  Primary method failed — trying yt-dlp fallback (max 1440p, prefer width)..."
+              echo "⚠️  Primary method failed — trying yt-dlp fallback (accept any format)..."
 
               # ── FINAL YT-DLP FALLBACK ──
               yt-dlp \
-                -S "res:1440" \
                 --extractor-args "generic:impersonate" \
                 --impersonate chrome \
-                -f "b[res<=1440]/b" \
+                -f "b/best" \
                 --merge-output-format mp4 \
                 --remux-video mp4 \
                 --no-progress --no-warnings \
