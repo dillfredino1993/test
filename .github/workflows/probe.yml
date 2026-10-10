@@ -1,0 +1,152 @@
+name: probe-episode
+
+on:
+  workflow_dispatch:
+    inputs:
+      seriesId:   { required: true, type: string }
+      numBase:    { required: true, type: string }
+      hashPrefix: { required: true, type: string }
+      ep:         { required: true, type: string }
+      shard:      { required: true, type: string }
+      shards:     { required: true, type: string, default: "16" }
+      callback:   { required: true, type: string }
+
+# Serialize per episode so we don't hammer the CDN with all shards at once.
+# Remove this block if you want all shards to run in parallel (faster, but
+# much more likely to trip the CDN's rate limiter).
+concurrency:
+  group: probe-${{ inputs.seriesId }}-ep${{ inputs.ep }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Probe this shard
+        env:
+          SERIES_ID:     ${{ inputs.seriesId }}
+          NUM_BASE:      ${{ inputs.numBase }}
+          HASH_PREFIX:   ${{ inputs.hashPrefix }}
+          EP:            ${{ inputs.ep }}
+          SHARD:         ${{ inputs.shard }}
+          SHARDS:        ${{ inputs.shards }}
+          CALLBACK:      ${{ inputs.callback }}
+          CALLBACK_AUTH: ${{ secrets.CALLBACK_AUTH }}   # empty if unset
+        shell: bash
+        run: |
+          node --input-type=module <<'EOF'
+          const {
+            SERIES_ID, NUM_BASE, HASH_PREFIX, EP, SHARD, SHARDS,
+            CALLBACK, CALLBACK_AUTH
+          } = process.env;
+
+          const numId      = Number(NUM_BASE) + Number(EP);
+          const shardCount = Number(SHARDS);
+          const shardIdx   = Number(SHARD);
+
+          // Disjoint slice of the 4-hex-tail space (65536 combos).
+          // SHARDS=16 => each shard owns 4096 tails (one leading hex nibble).
+          const sliceSize = 65536 / shardCount;
+          const startIdx  = shardIdx * sliceSize;
+          const endIdx    = startIdx + sliceSize;
+
+          const tail = (n) => n.toString(16).padStart(4, "0");
+          const tails = [];
+          for (let n = startIdx; n < endIdx; n++) tails.push(tail(n));
+
+          const tried = [];
+          let found = null;
+
+          const CONCURRENCY = 16;
+          const TIMEOUT_MS  = 4000;
+          const RETRY_429   = 5000;
+          const deadline    = Date.now() + 25 * 60 * 1000;
+          const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+          async function probeOne(t) {
+            if (found || Date.now() > deadline) return;
+            const hash = HASH_PREFIX + t;
+            const url  = `https://cdn.creativefitting.ai/tc/v3/${SERIES_ID}/EP${EP}/${numId}-${hash}.mp4`;
+
+            const ac = new AbortController();
+            const to = setTimeout(() => ac.abort(), TIMEOUT_MS);
+            try {
+              const r = await fetch(url, {
+                method: "HEAD",
+                signal: ac.signal,
+                headers: { "User-Agent": "Mozilla/5.0" }
+              });
+              clearTimeout(to);
+              tried.push(t);
+
+              if (r.status === 200) {
+                found = { url, hash };
+                console.log(`FOUND ep=${EP} shard=${SHARD} ${url}`);
+              } else if (r.status === 429 || r.status === 503) {
+                await sleep(RETRY_429);
+              }
+            } catch {
+              clearTimeout(to);
+              tried.push(t);
+            }
+          }
+
+          async function worker() {
+            while (true) {
+              if (found || Date.now() > deadline) return;
+              const t = tails.shift();
+              if (!t) return;
+              await probeOne(t);
+            }
+          }
+
+          console.log(
+            `ep=${EP} shard=${SHARD}/${shardCount} ` +
+            `tails=${startIdx.toString(16)}..${(endIdx-1).toString(16)} numId=${numId}`
+          );
+
+          await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
+          // Persist tried list as an artifact for audit/resume
+          try {
+            const fs = await import("node:fs");
+            fs.writeFileSync("tried.txt", tried.join("\n"));
+          } catch {}
+
+          // Report back to the Worker
+          const headers = { "content-type": "application/json" };
+          if (CALLBACK_AUTH) headers.authorization = `Bearer ${CALLBACK_AUTH}`;
+
+          try {
+            const res = await fetch(CALLBACK, {
+              method: "POST",
+              headers,
+              body: JSON.stringify({
+                seriesId: SERIES_ID,
+                ep: Number(EP),
+                url:  found?.url  ?? null,
+                hash: found?.hash ?? null,
+                tried
+              })
+            });
+            console.log(`reported to ${CALLBACK} status=${res.status}`);
+            if (!res.ok) process.exitCode = 1;
+          } catch (e) {
+            console.error("report failed:", e);
+            process.exitCode = 1;
+          }
+          EOF
+
+      - name: Upload tried-tails artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tried-${{ inputs.seriesId }}-ep${{ inputs.ep }}-shard${{ inputs.shard }}
+          path: tried.txt
+          if-no-files-found: ignore
+          retention-days: 3
