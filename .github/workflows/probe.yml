@@ -11,12 +11,11 @@ on:
       shards:     { required: true, type: string, default: "16" }
       callback:   { required: true, type: string }
 
-# Serialize per episode so we don't hammer the CDN with all shards at once.
-# Remove this block if you want all shards to run in parallel (faster, but
-# much more likely to trip the CDN's rate limiter).
+# One group per (series, episode, shard). Nothing gets cancelled by
+# GitHub's "1 pending per group" rule because each shard is unique.
 concurrency:
-  group: probe-${{ inputs.seriesId }}-ep${{ inputs.ep }}
-  cancel-in-progress: false
+  group: probe-${{ inputs.seriesId }}-${{ inputs.ep }}-${{ inputs.shard }}
+  cancel-in-progress: true
 
 jobs:
   probe:
@@ -36,7 +35,7 @@ jobs:
           SHARD:         ${{ inputs.shard }}
           SHARDS:        ${{ inputs.shards }}
           CALLBACK:      ${{ inputs.callback }}
-          CALLBACK_AUTH: ${{ secrets.CALLBACK_AUTH }}   # empty if unset
+          CALLBACK_AUTH: ${{ secrets.CALLBACK_AUTH }}
         shell: bash
         run: |
           node --input-type=module <<'EOF'
@@ -49,8 +48,6 @@ jobs:
           const shardCount = Number(SHARDS);
           const shardIdx   = Number(SHARD);
 
-          // Disjoint slice of the 4-hex-tail space (65536 combos).
-          // SHARDS=16 => each shard owns 4096 tails (one leading hex nibble).
           const sliceSize = 65536 / shardCount;
           const startIdx  = shardIdx * sliceSize;
           const endIdx    = startIdx + sliceSize;
@@ -62,7 +59,7 @@ jobs:
           const tried = [];
           let found = null;
 
-          const CONCURRENCY = 16;
+          const CONCURRENCY = 32;
           const TIMEOUT_MS  = 4000;
           const RETRY_429   = 5000;
           const deadline    = Date.now() + 25 * 60 * 1000;
@@ -72,18 +69,12 @@ jobs:
             if (found || Date.now() > deadline) return;
             const hash = HASH_PREFIX + t;
             const url  = `https://cdn.creativefitting.ai/tc/v3/${SERIES_ID}/EP${EP}/${numId}-${hash}.mp4`;
-
             const ac = new AbortController();
             const to = setTimeout(() => ac.abort(), TIMEOUT_MS);
             try {
-              const r = await fetch(url, {
-                method: "HEAD",
-                signal: ac.signal,
-                headers: { "User-Agent": "Mozilla/5.0" }
-              });
+              const r = await fetch(url, { method: "HEAD", signal: ac.signal, headers: { "User-Agent": "Mozilla/5.0" } });
               clearTimeout(to);
               tried.push(t);
-
               if (r.status === 200) {
                 found = { url, hash };
                 console.log(`FOUND ep=${EP} shard=${SHARD} ${url}`);
@@ -105,41 +96,25 @@ jobs:
             }
           }
 
-          console.log(
-            `ep=${EP} shard=${SHARD}/${shardCount} ` +
-            `tails=${startIdx.toString(16)}..${(endIdx-1).toString(16)} numId=${numId}`
-          );
-
+          console.log(`ep=${EP} shard=${SHARD}/${shardCount} tails=${startIdx.toString(16)}..${(endIdx-1).toString(16)} numId=${numId}`);
           await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
-          // Persist tried list as an artifact for audit/resume
           try {
             const fs = await import("node:fs");
             fs.writeFileSync("tried.txt", tried.join("\n"));
           } catch {}
 
-          // Report back to the Worker
           const headers = { "content-type": "application/json" };
           if (CALLBACK_AUTH) headers.authorization = `Bearer ${CALLBACK_AUTH}`;
 
           try {
             const res = await fetch(CALLBACK, {
-              method: "POST",
-              headers,
-              body: JSON.stringify({
-                seriesId: SERIES_ID,
-                ep: Number(EP),
-                url:  found?.url  ?? null,
-                hash: found?.hash ?? null,
-                tried
-              })
+              method: "POST", headers,
+              body: JSON.stringify({ seriesId: SERIES_ID, ep: Number(EP), url: found?.url ?? null, hash: found?.hash ?? null, tried })
             });
             console.log(`reported to ${CALLBACK} status=${res.status}`);
             if (!res.ok) process.exitCode = 1;
-          } catch (e) {
-            console.error("report failed:", e);
-            process.exitCode = 1;
-          }
+          } catch (e) { console.error("report failed:", e); process.exitCode = 1; }
           EOF
 
       - name: Upload tried-tails artifact
