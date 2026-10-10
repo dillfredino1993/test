@@ -11,8 +11,8 @@ on:
       shards:     { required: true, type: string, default: "16" }
       callback:   { required: true, type: string }
 
-# One group per (series, episode, shard). Nothing gets cancelled by
-# GitHub's "1 pending per group" rule because each shard is unique.
+# One concurrency group per (series, episode, shard). Every shard gets its
+# own queue slot; GitHub's "1 pending per group" rule never cancels a shard.
 concurrency:
   group: probe-${{ inputs.seriesId }}-${{ inputs.ep }}-${{ inputs.shard }}
   cancel-in-progress: true
@@ -72,7 +72,11 @@ jobs:
             const ac = new AbortController();
             const to = setTimeout(() => ac.abort(), TIMEOUT_MS);
             try {
-              const r = await fetch(url, { method: "HEAD", signal: ac.signal, headers: { "User-Agent": "Mozilla/5.0" } });
+              const r = await fetch(url, {
+                method: "HEAD",
+                signal: ac.signal,
+                headers: { "User-Agent": "Mozilla/5.0" }
+              });
               clearTimeout(to);
               tried.push(t);
               if (r.status === 200) {
@@ -109,12 +113,24 @@ jobs:
 
           try {
             const res = await fetch(CALLBACK, {
-              method: "POST", headers,
-              body: JSON.stringify({ seriesId: SERIES_ID, ep: Number(EP), url: found?.url ?? null, hash: found?.hash ?? null, tried })
+              method: "POST",
+              headers,
+              body: JSON.stringify({
+                seriesId: SERIES_ID,
+                ep:       Number(EP),
+                shard:    Number(SHARD),
+                shards:   Number(SHARDS),
+                url:      found?.url  ?? null,
+                hash:     found?.hash ?? null,
+                tried
+              })
             });
             console.log(`reported to ${CALLBACK} status=${res.status}`);
             if (!res.ok) process.exitCode = 1;
-          } catch (e) { console.error("report failed:", e); process.exitCode = 1; }
+          } catch (e) {
+            console.error("report failed:", e);
+            process.exitCode = 1;
+          }
           EOF
 
       - name: Upload tried-tails artifact
